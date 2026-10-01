@@ -53,3 +53,52 @@ Retain when a fact is **(a)** expensive to re-derive (multi-step exploration),
 or person. Skip transient state, one-off facts, and anything one grep away.
 Changelogs are re-derivable from git — retain the *interpretation*
 ("this refactor moved X to Y, because Z"), not the diff log.
+
+## v0.2 capabilities
+
+### Graph arm (multi-hop recall)
+
+Fires automatically inside `ames_recall` — entity two-hop expansion fused at
+RRF weight 0.01. Retain two facts sharing an entity ("Bob joined Acme",
+"Acme HQ is Krakow") and `where does Bob work` returns the Krakow fact with
+zero lexical overlap. Hop-2 evidence weighs ~100× less than lexical hits:
+it reorders near-ties only.
+
+### Knowledge pages
+
+```sh
+curl -X POST $AMES/memory/pages/refresh -H "$AUTH" -d '{"scope":"omniroute"}'
+curl $AMES/memory/pages/omniroute -H "$AUTH"
+```
+
+Per-topic living documents built from active semantic facts. `source_ids`
+link evidence; pages never cite pages (no self-citation loops). Deterministic
+body today (chronological bullets); LLM rewrite is the natural next step.
+
+### Temporal arm
+
+Queries with time expressions ("in 2024", "last 3 months") fill from the
+parsed window spread across 4 equal buckets — "what happened last month"
+won't return only the final week. No date in query → arm skipped.
+
+### Reranker
+
+`POST /memory/rerank` uses ES `_inference` rerank. Returns
+`reranked:false` + note when the model/license is absent — identity order,
+never a fake rerank. Deploy `.rerank-v1-elasticsearch` to enable.
+
+### Reflect multi-round
+
+`reflect` now: recall → mental-model tier → LLM rewrites the question (2
+alternates) → re-recall → merge unseen evidence (cap 5) → synthesize with
+citations. Response carries `queries` (all run) and `sources` (cited only).
+LLM down → silent single-pass degrade.
+
+### Mental models
+
+```sh
+curl -X POST $AMES/memory/models -H "$AUTH" -d '{"question_pattern":"where do we run evals","summary":"Azure VMs via suite_sweep.py, never local Mac"}'
+```
+
+Write the canonical answer once for questions you answer weekly; recall and
+reflect surface it as the priority tier above raw facts.

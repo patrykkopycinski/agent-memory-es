@@ -45,6 +45,17 @@ HTTP / curl ──┘   (auth · ops · worker)           └─ procedural (pla
 
 API key → owner identity, server-side visibility filter, hybrid BM25 + kNN recall fused with RRF, a guarded private→shared promotion path, and a propose-then-apply consolidation worker. Full detail with per-file source references: **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** — diagrams: [topology](docs/diagrams/architecture.svg) · [recall pipeline](docs/diagrams/recall-pipeline.svg) · interactive: [explainer](docs/explainer.html).
 
+## Capabilities (v0.2)
+
+Beyond the hybrid core:
+
+- **Graph arm** — entity two-hop expansion in recall: facts sharing entities with your query's entities surface even with zero lexical overlap. Fused at low RRF weight (0.01) so hop-2 evidence never outvotes lexical+kNN agreement (measured: MRR 0.906→0.928 with hop-2 intact).
+- **Knowledge pages** — `am_pages`: per-topic living documents regenerated from active semantic facts, evidence-linked (`source_ids`), never self-citing. `POST /memory/pages/refresh`, `GET /memory/pages[/{scope}]`.
+- **Temporal arm** — time expressions in queries ("last 3 months", "in 2024") parse into a window, filled spread across equal buckets so results aren't all from one end.
+- **Reranker** — ES-native `_inference` rerank endpoint; honest fallback (`reranked: false`) when model/license unavailable — never faked.
+- **Reflect multi-round** — bounded LLM query rewrites extend evidence before synthesis; mental-model tier consulted first.
+- **Mental models** — curated summaries for frequent questions, matched by BM25 on question pattern, surfaced as a priority tier in recall and reflect. `POST /memory/models`.
+
 ## Landing page
 
 **https://patrykkopycinski.github.io/agent-memory-es/** — concept, architecture, quick start, interactive archify diagrams.
