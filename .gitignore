@@ -2,3 +2,9 @@ __pycache__/
 *.pyc
 .env
 .venv/
+backend/.venv/
+backend/data/
+*.pyc
+__pycache__/
+.env
+nohup.out
