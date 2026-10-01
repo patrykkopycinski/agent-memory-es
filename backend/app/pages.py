@@ -9,7 +9,7 @@ an LLM rewrite hook is optional.
 import hashlib
 from typing import Optional
 
-from .store import es, ensure_indices
+from .store import es, ensure_indices, PREFIX
 
 PAGE_MAPPINGS = {
     "settings": {"number_of_shards": 1, "number_of_replicas": 0},
@@ -35,9 +35,9 @@ def page_id(owner_id: str, scope: str) -> str:
 
 def ensure_pages_index() -> None:
     try:
-        es("GET", "/am_pages")
+        es("GET", f"/{PREFIX}am_pages")
     except RuntimeError:
-        es("PUT", "/am_pages", PAGE_MAPPINGS)
+        es("PUT", f"/{PREFIX}am_pages", PAGE_MAPPINGS)
 
 
 def refresh_page(owner_id: str, scope: str, facts: list, visibility: str = "private") -> dict:
@@ -57,13 +57,13 @@ def refresh_page(owner_id: str, scope: str, facts: list, visibility: str = "priv
         "fact_count": len(facts),
         "updated_at": _now(),
     }
-    es("PUT", f"/am_pages/_doc/{page_id(owner_id, scope)}?refresh=true", doc)
+    es("PUT", f"/{PREFIX}am_pages/_doc/{page_id(owner_id, scope)}?refresh=true", doc)
     return {"id": page_id(owner_id, scope), **doc}
 
 
 def get_page(owner_id: str, scope: str) -> Optional[dict]:
     try:
-        r = es("GET", f"/am_pages/_doc/{page_id(owner_id, scope)}")
+        r = es("GET", f"/{PREFIX}am_pages/_doc/{page_id(owner_id, scope)}")
         return {"id": r["_id"], **r["_source"]}
     except RuntimeError:
         return None
@@ -77,7 +77,7 @@ def list_pages(owner_id: str, include_shared: bool = True) -> list:
             {"term": {"owner_id": owner_id}},
             {"bool": {"must_not": {"term": {"visibility": "private"}}}},
         ]}}]
-    r = es("POST", "/am_pages/_search", {"size": 100, "query": {"bool": {"filter": filt}},
+    r = es("POST", f"/{PREFIX}am_pages/_search", {"size": 100, "query": {"bool": {"filter": filt}},
                                          "sort": [{"updated_at": {"order": "desc"}}]})
     return [{"id": h["_id"], **h["_source"]} for h in r["hits"]["hits"]]
 

@@ -7,6 +7,9 @@ from typing import Any, Optional
 
 ES_URL = os.environ.get("AMES_ES_URL", "http://localhost:9268")
 API_KEYS_FILE = os.environ.get("AMES_API_KEYS_FILE", os.path.join(os.path.dirname(__file__), "..", "data", "api_keys.json"))
+# Test isolation: prefix all indices (e.g. amtest_) so suites never read/write
+# the live cluster's shared data. Empty in production.
+PREFIX = os.environ.get("AMES_INDEX_PREFIX", "")
 
 KINDS = ("episodic", "semantic", "procedural")
 
@@ -52,13 +55,12 @@ def es(method: str, path: str, body: Optional[dict] = None) -> dict:
 def ensure_indices() -> None:
     for kind in KINDS:
         try:
-            es("HEAD_OK", f"/am_{kind}") if False else None
-            es("GET", f"/am_{kind}")
+            es("GET", f"/{idx(kind)}")
         except RuntimeError:
-            es("PUT", f"/am_{kind}", MAPPINGS)
+            es("PUT", f"/{idx(kind)}", MAPPINGS)
 
 
 def idx(kind: str) -> str:
     if kind not in KINDS:
         raise ValueError(f"unknown kind {kind}")
-    return f"am_{kind}"
+    return f"{PREFIX}am_{kind}"

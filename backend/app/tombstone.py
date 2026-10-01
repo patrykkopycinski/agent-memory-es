@@ -10,7 +10,7 @@ import json
 import re
 import time
 
-from .store import es
+from .store import es, PREFIX
 
 TOKEN_RE = re.compile(r"[a-z0-9][a-z0-9_.+-]{2,}")
 STOP = {"the", "and", "was", "for", "with", "not", "never", "always"}
@@ -26,9 +26,9 @@ def _key(terms) -> str:
 
 def _ensure_index():
     try:
-        es("GET", "/am_rejected")
+        es("GET", f"/{PREFIX}am_rejected")
     except RuntimeError:
-        es("PUT", "/am_rejected", {
+        es("PUT", f"/{PREFIX}am_rejected", {
             "settings": {"number_of_shards": 1, "number_of_replicas": 0},
             "mappings": {
                 "dynamic": "strict",
@@ -52,7 +52,7 @@ def reject(owner_id: str, text: str, reason: str, source_id: str = "") -> dict:
            "terms": sorted(terms),
            "source_id": source_id,
            "rejected_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
-    es("POST", "/am_rejected/_doc?refresh=true", doc)
+    es("POST", f"/{PREFIX}am_rejected/_doc?refresh=true", doc)
     return doc
 
 
@@ -64,7 +64,7 @@ def is_rejected(owner_id: str, text: str) -> dict | None:
     _ensure_index()
     terms = _terms(text)
     body = {"size": 50, "query": {"bool": {"filter": [{"term": {"owner_id": owner_id}}]}}}
-    r = es("POST", "/am_rejected/_search", body)
+    r = es("POST", f"/{PREFIX}am_rejected/_search", body)
     for h in r["hits"]["hits"]:
         s = h["_source"]
         rterms = set(s.get("terms", []))
