@@ -10,6 +10,20 @@ from . import tombstone
 
 VISIBILITIES = ("private", "team", "common")
 
+import re as _re
+_PRIVATE_MARKERS = _re.compile(
+    r"(?i)\b(api[_ -]?key|token|password|passwd|secret|credential|ssh[_ -]?key|"
+    r"private[_ -]?key|admin[_ -]?token)\b"
+)
+
+
+def guard_promotion(text: str, to_visibility: str) -> tuple:
+    """Deterministic write-guard (APPA-style): same text, same decision, no classifier.
+    Blocks promotion of private memories carrying sensitive markers to shared visibility."""
+    if to_visibility in ("team", "common") and _PRIVATE_MARKERS.search(text):
+        return False, "sensitive marker present in private memory; refusing shared promotion"
+    return True, "ok"
+
 TOKEN_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_.+-]{2,}")
 STOPWORDS = {
     "the", "a", "an", "and", "or", "of", "to", "in", "on", "for", "with",
@@ -132,6 +146,9 @@ def promote(owner_id: str, kind: str, doc_id: str, to_visibility: str) -> dict:
         raise PermissionError("only the creator can promote their memory")
     if s["visibility"] != "private":
         raise ValueError("only private memories can be promoted")
+    allowed, reason = guard_promotion(s["text"], to_visibility)
+    if not allowed:
+        raise ValueError(reason)
     copy = {k: v for k, v in s.items() if k not in ("superseded_by", "supersedes")}
     copy["visibility"] = to_visibility
     copy["promoted_from"] = doc_id
