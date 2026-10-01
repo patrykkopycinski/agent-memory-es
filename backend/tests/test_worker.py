@@ -17,9 +17,8 @@ memory.retain("w1", "semantic", "Python toolchain for repo gates is python3.12 v
 memory.retain("w1", "semantic", "Python toolchain for repo gates is python3.12 venv")
 memory.retain("w2", "semantic", "Worker two note: git identity uses committer contact@patrykkopycinski.com")
 
-stats = run_once()  # dry_run default: proposes only
+stats = run_once()  # now proposes + applies
 assert "w1" in stats and "w2" in stats, stats
-stats = {o: run_once_apply(o) for o in ("w1", "w2")}
 assert stats["w1"]["superseded"] >= 1, stats  # duplicate w1 fact superseded
 hits = memory.recall("w2", "git identity committer email")["fused"]
 assert any("contact@patrykkopycinski.com" in h["text"] for h in hits), hits

@@ -11,9 +11,14 @@ def known_owners() -> list:
 
 
 def run_once() -> dict:
+    """Propose then apply: dry_run pass for visibility, apply pass for supersessions
+    (keep_both stays untouched — surfaced only)."""
     stats = {}
     for owner in known_owners():
-        stats[owner] = memory.consolidate(owner)
+        plan = memory.consolidate(owner, dry_run=True)
+        applied = memory.consolidate(owner, dry_run=False)
+        stats[owner] = {"proposals": len(plan.get("proposals", [])),
+                        "superseded": applied.get("superseded", 0)}
     return stats
 
 
