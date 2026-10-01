@@ -8,6 +8,29 @@ MCP clients ──┼─ FastAPI :8123 ── Elasticsearch ──┼─ semanti
 HTTP / curl ──┘   (auth · ops · worker)           └─ procedural (playbooks)
 ```
 
+## Quickstart (60 seconds)
+
+```bash
+# 1. everything up (ES + API + worker, named volumes):
+cd backend && docker compose -f docker-compose.quickstart.yml up -d
+# 2. mint a key:
+curl -X POST -H 'X-Admin-Token: dev-admin' \
+  'http://localhost:8123/admin/keys?owner_id=you'
+# 3. preflight:
+python ../scripts/ames_doctor.py
+# 4. import your existing memory (governance stores / Hindsight / CLAUDE.md):
+python ../scripts/import_memory.py ~/my-governance-store --dry-run
+python ../scripts/import_memory.py ~/my-governance-store
+# 5. recall from any MCP client (Claude Code, Cursor):
+python ../scripts/ames_mcp_server.py   # reads AMES_SERVICE_URL / AMES_SERVICE_KEY
+```
+
+Preflight trouble → `ames_doctor.py` prints the exact fix for each failure.
+No Docker? Any ES 8.x works — set `AMES_ES_URL`. Importers & MCP bridge:
+**[docs/IMPORTERS.md](docs/IMPORTERS.md)** · usage patterns:
+**[docs/RECIPES.md](docs/RECIPES.md)** (recall-before-read, session-end
+retention hooks, what deserves the bank).
+
 ## Why
 
 Agents forget everything between sessions. This service gives every agent (or human teammate) a memory bank: raw experience, distilled facts, and procedural playbooks — retrievable with hybrid search, isolated per owner, and shareable only on explicit promotion.
@@ -70,12 +93,12 @@ Hermes users: install the [standalone plugin](https://github.com/patrykkopycinsk
 backend/    FastAPI app: memory ops, consolidation worker, MCP endpoint
 backend/hermes_plugin/    reference copy of the Hermes provider plugin
 docs/       architecture, decision records, diagrams
-scripts/    phase-0 spike, seed, isolation tests
+scripts/    doctor, importers, MCP bridge, seed, isolation tests
 ```
 
 ## Status
 
-Phase 0 spike — see docs/PHASE0_PLAN.md. API surface is small and stable; consolidation and reflect are evolving.
+Deployed and in daily use (self-hosted): Hermes memory provider swapped in, MCP farm workers onboarded, consolidation worker running. API surface is small and stable; consolidation and reflect are evolving. History: docs/PHASE0_PLAN.md, docs/AUDIT.md.
 
 ## License
 
