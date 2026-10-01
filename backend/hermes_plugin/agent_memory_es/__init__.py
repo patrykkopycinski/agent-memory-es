@@ -76,7 +76,11 @@ class AgentMemoryEsProvider(MemoryProvider):
         return None
 
     def sync_turn(self, user_content: str, assistant_content: str, **kwargs) -> None:
-        # episodic evidence tier: the user's words, never the assistant's prose
+        # episodic evidence tier: the user's words, never the assistant's prose.
+        # Skip machine noise (hook outputs, banner lines) — it is not evidence.
+        import re as _re
+        if _re.match(r"^\s*\[IMPORTANT:|^=+\s*$|^---", user_content):
+            return
         try:
             self._post("/memory/retain", {"kind": "episodic", "text": user_content[:4000]})
         except Exception:
