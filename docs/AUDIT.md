@@ -40,3 +40,4 @@ Append-only. Every autonomous decision logged with rationale, so any entry can b
 - [2026-10-01] D3 CLOSED — final: adopt guard concept in-code, reject external APPA dependency
 - [2026-10-01] DEPLOY — docker-compose (backend :8123 + worker) targeting am-es-spike ES on m1max; Dockerfile python:3.12-slim; admin token via .env
 - [2026-10-01] WORKER-APPLY — run_once now propose+apply (supersessions auto-applied, keep_both surfaced only); test updated
+- [2026-10-01] HERMES-SWAP — plugin installed to ~/.hermes/hermes-agent/plugins/memory/agent_memory_es; key for owner hermes-default minted into ~/.hermes/.env (AMES_SERVICE_KEY); config.yaml memory.provider hindsight -> agent_memory_es (backup config.yaml.bak-hindsight-swap); live canary retain+recall via HTTP PASS. Hindsight retirement pending soak verification in a NEW session (current session still has Hindsight wired).
