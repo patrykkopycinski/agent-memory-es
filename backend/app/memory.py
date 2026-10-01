@@ -197,15 +197,20 @@ def consolidate(owner_id: str, kind: str = "semantic", similarity_threshold: flo
 
 def reflect(owner_id: str, question: str, llm_answer_fn=None) -> dict:
     """Answer from memory: gather evidence via recall, synthesize if an LLM fn is provided,
-    else return the distilled evidence bundle with per-source attribution."""
+    else return the distilled evidence bundle with per-source attribution. Abstains when
+    no evidence (atlas: irrelevant memory in a prompt bends the answer)."""
     evidence = recall(owner_id, question)
     sources = [h for h in evidence["fused"][:5]]
+    if not sources:
+        return {"question": question, "answer": "INSUFFICIENT_EVIDENCE", "sources": [],
+                "synthesized": False}
     if llm_answer_fn is None:
-        return {
-            "question": question,
-            "answer": " | ".join(s["text"] for s in sources[:3]) or "(no evidence found)",
-            "sources": [s["id"] for s in sources],
-            "synthesized": False,
-        }
-    answer = llm_answer_fn(question, [s["text"] for s in sources])
-    return {"question": question, "answer": answer, "sources": [s["id"] for s in sources], "synthesized": True}
+        from . import llm as _llm
+        fn = _llm.chat
+    else:
+        fn = llm_answer_fn
+    answer = fn(question, sources)
+    cited = [s["id"] for s in sources if s["id"] in (answer or "")]
+    return {"question": question, "answer": answer,
+            "sources": cited or [s["id"] for s in sources],
+            "synthesized": True}

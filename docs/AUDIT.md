@@ -32,3 +32,5 @@ Append-only. Every autonomous decision logged with rationale, so any entry can b
 - [2026-10-01] OPS-TRAP — eval dim-switch left a 3072d index vs 384d store default → 400s; index rebuild is part of any backend switch, encoded in eval flow now
 - [2026-10-01] EVAL-IDEMPOTENT — eval_recall wipes its own ame_eval_* corpus slice per run (delete_by_query on owner prefix) :: re-runs stacked duplicate golds, MRR collapsed 0.907→0.436 on stale corpus; deterministic eval must own its data :: append-only corpus
 - [2026-10-01] WORKER-DRYRUN — worker test updated for dry_run default: run_once() proposes, apply via consolidate(dry_run=False) :: old test asserted mutation on the default path, broke after hardening
+- [2026-10-01] REFLECT — OmniRoute chat completion (auto/best-chat, temp 0), evidence-only synthesis, id citations clipped to retrieved set, INSUFFICIENT_EVIDENCE abstention on empty recall :: atlas finding: retrieval abstention beats bending answers with irrelevant memory; citations restricted to retrieved ids per Hindsight reflect contract
+- [2026-10-01] REFLECT-TEST — out-of-domain question (capital of France) must abstain; PASS
