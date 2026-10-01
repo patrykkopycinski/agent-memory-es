@@ -1,0 +1,58 @@
+version: "3.8"
+
+# One-command quickstart: ES + ames backend + worker, with a named volume.
+#   docker compose -f docker-compose.quickstart.yml up -d
+services:
+  ames-es:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.14.1
+    container_name: ames-es
+    restart: unless-stopped
+    environment:
+      discovery.type: single-node
+      xpack.security.enabled: "false"
+      ES_JAVA_OPTS: -Xms512m -Xmx512m
+    ports:
+      - "9268:9200"
+    volumes:
+      - ames-es-data:/usr/share/elasticsearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9200/_cluster/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  ames-backend:
+    build: ..
+       # or: image: ghcr.io/patrykkopycinski/agent-memory-es:latest
+    container_name: ames-backend
+    restart: unless-stopped
+    depends_on:
+      ames-es:
+        condition: service_healthy
+    environment:
+      AMES_ES_URL: http://ames-es:9200
+      AMES_EMBED_BACKEND: es
+      AMES_ADMIN_TOKEN: ${AMES_ADMIN_TOKEN:-dev-admin}
+      AMES_API_KEYS_FILE: /data/ames_keys.json
+      AMES_CONSOLIDATE_INTERVAL: "600"
+    ports:
+      - "8123:8123"
+    volumes:
+      - ames-app-data:/data
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8123
+
+  ames-worker:
+    build: ..
+    container_name: ames-worker
+    restart: unless-stopped
+    depends_on:
+      ames-es:
+        condition: service_healthy
+    environment:
+      AMES_ES_URL: http://ames-es:9200
+      AMES_EMBED_BACKEND: es
+    command: python -m app.worker
+
+volumes:
+  ames-es-data:
+  ames-app-data:
