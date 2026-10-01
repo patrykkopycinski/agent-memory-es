@@ -25,4 +25,8 @@ services:
     environment:
       AMES_ES_URL: http://host.docker.internal:9268
       AMES_EMBED_BACKEND: es
+      AMES_API_KEYS_FILE: /data/ames_keys.json
+      AMES_CONSOLIDATE_INTERVAL: "600"
+    volumes:
+      - ~/ames-data:/data
     command: python -m app.worker
