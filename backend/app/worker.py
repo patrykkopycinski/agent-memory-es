@@ -9,7 +9,10 @@ from .store import es, idx
 
 def known_owners() -> list:
     keys = auth._load()
-    return sorted({v["owner_id"] for v in keys.values()})
+    # digest entries only — the file also keeps name-keyed plaintext copies
+    # (legacy migration) which would blow up v["owner_id"].
+    return sorted({v["owner_id"] for v in keys.values()
+                   if isinstance(v, dict)})
 
 
 def _already_covered(owner: str, pattern: str) -> bool:
