@@ -10,11 +10,11 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from app import auth  # noqa: E402
 
 
-def test_legacy_plaintext_entry_migrates(tmp_path):
+def test_legacy_plaintext_entry_migrates(tmp_path, monkeypatch):
     keys_file = tmp_path / "keys.json"
     token = "ame_" + "a" * 64
     keys_file.write_text(json.dumps({"hermes-default": token}))
-    auth._keys_file = lambda: str(keys_file)  # type: ignore[assignment]
+    monkeypatch.setattr(auth, "_keys_file", lambda: str(keys_file))
 
     who = auth.owner_of(token)
     assert who == {"owner_id": "hermes-default", "role": "owner"}
@@ -27,9 +27,9 @@ def test_legacy_plaintext_entry_migrates(tmp_path):
     assert on_disk["hermes-default"] == token  # original entry untouched
 
 
-def test_digest_entries_untouched(tmp_path):
+def test_digest_entries_untouched(tmp_path, monkeypatch):
     keys_file = tmp_path / "keys.json"
-    auth._keys_file = lambda: str(keys_file)  # type: ignore[assignment]
+    monkeypatch.setattr(auth, "_keys_file", lambda: str(keys_file))
     token = auth.create_key("alice")
     before = keys_file.read_text()
     auth.owner_of(token)  # triggers _load -> migrate (no-op)
@@ -37,9 +37,9 @@ def test_digest_entries_untouched(tmp_path):
     assert auth.owner_of(token)["owner_id"] == "alice"  # type: ignore[index]
 
 
-def test_non_ame_strings_ignored(tmp_path):
+def test_non_ame_strings_ignored(tmp_path, monkeypatch):
     keys_file = tmp_path / "keys.json"
     keys_file.write_text(json.dumps({"note": "not-a-token"}))
-    auth._keys_file = lambda: str(keys_file)  # type: ignore[assignment]
+    monkeypatch.setattr(auth, "_keys_file", lambda: str(keys_file))
     assert json.loads(keys_file.read_text()) == {"note": "not-a-token"}
     assert auth.owner_of("ame_" + "b" * 64) is None

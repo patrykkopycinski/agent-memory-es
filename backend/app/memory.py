@@ -132,8 +132,59 @@ def recall(owner_id: str, query: str, kinds=None, size: int = 8) -> dict:
         for rank, h in enumerate(hits):
             fused.setdefault(h["id"], {**h, "rrf": 0.0})
             fused[h["id"]]["rrf"] += 1.0 / (60 + rank + 1)
+    GRAPH_RRF_WEIGHT = 0.01  # hop-2 evidence must not outvote lexical+kNN agreement
+    # graph arm: entity two-hop expansion, fused by rank (never dominates other arms)
+    try:
+        from . import graph as _graph
+        for rank, h in enumerate(_graph.graph_expand(owner_id, query, size,
+                                                     _visibility_filter(owner_id))):
+            fused.setdefault(h["id"], {**h, "rrf": 0.0, "arm": "graph"})
+            fused[h["id"]]["rrf"] += GRAPH_RRF_WEIGHT / (60 + rank + 1)
+            fused[h["id"]]["graph_hit"] = True
+    except Exception:
+        pass
+    # temporal arm: window fill spread across the range
+    temporal_meta = None
+    try:
+        from . import temporal as _temporal
+        w = _temporal.parse_window(query)
+        if w:
+            start, end = w
+            buckets = _temporal.spread_buckets(start, end)
+            per_bucket = max(1, size // len(buckets))
+            t_hits = []
+            for bs, be in buckets:
+                rb = es("POST", f"/{idx('episodic')}/_search", {
+                    "size": per_bucket,
+                    "query": {"bool": {
+                        "must": [{"match_all": {}}],
+                        "filter": [{"term": {"active": True}},
+                                   _visibility_filter(owner_id),
+                                   {"range": {"occurred_at": {"gte": bs, "lte": be}}}],
+                    }}, "sort": [{"occurred_at": {"order": "asc"}}]})
+                t_hits += [{"id": h["_id"], "score": h["_score"], "arm": "temporal",
+                            **{k: v for k, v in h["_source"].items() if k != "embedding"}}
+                           for h in rb["hits"]["hits"]]
+            for rank, h in enumerate(t_hits):
+                fused.setdefault(h["id"], {**h, "rrf": 0.0})
+                fused[h["id"]]["rrf"] += 1.0 / (60 + rank + 1)
+                fused[h["id"]]["temporal_hit"] = True
+            temporal_meta = {"window": [start, end], "buckets": len(buckets)}
+    except Exception:
+        pass
     ordered = sorted(fused.values(), key=lambda x: -x["rrf"])
-    return {"query": query, "by_kind": results, "fused": ordered[:size]}
+    out = {"query": query, "by_kind": results, "fused": ordered[:size]}
+    # mental-model priority tier surfaces above facts (like reflect's source order)
+    try:
+        from . import mental_models as _mm
+        m = _mm.match_model(owner_id, query)
+        if m:
+            out["mental_model"] = m
+    except Exception:
+        pass
+    if temporal_meta:
+        out["temporal"] = temporal_meta
+    return out
 
 
 def promote(owner_id: str, kind: str, doc_id: str, to_visibility: str) -> dict:
@@ -212,15 +263,43 @@ def consolidate(owner_id: str, kind: str = "semantic", similarity_threshold: flo
             "superseded": superseded, "proposals": proposals}
 
 
-def reflect(owner_id: str, question: str, llm_answer_fn=None) -> dict:
-    """Answer from memory: gather evidence via recall, synthesize if an LLM fn is provided,
-    else return the distilled evidence bundle with per-source attribution. Abstains when
-    no evidence (atlas: irrelevant memory in a prompt bends the answer)."""
+def reflect(owner_id: str, question: str, llm_answer_fn=None, rounds: int = 3) -> dict:
+    """Answer from memory via a bounded agentic loop: recall (with mental-model
+    priority tier), optionally rewrite the query and recall again when evidence is
+    thin, synthesize if an LLM fn is provided. Cites only retrieved ids.
+    Abstains when no evidence (atlas: irrelevant memory bends the answer)."""
+    from . import mental_models as _mm
+    model = _mm.match_model(owner_id, question)
     evidence = recall(owner_id, question)
     sources = [h for h in evidence["fused"][:5]]
-    if not sources:
+    queries_run = [question]
+    # multi-round: bounded query rewrites extend evidence whenever the LLM is
+    # reachable (Hindsight runs its loop unconditionally; thin-evidence gating
+    # never fires on a corpus with shared memories). llm_answer_fn=False means
+    # "don't synthesize", not "no LLM at all" — rewrites still run.
+    if rounds > 1:
+        from . import llm as _llm
+        try:
+            rewrites = _llm.rewrite_queries(question, rounds - 1)
+            for q in rewrites[:rounds - 1]:
+                queries_run.append(q)
+                more = recall(owner_id, q)
+                seen = {s["id"] for s in sources}
+                for h in more["fused"]:
+                    if h["id"] not in seen and len(sources) < 5:
+                        sources.append(h)
+        except Exception:
+            pass  # rewrite unavailable → single-pass reflect, never fake rounds
+    if not sources and model is None:
         return {"question": question, "answer": "INSUFFICIENT_EVIDENCE", "sources": [],
-                "synthesized": False}
+                "synthesized": False, "queries": queries_run}
+    if model is not None:
+        sources = [{"id": model["id"], "text": model["summary"],
+                    "tier": "mental_model", **{k: v for k, v in model.items()
+                                              if k in ("owner_id", "visibility", "updated_at")}}] + sources
+    if llm_answer_fn is False:
+        return {"question": question, "sources": [s["id"] for s in sources],
+                "evidence": sources, "synthesized": False, "queries": queries_run}
     if llm_answer_fn is None:
         from . import llm as _llm
         fn = _llm.chat
@@ -230,4 +309,4 @@ def reflect(owner_id: str, question: str, llm_answer_fn=None) -> dict:
     cited = [s["id"] for s in sources if s["id"] in (answer or "")]
     return {"question": question, "answer": answer,
             "sources": cited or [s["id"] for s in sources],
-            "synthesized": True}
+            "synthesized": True, "queries": queries_run}

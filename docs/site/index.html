@@ -1,0 +1,187 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>agent-memory-es — long-term memory for AI agents, on Elasticsearch</title>
+<meta name="description" content="Self-owned, Elasticsearch-native long-term memory for AI agents: episodic, semantic and procedural tiers, hybrid recall, private/team/common visibility.">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%2307101F'/><circle cx='13' cy='16' r='7' fill='none' stroke='%2361A2FF' stroke-width='2.5'/><circle cx='22' cy='16' r='7' fill='none' stroke='%23FEC514' stroke-width='2.5' opacity='.8'/></svg>">
+<style>
+  :root{--bg:#07101F;--panel:#0B1628;--panel2:#0E1D33;--fg:#D6E4FF;--muted:#7C8DB0;--accent:#61A2FF;--gold:#FEC514;--border:#1F3050;--mono:ui-monospace,'Roboto Mono','SF Mono',monospace}
+  *{box-sizing:border-box;margin:0;padding:0}
+  html{scroll-behavior:smooth}
+  body{background:var(--bg);color:var(--fg);font-family:Inter,'Segoe UI',system-ui,sans-serif;line-height:1.65;-webkit-font-smoothing:antialiased}
+  a{color:var(--accent)}
+  .wrap{max-width:1060px;margin:0 auto;padding:0 28px}
+  /* hero */
+  .hero{position:relative;overflow:hidden;padding:96px 0 72px;border-bottom:1px solid var(--border);
+    background:radial-gradient(1100px 500px at 75% -10%,rgba(97,162,255,.13),transparent 60%),
+               radial-gradient(700px 380px at 10% 110%,rgba(254,197,20,.07),transparent 60%)}
+  .badge{display:inline-flex;align-items:center;gap:8px;border:1px solid var(--border);background:rgba(97,162,255,.07);
+    border-radius:999px;padding:5px 14px;font-size:.8rem;color:var(--accent);letter-spacing:.04em;text-transform:uppercase;font-weight:600}
+  .badge i{width:7px;height:7px;border-radius:50%;background:#7EE2A8;display:inline-block}
+  h1{font-size:clamp(2.2rem,5.2vw,3.4rem);font-weight:800;letter-spacing:-.025em;margin:20px 0 14px;line-height:1.12}
+  h1 .grad{background:linear-gradient(92deg,#61A2FF 10%,#9BB8FF 55%,#FEC514 110%);-webkit-background-clip:text;background-clip:text;color:transparent}
+  .lede{font-size:1.16rem;color:var(--muted);max-width:46em}
+  .cta{margin-top:30px;display:flex;gap:14px;flex-wrap:wrap}
+  .btn{display:inline-flex;align-items:center;gap:9px;border-radius:10px;padding:12px 22px;font-weight:700;font-size:.95rem;
+    text-decoration:none;transition:transform .12s ease,box-shadow .12s ease}
+  .btn:hover{transform:translateY(-1px)}
+  .btn.primary{background:var(--accent);color:#04101F;box-shadow:0 6px 24px rgba(97,162,255,.25)}
+  .btn.ghost{border:1px solid var(--border);color:var(--fg);background:var(--panel)}
+  .stats{display:flex;gap:0;margin-top:44px;border:1px solid var(--border);border-radius:14px;overflow:hidden;flex-wrap:wrap}
+  .stat{flex:1 1 140px;padding:18px 22px;background:var(--panel)}
+  .stat+.stat{border-left:1px solid var(--border)}
+  .stat b{display:block;font-size:1.5rem;font-weight:800;color:var(--fg)}
+  .stat span{font-size:.8rem;color:var(--muted)}
+  section{padding:70px 0}
+  section.alt{background:var(--panel);border-block:1px solid var(--border)}
+  h2{font-size:1.75rem;font-weight:750;letter-spacing:-.015em;margin-bottom:8px}
+  .kicker{color:var(--accent);font-size:.8rem;font-weight:700;letter-spacing:.12em;text-transform:uppercase;margin-bottom:10px}
+  .sub{color:var(--muted);max-width:52em;margin-bottom:36px}
+  /* cards */
+  .grid3{display:grid;grid-template-columns:repeat(auto-fit,minmax(270px,1fr));gap:18px}
+  .card{background:var(--panel);border:1px solid var(--border);border-radius:14px;padding:26px;transition:border-color .15s}
+  .card:hover{border-color:rgba(97,162,255,.45)}
+  .card .ico{font-size:1.6rem;margin-bottom:12px;display:block}
+  .card h3{font-size:1.05rem;margin-bottom:8px}
+  .card p{color:var(--muted);font-size:.92rem}
+  .card code{font-family:var(--mono);color:var(--gold);font-size:.85em}
+  /* tiers */
+  .tiers{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:18px;margin-top:26px}
+  .tier{position:relative;border-radius:14px;padding:24px;border:1px solid var(--border);background:var(--panel);overflow:hidden}
+  .tier::before{content:'';position:absolute;inset:0 auto 0 0;width:4px}
+  .tier.p::before{background:#61A2FF}.tier.t::before{background:#7EE2A8}.tier.c::before{background:#FEC514}
+  .tier .vis{font-family:var(--mono);font-size:.78rem;letter-spacing:.06em}
+  .tier.p .vis{color:var(--accent)}.tier.t .vis{color:#7EE2A8}.tier.c .vis{color:var(--gold)}
+  .tier h3{margin:8px 0}
+  .tier p{color:var(--muted);font-size:.9rem}
+  /* pipeline */
+  .flow{display:flex;flex-wrap:wrap;gap:0;margin-top:10px}
+  .step{flex:1 1 170px;background:var(--panel2);border:1px solid var(--border);border-radius:12px;padding:20px;position:relative;margin:10px 0}
+  .step+.step{margin-left:28px}
+  .step+.step::before{content:'→';position:absolute;left:-24px;top:44%;color:var(--accent);font-size:1.2rem}
+  .step .n{font-family:var(--mono);color:var(--accent);font-size:.75rem}
+  .step h3{font-size:.98rem;margin:5px 0}
+  .step p{color:var(--muted);font-size:.83rem}
+  /* diagram frame */
+  .frame{border:1px solid var(--border);border-radius:16px;overflow:hidden;background:var(--panel);margin-top:22px}
+  .frame-head{display:flex;justify-content:space-between;align-items:center;padding:12px 18px;border-bottom:1px solid var(--border);font-size:.85rem;color:var(--muted)}
+  .frame-head a{font-size:.8rem}
+  .frame iframe{display:block;width:100%;height:620px;border:0;background:var(--bg)}
+  .frame.static img{display:block;width:100%;border-radius:0}
+  /* code */
+  pre{background:#050B14;border:1px solid var(--border);border-radius:12px;padding:20px;overflow:auto;
+    font-family:var(--mono);font-size:.82rem;color:#9FB6DC;line-height:1.7}
+  pre .c{color:#5E729B}pre .k{color:#61A2FF}pre .s{color:#7EE2A8}pre .o{color:#FEC514}
+  footer{border-top:1px solid var(--border);padding:36px 0;color:var(--muted);font-size:.85rem}
+  footer .wrap{display:flex;justify-content:space-between;gap:16px;flex-wrap:wrap}
+  @media(max-width:640px){.frame iframe{height:460px}}
+</style>
+</head>
+<body>
+
+<header class="hero">
+  <div class="wrap">
+    <span class="badge"><i></i>Open source · MIT · Phase 0 spike</span>
+    <h1>Your agents deserve<br><span class="grad">a memory that survives</span> the session.</h1>
+    <p class="lede">agent-memory-es is a self-owned, Elasticsearch-native long-term memory service for AI agents — three memory tiers, hybrid recall, and strict private/team/common visibility. Run it on your cluster; no memory SaaS between your agents and their past.</p>
+    <div class="cta">
+      <a class="btn primary" href="#quickstart">Quick start</a>
+      <a class="btn ghost" href="https://github.com/patrykkopycinski/agent-memory-es">GitHub ↗</a>
+      <a class="btn ghost" href="topology.html">Interactive diagram</a>
+    </div>
+    <div class="stats">
+      <div class="stat"><b>3</b><span>memory tiers — episodic · semantic · procedural</span></div>
+      <div class="stat"><b>2→1</b><span>BM25 + kNN arms, RRF-fused into one ranking</span></div>
+      <div class="stat"><b>0</b><span>visibility a client can widen — owner comes from the API key</span></div>
+    </div>
+  </div>
+</header>
+
+<section id="why">
+  <div class="wrap">
+    <p class="kicker">Why</p>
+    <h2>Context windows are whiteboards.<br>They get erased.</h2>
+    <p class="sub">Every session starts from zero: re-explained preferences, re-discovered decisions, re-learned mistakes. A memory bank fixes that — with the same discipline you'd expect from any multi-user data store.</p>
+    <div class="grid3">
+      <div class="card"><span class="ico">🧠</span><h3>Three kinds of memory</h3><p><code>episodic</code> raw events in the user's words, <code>semantic</code> distilled facts, <code>procedural</code> playbooks. Each searched together or apart.</p></div>
+      <div class="card"><span class="ico">🔐</span><h3>Tenancy is not a filter arg</h3><p>Owner identity comes from the API key. The recall filter <code>owner_id == me OR visibility ∈ {team, common}</code> is applied server-side, on both retrieval arms.</p></div>
+      <div class="card"><span class="ico">🛡️</span><h3>Guarded promotion</h3><p>private → team/common passes a deterministic sensitive-marker guard. "Forget this" tombstones block re-learning forgotten values.</p></div>
+      <div class="card"><span class="ico">🔎</span><h3>Hybrid recall</h3><p>BM25 over text + entities, dense kNN over embeddings, fused with RRF, cut to a token budget. No embeddings backend? Degrades to BM25-only.</p></div>
+      <div class="card"><span class="ico">🧹</span><h3>Memory that maintains itself</h3><p>A consolidation worker proposes and applies dedup/supersession across semantic facts. Superseded docs stay as audit history.</p></div>
+      <div class="card"><span class="ico">🔌</span><h3>Any agent can plug in</h3><p>Hermes provider plugin, MCP endpoint (Claude Code, Cursor, Codex), or plain <code>curl</code>. Same five operations everywhere.</p></div>
+    </div>
+  </div>
+</section>
+
+<section class="alt" id="visibility">
+  <div class="wrap">
+    <p class="kicker">Visibility model</p>
+    <h2>Shared knowledge, private banks.</h2>
+    <p class="sub">One store, three visibility levels, one server-side rule. A team playbook and a personal API key never mix by accident.</p>
+    <div class="tiers">
+      <div class="tier p"><span class="vis">private</span><h3>Only the owner</h3><p>Default for everything. Recall filter pins <code>owner_id</code> to the API key's owner — never a request argument.</p></div>
+      <div class="tier t"><span class="vis">team</span><h3>Team-shared</h3><p>Explicit promotion only, through the deterministic guard. Sensitive-marker text stays private, same text ⇒ same decision.</p></div>
+      <div class="tier c"><span class="vis">common</span><h3>Everyone</h3><p>Fleet-wide playbooks and procedural knowledge. Rejection tombstones keep forgotten values from sneaking back.</p></div>
+    </div>
+  </div>
+</section>
+
+<section id="architecture">
+  <div class="wrap">
+    <p class="kicker">Architecture</p>
+    <h2>Small surface, boring parts, real guarantees.</h2>
+    <p class="sub">FastAPI in front of Elasticsearch, a consolidation worker behind it. Every box below is clickable in the <a href="topology.html">interactive version</a> — with links to the exact source lines.</p>
+    <div class="frame">
+      <div class="frame-head"><b>System topology</b> <span>archify · source-linked · <a href="topology.html" target="_blank">open full diagram ↗</a></span></div>
+      <iframe src="topology.html" title="agent-memory-es system topology" loading="lazy"></iframe>
+    </div>
+  </div>
+</section>
+
+<section class="alt" id="pipeline">
+  <div class="wrap">
+    <p class="kicker">Recall pipeline</p>
+    <h2>Two arms, one ranking, zero score tuning.</h2>
+    <div class="flow">
+      <div class="step"><span class="n">01</span><h3>Visibility filter</h3><p>Applied to both arms before anything scores.</p></div>
+      <div class="step"><span class="n">02</span><h3>BM25 arm</h3><p>Match over text + extracted entities.</p></div>
+      <div class="step"><span class="n">03</span><h3>kNN arm</h3><p>Dense-vector top-k similarity.</p></div>
+      <div class="step"><span class="n">04</span><h3>RRF fuse</h3><p>Rank fusion across arms — no cross-arm score tuning.</p></div>
+      <div class="step"><span class="n">05</span><h3>Budget cut</h3><p>Top fused hits until the token budget is spent.</p></div>
+    </div>
+    <div class="frame static">
+      <div class="frame-head"><b>Recall pipeline (static)</b> <a href="diagrams/recall-pipeline.svg" target="_blank">open SVG ↗</a></div>
+      <img src="diagrams/recall-pipeline.svg" alt="Recall pipeline: BM25 arm and kNN arm, both visibility-filtered, fused with RRF, cut at a token budget" loading="lazy">
+    </div>
+  </div>
+</section>
+
+<section id="quickstart">
+  <div class="wrap">
+    <p class="kicker">Quick start</p>
+    <h2>Running in three commands.</h2>
+    <pre><span class="c"># 1. boot the stack (backend :8123 + worker + Elasticsearch)</span>
+<span class="o">cd</span> backend && <span class="o">export</span> AMES_ADMIN_TOKEN=<span class="s">change-me</span> && docker compose up <span class="k">-d</span>
+
+<span class="c"># 2. mint a key — owner identity binds to it</span>
+<span class="o">curl</span> -s -X POST <span class="s">"localhost:8123/admin/keys?owner_id=alice"</span> -H <span class="s">"X-Admin-Token: $AMES_ADMIN_TOKEN"</span>
+
+<span class="c"># 3. remember, then recall</span>
+<span class="o">curl</span> -s -X POST localhost:8123/memory/retain -H <span class="s">"X-API-Key: $KEY"</span> \
+  -d <span class="s">'{"kind":"semantic","text":"Deploys go through OmniRoute catchup branches"}'</span>
+<span class="o">curl</span> -s -X POST localhost:8123/memory/recall -H <span class="s">"X-API-Key: $KEY"</span> \
+  -d <span class="s">'{"query":"how do deploys work"}'</span></pre>
+    <p class="sub" style="margin-top:18px">Hermes Agent user? Install the <a href="https://patrykkopycinski.github.io/hermes-plugin-agent-memory-es/">standalone plugin ↗</a> and these become native agent tools.</p>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">
+    <span>agent-memory-es · MIT license · Phase 0 spike</span>
+    <span><a href="https://github.com/patrykkopycinski/agent-memory-es">GitHub</a> · <a href="https://github.com/patrykkopycinski/agent-memory-es/blob/main/docs/ARCHITECTURE.md">Architecture</a> · <a href="explainer.html">Explainer</a> · <a href="plugin-flow.html">Plugin flow</a></span>
+  </div>
+</footer>
+</body>
+</html>

@@ -1,0 +1,91 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="600" viewBox="0 0 960 600" font-family="Inter, 'Segoe UI', sans-serif">
+  <defs>
+    <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#61A2FF"/>
+    </marker>
+    <linearGradient id="hdr" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#0B1628"/><stop offset="1" stop-color="#07101F"/>
+    </linearGradient>
+  </defs>
+  <rect width="960" height="600" fill="#07101F"/>
+  <text x="24" y="36" fill="#D6E4FF" font-size="20" font-weight="700">agent-memory-es — system topology</text>
+  <text x="24" y="56" fill="#7C8DB0" font-size="12">Surfaces → FastAPI service → Elasticsearch store</text>
+
+  <!-- Clients column -->
+  <g>
+    <rect x="24" y="90" width="200" height="52" rx="8" fill="#0B1628" stroke="#61A2FF" stroke-opacity=".5"/>
+    <text x="124" y="112" fill="#D6E4FF" font-size="13" text-anchor="middle" font-weight="600">Hermes Agent</text>
+    <text x="124" y="129" fill="#7C8DB0" font-size="10" text-anchor="middle">memory provider plugin</text>
+
+    <rect x="24" y="158" width="200" height="52" rx="8" fill="#0B1628" stroke="#61A2FF" stroke-opacity=".5"/>
+    <text x="124" y="180" fill="#D6E4FF" font-size="13" text-anchor="middle" font-weight="600">MCP clients</text>
+    <text x="124" y="197" fill="#7C8DB0" font-size="10" text-anchor="middle">Claude Code · Cursor · Codex</text>
+
+    <rect x="24" y="226" width="200" height="52" rx="8" fill="#0B1628" stroke="#61A2FF" stroke-opacity=".5"/>
+    <text x="124" y="248" fill="#D6E4FF" font-size="13" text-anchor="middle" font-weight="600">HTTP / curl</text>
+    <text x="124" y="265" fill="#7C8DB0" font-size="10" text-anchor="middle">X-API-Key per owner</text>
+  </g>
+
+  <!-- Service -->
+  <rect x="300" y="80" width="330" height="420" rx="12" fill="url(#hdr)" stroke="#61A2FF" stroke-opacity=".7"/>
+  <text x="465" y="108" fill="#61A2FF" font-size="14" text-anchor="middle" font-weight="700">FastAPI service (backend/app)</text>
+
+  <rect x="324" y="126" width="282" height="44" rx="6" fill="#0B1628" stroke="#2C3E5D"/>
+  <text x="465" y="145" fill="#D6E4FF" font-size="12" text-anchor="middle" font-weight="600">auth middleware — API key → owner_id, role</text>
+  <text x="465" y="161" fill="#7C8DB0" font-size="10" text-anchor="middle">auth.py · data/api_keys.json</text>
+
+  <rect x="324" y="182" width="282" height="44" rx="6" fill="#0B1628" stroke="#2C3E5D"/>
+  <text x="465" y="201" fill="#D6E4FF" font-size="12" text-anchor="middle" font-weight="600">memory ops — retain · recall · promote</text>
+  <text x="465" y="217" fill="#7C8DB0" font-size="10" text-anchor="middle">memory.py · visibility guard · entity extraction</text>
+
+  <rect x="324" y="238" width="282" height="44" rx="6" fill="#0B1628" stroke="#2C3E5D"/>
+  <text x="465" y="257" fill="#D6E4FF" font-size="12" text-anchor="middle" font-weight="600">reflect — LLM answer w/ citations</text>
+  <text x="465" y="273" fill="#7C8DB0" font-size="10" text-anchor="middle">llm.py · any OpenAI-compatible endpoint</text>
+
+  <rect x="324" y="294" width="282" height="44" rx="6" fill="#0B1628" stroke="#2C3E5D"/>
+  <text x="465" y="313" fill="#D6E4FF" font-size="12" text-anchor="middle" font-weight="600">consolidation worker — dedup / supersede</text>
+  <text x="465" y="329" fill="#7C8DB0" font-size="10" text-anchor="middle">worker.py · dry-run propose, then apply</text>
+
+  <rect x="324" y="350" width="282" height="44" rx="6" fill="#0B1628" stroke="#2C3E5D"/>
+  <text x="465" y="369" fill="#D6E4FF" font-size="12" text-anchor="middle" font-weight="600">MCP endpoint — /mcp/tools/{tool}</text>
+  <text x="465" y="385" fill="#7C8DB0" font-size="10" text-anchor="middle">main.py · thin adapter over memory ops</text>
+
+  <rect x="324" y="406" width="282" height="44" rx="6" fill="#0B1628" stroke="#2C3E5D"/>
+  <text x="465" y="425" fill="#D6E4FF" font-size="12" text-anchor="middle" font-weight="600">embeddings — ES bulk or OpenRouter</text>
+  <text x="465" y="441" fill="#7C8DB0" font-size="10" text-anchor="middle">embeddings.py · BM25-only degrade on failure</text>
+
+  <!-- ES -->
+  <rect x="700" y="80" width="236" height="420" rx="12" fill="url(#hdr)" stroke="#FEC514" stroke-opacity=".55"/>
+  <text x="818" y="108" fill="#FEC514" font-size="14" text-anchor="middle" font-weight="700">Elasticsearch</text>
+  <g font-size="11">
+    <rect x="722" y="126" width="192" height="58" rx="6" fill="#0B1628" stroke="#2C3E5D"/>
+    <text x="818" y="149" fill="#D6E4FF" text-anchor="middle" font-weight="600">episodic index</text>
+    <text x="818" y="166" fill="#7C8DB0" text-anchor="middle" font-size="10">raw events, user words</text>
+
+    <rect x="722" y="196" width="192" height="58" rx="6" fill="#0B1628" stroke="#2C3E5D"/>
+    <text x="818" y="219" fill="#D6E4FF" text-anchor="middle" font-weight="600">semantic index</text>
+    <text x="818" y="236" fill="#7C8DB0" text-anchor="middle" font-size="10">distilled facts</text>
+
+    <rect x="722" y="266" width="192" height="58" rx="6" fill="#0B1628" stroke="#2C3E5D"/>
+    <text x="818" y="289" fill="#D6E4FF" text-anchor="middle" font-weight="600">procedural index</text>
+    <text x="818" y="306" fill="#7C8DB0" text-anchor="middle" font-size="10">playbooks / skills</text>
+
+    <rect x="722" y="340" width="192" height="66" rx="6" fill="#0B1628" stroke="#2C3E5D"/>
+    <text x="818" y="362" fill="#D6E4FF" text-anchor="middle" font-weight="600">shared mapping</text>
+    <text x="818" y="377" fill="#7C8DB0" text-anchor="middle" font-size="10">owner_id · visibility · entities</text>
+    <text x="818" y="392" fill="#7C8DB0" text-anchor="middle" font-size="10">text · embedding(384, indexed)</text>
+  </g>
+  <text x="818" y="440" fill="#7C8DB0" font-size="10" text-anchor="middle">hybrid query: BM25 + kNN,</text>
+  <text x="818" y="455" fill="#7C8DB0" font-size="10" text-anchor="middle">fused with RRF (memory.py recall)</text>
+
+  <!-- arrows -->
+  <g stroke="#61A2FF" stroke-width="1.5" fill="none" marker-end="url(#arr)">
+    <path d="M224,116 C270,116 270,148 324,148"/>
+    <path d="M224,184 C270,184 270,204 324,204"/>
+    <path d="M224,252 C270,252 270,260 324,260"/>
+    <path d="M630,204 C672,204 672,155 722,155"/>
+    <path d="M630,204 C672,204 672,225 722,225"/>
+    <path d="M630,204 C672,204 672,295 722,295"/>
+  </g>
+  <text x="465" y="560" fill="#7C8DB0" font-size="11" text-anchor="middle">Visibility rule (recall filter, memory.py): owner_id == me  OR  visibility ∈ {team, common} — a profile can never widen it client-side</text>
+</svg>

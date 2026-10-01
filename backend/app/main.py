@@ -5,15 +5,17 @@ from typing import Optional
 from fastapi import Depends, FastAPI, Header, HTTPException
 from pydantic import BaseModel
 
-from . import auth, memory
+from . import auth, memory, pages as pages_mod, mental_models as mm_mod, reranker
 from .store import KINDS, ensure_indices
 
-app = FastAPI(title="agent-memory-es", version="0.1.0")
+app = FastAPI(title="agent-memory-es", version="0.2.0")
 
 
 @app.on_event("startup")
 def _startup():
     ensure_indices()
+    pages_mod.ensure_pages_index()
+    mm_mod.ensure_models_index()
 
 
 def caller(x_api_key: Optional[str] = Header(None)) -> dict:
@@ -82,6 +84,60 @@ def consolidate(who: dict = Depends(caller)):
 @app.post("/memory/reflect")
 def reflect(body: ReflectIn, who: dict = Depends(caller)):
     return memory.reflect(who["owner_id"], body.question)
+
+
+class PageIn(BaseModel):
+    scope: str
+
+
+@app.post("/memory/pages/refresh")
+def page_refresh(body: PageIn, who: dict = Depends(caller)):
+    """Regenerate one knowledge page from the owner's active semantic facts in scope."""
+    r = memory.recall(who["owner_id"], body.scope, kinds=["semantic"], size=50)
+    facts = [{"id": h["id"], "text": h["text"], "occurred_at": h.get("occurred_at")}
+             for h in r["by_kind"].get("semantic", [])]
+    if not facts:
+        raise HTTPException(422, "no facts in scope")
+    return pages_mod.refresh_page(who["owner_id"], body.scope, facts)
+
+
+@app.get("/memory/pages")
+def page_list(who: dict = Depends(caller)):
+    return {"pages": pages_mod.list_pages(who["owner_id"])}
+
+
+@app.get("/memory/pages/{scope}")
+def page_get(scope: str, who: dict = Depends(caller)):
+    p = pages_mod.get_page(who["owner_id"], scope)
+    if not p:
+        raise HTTPException(404, "no page for scope")
+    return p
+
+
+class ModelIn(BaseModel):
+    question_pattern: str
+    summary: str
+    visibility: str = "private"
+
+
+@app.post("/memory/models")
+def model_upsert(body: ModelIn, who: dict = Depends(caller)):
+    return mm_mod.upsert_model(who["owner_id"], body.question_pattern, body.summary,
+                               body.visibility)
+
+
+class RerankIn(BaseModel):
+    query: str
+    hits: list
+    top_n: int = 5
+
+
+@app.post("/memory/rerank")
+def rerank_ep(body: RerankIn, who: dict = Depends(caller)):
+    out = reranker.rerank(body.query, body.hits, body.top_n)
+    if not out["reranked"]:
+        return {**out, "note": "rerank unavailable (license/model); identity order returned"}
+    return out
 
 
 @app.post("/mcp/tools/{tool}")

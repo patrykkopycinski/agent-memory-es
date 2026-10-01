@@ -31,3 +31,29 @@ def chat(question: str, evidence: list) -> str:
     with urllib.request.urlopen(req, timeout=120) as r:
         out = json.load(r)
     return out["choices"][0]["message"]["content"]
+
+
+REWRITE_SYSTEM = (
+    "Rewrite the question as 2 alternative search queries for a memory bank. "
+    "Use different vocabulary than the original. Reply with one query per line, "
+    "nothing else."
+)
+
+
+def rewrite_queries(question: str, n: int = 2) -> list:
+    """Generate alternative recall queries for reflect's multi-round loop."""
+    body = json.dumps({
+        "model": MODEL, "temperature": 0.3,
+        "messages": [
+            {"role": "system", "content": REWRITE_SYSTEM},
+            {"role": "user", "content": question},
+        ],
+    }).encode()
+    req = urllib.request.Request(BASE + "/chat/completions", data=body, method="POST",
+                                 headers={"Content-Type": "application/json",
+                                          "Authorization": f"Bearer {KEY}"})
+    with urllib.request.urlopen(req, timeout=60) as r:
+        out = json.load(r)
+    lines = [l.strip().lstrip("0123456789.-) ") for l in
+             out["choices"][0]["message"]["content"].splitlines() if l.strip()]
+    return lines[:n]
