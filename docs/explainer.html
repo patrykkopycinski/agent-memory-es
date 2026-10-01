@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>agent-memory-es — pipeline walkthrough</title>
+<style>
+  :root{--bg:#07101F;--panel:#0B1628;--panel2:#0E1D33;--fg:#D6E4FF;--muted:#7C8DB0;--accent:#61A2FF;--gold:#FEC514;--border:#2C3E5D;--mono:ui-monospace,'Roboto Mono',monospace}
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:var(--bg);color:var(--fg);font-family:Inter,'Segoe UI',system-ui,sans-serif;line-height:1.6;padding:32px}
+  .wrap{max-width:900px;margin:0 auto}
+  h1{font-size:1.7rem;font-weight:800}
+  .sub{color:var(--muted);margin-bottom:24px}
+  .tabs{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:20px}
+  .tab{background:var(--panel);border:1px solid var(--border);border-radius:8px;color:var(--muted);padding:8px 16px;cursor:pointer;font-size:.9rem;font-family:inherit}
+  .tab.on{border-color:var(--accent);color:var(--fg)}
+  .pane{display:none}
+  .pane.on{display:block}
+  .pane{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:24px}
+  .pane h2{font-size:1.1rem;margin-bottom:6px}
+  .pane h2 code{color:var(--gold);font-family:var(--mono);font-size:.9em}
+  .pane p{color:var(--muted);font-size:.92rem;margin-bottom:14px}
+  .chain{list-style:none}
+  .chain li{border-left:2px solid var(--border);padding:10px 0 10px 16px;margin-left:8px;position:relative}
+  .chain li::before{content:'';position:absolute;left:-6px;top:16px;width:10px;height:10px;border-radius:50%;background:var(--accent)}
+  .chain b{color:var(--fg)}
+  .chain span{color:var(--muted);font-size:.88rem}
+  .chain code{font-family:var(--mono);font-size:.8em;color:var(--gold)}
+  pre{background:#050B14;border:1px solid var(--border);border-radius:8px;padding:14px;overflow:auto;font-family:var(--mono);font-size:.8rem;color:#9FB6DC;margin:10px 0}
+  .demo{margin-top:16px}
+  .demo label{font-size:.85rem;color:var(--muted);display:block;margin-bottom:6px}
+  .demo input[type=text]{width:100%;background:#050B14;border:1px solid var(--border);border-radius:8px;color:var(--fg);font-family:var(--mono);font-size:.85rem;padding:10px 12px}
+  button{background:var(--accent);border:none;border-radius:8px;color:#07101F;font-weight:700;padding:10px 18px;cursor:pointer;font-family:inherit;margin-top:10px}
+  button:hover{filter:brightness(1.1)}
+  .out{margin-top:14px;font-family:var(--mono);font-size:.8rem;white-space:pre-wrap;color:#9FB6DC;background:#050B14;border:1px solid var(--border);border-radius:8px;padding:14px;min-height:2em;display:none}
+  .ok{color:#7EE2A8}.bad{color:#FF8A8A}.dim{color:var(--muted)}
+  .src{margin-top:18px;font-size:.78rem;color:var(--muted)}
+  .src code{font-family:var(--mono);color:var(--accent)}
+  a{color:var(--accent)}
+</style>
+</head>
+<body>
+<div class="wrap">
+<h1>Pipeline walkthrough</h1>
+<p class="sub">Every mechanism below mirrors real code paths — source file named per step. <a href="index.html">← landing page</a></p>
+
+<div class="tabs">
+  <button class="tab on" data-p="p1">1 · Retain</button>
+  <button class="tab" data-p="p2">2 · Recall</button>
+  <button class="tab" data-p="p3">3 · Reflect</button>
+  <button class="tab" data-p="p4">4 · Promote & guard</button>
+  <button class="tab" data-p="p5">5 · Consolidate</button>
+</div>
+
+<div class="pane on" id="p1">
+  <h2>Retain — <code>POST /memory/retain</code></h2>
+  <p>A memory lands in one of three indices with a full tenancy envelope.</p>
+  <ul class="chain">
+    <li><b>Validate</b> — <span>kind ∈ episodic/semantic/procedural, visibility ∈ private/team/common</span> <code>memory.py:retain</code></li>
+    <li><b>Tombstone check</b> — <span>if the user rejected this exact value before, retain raises</span> <code>tombstone.py:is_rejected</code></li>
+    <li><b>Embed</b> — <span>dense vector via ES inference or OpenAI-compatible endpoint; on failure → BM25-only, never a rejected write</span> <code>embeddings.py</code></li>
+    <li><b>Index</b> — <span>doc with owner_id (from API key), visibility, entities, occurred_at</span> <code>store.py MAPPINGS</code></li>
+  </ul>
+  <div class="demo">
+    <label>Your text (entities are extracted and indexed as keywords):</label>
+    <input type="text" id="t1" value="Deploys go through OmniRoute catchup branches">
+    <button onclick="d1()">Retain (simulated)</button>
+    <div class="out" id="o1"></div>
+  </div>
+  <p class="src">Source: <code>backend/app/memory.py</code> · <code>store.py</code></p>
+</div>
+
+<div class="pane" id="p2">
+  <h2>Recall — <code>POST /memory/recall</code></h2>
+  <p>Two retrieval arms over the visibility-filtered set, fused by rank.</p>
+  <ul class="chain">
+    <li><b>Visibility filter</b> — <span>owner_id == caller OR visibility ∈ {team, common}; identity is the API key, never an argument</span> <code>memory.py:_visibility_filter</code></li>
+    <li><b>BM25 arm</b> — <span>match over text + entities</span></li>
+    <li><b>kNN arm</b> — <span>top-k by dense_vector similarity</span></li>
+    <li><b>RRF fuse</b> — <span>rank-based fusion, then token-budget cut</span></li>
+  </ul>
+  <div class="demo">
+    <label>Query as a different owner would see it:</label>
+    <input type="text" id="t2" value="how do deploys work">
+    <button onclick="d2()">Recall (simulated, 3 docs)</button>
+    <div class="out" id="o2"></div>
+  </div>
+  <p class="src">Source: <code>backend/app/memory.py</code> · diagram: <code>docs/diagrams/recall-pipeline.svg</code></p>
+</div>
+
+<div class="pane" id="p3">
+  <h2>Reflect — <code>POST /memory/reflect</code></h2>
+  <p>Recall as evidence, then an LLM answers with citations.</p>
+  <ul class="chain">
+    <li><b>Gather evidence</b> — <span>same recall pipeline, top hits as context</span> <code>memory.py</code></li>
+    <li><b>LLM call</b> — <span>any OpenAI-compatible endpoint</span> <code>llm.py (AMES_LLM_BASE)</code></li>
+    <li><b>Cited answer</b> — <span>response references memory ids it used</span> <code>main.py:reflect</code></li>
+  </ul>
+  <pre>Q: how do deploys work?
+A: Deploys go through OmniRoute catchup branches [ames-semantic:Zu3f...]
+   — 1 source, owner-scoped evidence only</pre>
+  <p class="src">Source: <code>backend/app/llm.py</code> · <code>main.py</code></p>
+</div>
+
+<div class="pane" id="p4">
+  <h2>Promote & the guard — <code>POST /memory/promote</code></h2>
+  <p>private → team/common is an explicit, guarded operation.</p>
+  <ul class="chain">
+    <li><b>Deterministic guard</b> — <span>regex over sensitive markers (api key, token, secret, credential, ssh key…); a hit blocks shared promotion</span> <code>memory.py:guard_promotion</code></li>
+    <li><b>Same text, same decision</b> — <span>no classifier, no LLM in the path</span></li>
+    <li><b>Rejection tombstones</b> — <span>"forget this" survives as a block on re-learning</span> <code>tombstone.py</code></li>
+  </ul>
+  <div class="demo">
+    <label>Try promoting this private memory to team:</label>
+    <input type="text" id="t4" value="my api key is sk-live-9f2c...">
+    <button onclick="d4()">Promote (simulated)</button>
+    <div class="out" id="o4"></div>
+  </div>
+  <p class="src">Source: <code>backend/app/memory.py</code> (guard_promotion, _PRIVATE_MARKERS) · tests: <code>backend/tests/test_promotion_guard.py</code></p>
+</div>
+
+<div class="pane" id="p5">
+  <h2>Consolidate — worker loop</h2>
+  <p>Semantic facts rot; the worker proposes and then applies supersessions.</p>
+  <ul class="chain">
+    <li><b>Every interval</b> — <span>default 600 s</span> <code>worker.py (AMES_CONSOLIDATE_INTERVAL)</code></li>
+    <li><b>Propose pass</b> — <span>dry-run: duplicates / supersessions surfaced for visibility</span> <code>memory.consolidate(dry_run=True)</code></li>
+    <li><b>Apply pass</b> — <span>supersede old facts; keep_both cases are surfaced, never auto-merged</span></li>
+    <li><b>Audit</b> — <span>superseded docs flagged inactive, not deleted</span></li>
+  </ul>
+  <pre>14:02:11 {'alice': {'proposals': 3, 'superseded': 2}}</pre>
+  <p class="src">Source: <code>backend/app/worker.py</code> · tests: <code>backend/tests/test_worker.py</code></p>
+</div>
+</div>
+
+<script>
+const M = /api[_ -]?key|token|password|passwd|secret|credential|ssh[_ -]?key|private[_ -]?key|admin[_ -]?token/i;
+const SW = new Set(["the","a","an","and","or","of","to","in","on","for","with","is","are","was","were","be","been","it","its","this","that","what","which","who","whom","how","when","where","why","did","does","do","has","have","had","user","uses","using","use"]);
+function ents(t){const out=[],s=new Set();for(const m of t.match(/[A-Za-z_][A-Za-z0-9_.+-]{2,}/g)||[]){const l=m.toLowerCase();if(!SW.has(l)&&!s.has(l)){s.add(l);out.push(l);if(out.length>=12)break;}}return out;}
+const rid=()=>'ames-'+Math.random().toString(36).slice(2,8);
+function show(id,html){const el=document.getElementById(id);el.style.display='block';el.innerHTML=html;} // safe: html is built only from template literals + the visitor's own local input; no remote/untrusted content in this static demo
+function d1(){const t=document.getElementById('t1').value;const id=rid();show('o1',`<span class="ok">201 retained</span> ${id}\n{\n  "kind": "semantic",\n  "owner_id": "alice",        <span class="dim">// from X-API-Key, not the body</span>\n  "visibility": "private",\n  "text": ${JSON.stringify(t)},\n  "entities": ${JSON.stringify(ents(t))},\n  "embedding": [${Array(3).fill('0.').map(()=>Math.random().toFixed(3)).join(', ')} …384 dims],\n  "active": true\n}`);}
+function d2(){const q=document.getElementById('t2').value;const e=ents(q);show('o2',`<span class="ok">200 recall</span> query=${JSON.stringify(q)}\n<span class="dim">filter: owner_id=="alice" OR visibility in (team, common)</span>\n\n<span class="dim">BM25 arm:</span>  ames-semantic:dep01 <span class="dim">(text+entities match)</span>\n<span class="dim">kNN arm:</span>    ames-semantic:dep01, ames-procedural:rel05\n<span class="dim">RRF fused:</span>\n  1. dep01 <span class="dim">"Deploys go through OmniRoute catchup branches" (private, owner=alice)</span>\n  2. rel05 <span class="dim">"Release flow checklist" (team)</span>\n<span class="dim">— cut at token budget; bob would NOT see dep01 (private, not his)</span>`);}
+function d4(){const t=document.getElementById('t4').value;if(M.test(t)){show('o4',`<span class="bad">403 refused</span>\n"reason": "sensitive marker present in private memory; refusing shared promotion"\n<span class="dim">matched: ${M.exec(t)[0]} — memory.py:guard_promotion (deterministic, same text ⇒ same decision)</span>`);}else{show('o4',`<span class="ok">200 promoted</span> ${rid()} private → team\n<span class="dim">no sensitive marker; now visible to team recall</span>`);}}
+document.querySelectorAll('.tab').forEach(b=>b.onclick=()=>{document.querySelectorAll('.tab').forEach(x=>x.classList.remove('on'));document.querySelectorAll('.pane').forEach(x=>x.classList.remove('on'));b.classList.add('on');document.getElementById(b.dataset.p).classList.add('on');});
+</script>
+</body>
+</html>

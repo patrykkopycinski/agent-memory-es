@@ -85,16 +85,16 @@ class AgentMemoryEsProvider(MemoryProvider):
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
         return [
             {"name": "agent_memory_recall", "description": "Search the long-term memory bank",
-             "input_schema": {"type": "object", "properties": {"query": {"type": "string"}},
+             "parameters": {"type": "object", "properties": {"query": {"type": "string"}},
                               "required": ["query"]}},
             {"name": "agent_memory_retain", "description": "Store a durable fact in memory",
-             "input_schema": {"type": "object",
+             "parameters": {"type": "object",
                               "properties": {"text": {"type": "string"},
                                              "visibility": {"type": "string",
                                                             "enum": ["private", "team", "common"]}},
                               "required": ["text"]}},
             {"name": "agent_memory_reflect", "description": "Answer a question from memory with citations",
-             "input_schema": {"type": "object", "properties": {"question": {"type": "string"}},
+             "parameters": {"type": "object", "properties": {"question": {"type": "string"}},
                               "required": ["question"]}},
         ]
 

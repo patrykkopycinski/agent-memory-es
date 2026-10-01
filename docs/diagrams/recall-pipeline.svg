@@ -1,0 +1,47 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="340" viewBox="0 0 960 340" font-family="Inter, 'Segoe UI', sans-serif">
+  <defs>
+    <marker id="arr2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#61A2FF"/>
+    </marker>
+  </defs>
+  <rect width="960" height="340" fill="#07101F"/>
+  <text x="24" y="34" fill="#D6E4FF" font-size="18" font-weight="700">Recall pipeline — hybrid fusion with RRF</text>
+  <text x="24" y="54" fill="#7C8DB0" font-size="12">memory.py: recall(owner_id, query) → fused, token-budgeted list</text>
+
+  <g font-size="12">
+    <rect x="24" y="90" width="150" height="56" rx="8" fill="#0B1628" stroke="#61A2FF" stroke-opacity=".5"/>
+    <text x="99" y="114" fill="#D6E4FF" text-anchor="middle" font-weight="600">query</text>
+    <text x="99" y="132" fill="#7C8DB0" text-anchor="middle" font-size="10">+ owner context</text>
+
+    <rect x="230" y="70" width="180" height="48" rx="8" fill="#0B1628" stroke="#2C3E5D"/>
+    <text x="320" y="90" fill="#D6E4FF" text-anchor="middle" font-weight="600">BM25 arm</text>
+    <text x="320" y="106" fill="#7C8DB0" text-anchor="middle" font-size="10">match on text + entities</text>
+
+    <rect x="230" y="130" width="180" height="48" rx="8" fill="#0B1628" stroke="#2C3E5D"/>
+    <text x="320" y="150" fill="#D6E4FF" text-anchor="middle" font-weight="600">kNN arm</text>
+    <text x="320" y="166" fill="#7C8DB0" text-anchor="middle" font-size="10">dense_vector embedding, k top</text>
+
+    <rect x="470" y="100" width="170" height="48" rx="8" fill="#0B1628" stroke="#61A2FF" stroke-opacity=".6"/>
+    <text x="555" y="120" fill="#D6E4FF" text-anchor="middle" font-weight="600">RRF fuse</text>
+    <text x="555" y="136" fill="#7C8DB0" text-anchor="middle" font-size="10">rank fusion, no score tuning</text>
+
+    <rect x="700" y="100" width="236" height="48" rx="8" fill="#0B1628" stroke="#2C3E5D"/>
+    <text x="818" y="120" fill="#D6E4FF" text-anchor="middle" font-weight="600">token-budget cut</text>
+    <text x="818" y="136" fill="#7C8DB0" text-anchor="middle" font-size="10">top hits until the budget is spent</text>
+  </g>
+
+  <g stroke="#61A2FF" stroke-width="1.5" fill="none" marker-end="url(#arr2)">
+    <path d="M174,118 C204,110 200,94 230,94"/>
+    <path d="M174,118 C204,124 200,154 230,154"/>
+    <path d="M410,94 C440,100 440,112 470,124"/>
+    <path d="M410,154 C440,148 440,136 470,124"/>
+    <path d="M640,124 C672,124 668,124 700,124"/>
+  </g>
+
+  <g font-size="11">
+    <rect x="230" y="220" width="706" height="90" rx="8" fill="#0B1628" stroke="#FEC514" stroke-opacity=".4"/>
+    <text x="252" y="246" fill="#FEC514" font-weight="600">Visibility filter — applied to BOTH arms before fusion</text>
+    <text x="252" y="268" fill="#7C8DB0" font-size="11">bool.should: [ term: owner_id = caller ]  OR  [ terms: visibility in (team, common) ]</text>
+    <text x="252" y="288" fill="#7C8DB0" font-size="11">Owner identity comes from the API key (auth.py) — never from a request argument.</text>
+  </g>
+</svg>
