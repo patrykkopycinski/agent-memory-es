@@ -7,24 +7,30 @@ import secrets
 import threading
 from typing import Optional
 
-from .store import API_KEYS_FILE
-
 _lock = threading.Lock()
 
 
+def _keys_file() -> str:
+    # resolved per call so tests (and multi-tenant deploys) can scope key stores
+    return os.environ.get("AMES_API_KEYS_FILE",
+                          os.path.join(os.path.dirname(__file__), "..", "data", "api_keys.json"))
+
+
 def _load() -> dict:
-    if not os.path.exists(API_KEYS_FILE):
+    path = _keys_file()
+    if not os.path.exists(path):
         return {}
-    with open(API_KEYS_FILE) as f:
+    with open(path) as f:
         return json.load(f)
 
 
 def _save(keys: dict) -> None:
-    os.makedirs(os.path.dirname(API_KEYS_FILE), exist_ok=True)
-    tmp = API_KEYS_FILE + ".tmp"
+    path = _keys_file()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
     with open(tmp, "w") as f:
         json.dump(keys, f, indent=2)
-    os.replace(tmp, API_KEYS_FILE)
+    os.replace(tmp, path)
 
 
 def create_key(owner_id: str, role: str = "member") -> str:

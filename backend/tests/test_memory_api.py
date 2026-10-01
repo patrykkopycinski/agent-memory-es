@@ -7,10 +7,6 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import pytest
 from fastapi.testclient import TestClient
 
-os.environ.setdefault("AMES_API_KEYS_FILE", "/tmp/ames_test_keys.json")
-if os.path.exists(os.environ["AMES_API_KEYS_FILE"]):
-    os.remove(os.environ["AMES_API_KEYS_FILE"])
-
 from app.main import app  # noqa: E402
 from app import auth  # noqa: E402
 
