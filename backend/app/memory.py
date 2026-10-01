@@ -139,9 +139,23 @@ def promote(owner_id: str, kind: str, doc_id: str, to_visibility: str) -> dict:
     return {"promoted_id": r["_id"], "visibility": to_visibility}
 
 
-def consolidate(owner_id: str, kind: str = "semantic", similarity_threshold: float = 0.75) -> dict:
-    """Dedup/supersede: for each active semantic doc, find highly similar newer active doc
-    of same owner+visibility; mark older superseded (history preserved via active=False + chain)."""
+def _supersede(owner_id: str, old_id: str, new_id: str, kind: str = "semantic") -> None:
+    """Owner-checked supersede: both ends must belong to owner_id (atlas: Atlas's
+    supersede update is keyed on id alone — we refuse that class of cross-tenant write)."""
+    old = es("GET", f"/{idx(kind)}/_doc/{old_id}")["_source"]
+    new = es("GET", f"/{idx(kind)}/_doc/{new_id}")["_source"]
+    if old["owner_id"] != owner_id or new["owner_id"] != owner_id:
+        raise PermissionError("supersede requires both memories to belong to the caller")
+    es("POST", f"/{idx(kind)}/_update/{old_id}?refresh=true",
+       {"doc": {"active": False, "superseded_by": new_id}})
+
+
+def consolidate(owner_id: str, kind: str = "semantic", similarity_threshold: float = 0.75,
+                dry_run: bool = True) -> dict:
+    """Dedup/supersede proposal pass. dry_run=True (default): report pairs + dispositions,
+    mutate nothing. dry_run=False: apply supersessions (owner-checked, history preserved).
+    disposition 'keep_both' = similarity is coexistence, not contradiction (different times,
+    different contexts) — surfaced, never auto-merged."""
     assert kind == "semantic", "consolidation currently targets semantic facts"
     body = {
         "size": 200,
@@ -152,24 +166,33 @@ def consolidate(owner_id: str, kind: str = "semantic", similarity_threshold: flo
     }
     r = es("POST", f"/{idx(kind)}/_search", body)
     docs = [(h["_id"], h["_source"]) for h in r["hits"]["hits"]]
-    superseded = 0
+
+    def sim(a, b):
+        ea, eb = set(a.get("entities", [])), set(b.get("entities", []))
+        j = len(ea & eb) / len(ea | eb) if ea | eb else 0.0
+        ta = set(a["text"].lower().split())
+        tb = set(b["text"].lower().split())
+        jt = len(ta & tb) / len(ta | tb) if ta | tb else 0.0
+        return 0.5 * j + 0.5 * jt
+
+    proposals, superseded = [], 0
     for i, (id_a, a) in enumerate(docs):
         if not a.get("active", True):
             continue
         for id_b, b in docs[i + 1:]:
             if not b.get("active", True):
                 continue
-            ea, eb = set(a.get("entities", [])), set(b.get("entities", []))
-            j = len(ea & eb) / len(ea | eb) if ea | eb else 0.0
-            ta = set(a["text"].lower().split())
-            tb = set(b["text"].lower().split())
-            jt = len(ta & tb) / len(ta | tb) if ta | tb else 0.0
-            if 0.5 * j + 0.5 * jt >= similarity_threshold:
-                es("POST", f"/{idx(kind)}/_update/{id_a}?refresh=true",
-                   {"doc": {"active": False, "superseded_by": id_b}})
-                superseded += 1
+            s = sim(a, b)
+            if s >= similarity_threshold:
+                disposition = "supersede" if s >= similarity_threshold + 0.1 else "keep_both"
+                proposals.append({"older": id_a, "newer": id_b, "similarity": round(s, 3),
+                                  "disposition": disposition})
+                if not dry_run and disposition == "supersede":
+                    _supersede(owner_id, id_a, id_b, kind)
+                    superseded += 1
                 break
-    return {"checked": len(docs), "superseded": superseded}
+    return {"checked": len(docs), "mutated": 0 if dry_run else superseded,
+            "superseded": superseded, "proposals": proposals}
 
 
 def reflect(owner_id: str, question: str, llm_answer_fn=None) -> dict:

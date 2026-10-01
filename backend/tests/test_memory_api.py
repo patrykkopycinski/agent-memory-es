@@ -79,8 +79,7 @@ def test_consolidate_supersession():
     _retain(ALICE, text="Alice uses Vue for frontend development work")
     r = client.post("/memory/consolidate", headers=H(ALICE))
     assert r.status_code == 200
-    # both variants may remain if below threshold; at least the call works and returns counts
-    assert "superseded" in r.json()
+    assert "proposals" in r.json()
 
 
 def test_reflect_no_llm():
