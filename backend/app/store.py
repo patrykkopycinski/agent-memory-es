@@ -22,7 +22,7 @@ MAPPINGS = {
             "entities": {"type": "keyword"},
             "embedding": {
                 "type": "dense_vector",
-                "dims": 3072,
+                "dims": 384,
                 "index": True,
                 "similarity": "cosine",
             },

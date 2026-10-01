@@ -6,6 +6,7 @@ from typing import Any, Optional
 
 from .store import KINDS, es, idx, ensure_indices
 from . import embeddings
+from . import tombstone
 
 VISIBILITIES = ("private", "team", "common")
 
@@ -36,6 +37,10 @@ def retain(owner_id: str, kind: str, text: str, visibility: str = "private",
         raise ValueError(f"kind must be one of {KINDS}")
     if visibility not in VISIBILITIES:
         raise ValueError(f"visibility must be one of {VISIBILITIES}")
+    if kind == "semantic":
+        rej = tombstone.is_rejected(owner_id, text)
+        if rej:
+            raise ValueError(f"rejected value: {rej['reason']}")
     vec = None
     try:
         vec = embeddings.embed([text])[0]
