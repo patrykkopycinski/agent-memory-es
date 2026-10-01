@@ -16,14 +16,12 @@ def rerank(query: str, hits: list, top_n: int = 5,
     if not hits:
         return {"hits": hits, "reranked": False}
     body = json.dumps({
-        "model": model,
         "query": query,
         "top_n": min(top_n, len(hits)),
-        "input": [{"id_": h["id"], "text": h["text"]} for h in hits[:50]],
-        "inference_id": True,
+        "input": [h["text"] for h in hits[:50]],  # plain strings; response keyed by index
     }).encode()
     req = urllib.request.Request(
-        ES_URL + "/_inference/rerank", data=body, method="POST",
+        ES_URL + f"/_inference/rerank/{model}", data=body, method="POST",
         headers={"Content-Type": "application/json"})
     try:
         with urllib.request.urlopen(req, timeout=30) as r:
@@ -31,12 +29,11 @@ def rerank(query: str, hits: list, top_n: int = 5,
     except (urllib.error.HTTPError, urllib.error.URLError, RuntimeError):
         # license/mapping/model unavailable → honest fallback, no fake rerank
         return {"hits": hits[:top_n], "reranked": False}
-    by_id = {h["id"]: h for h in hits}
     ranked = []
     for item in out.get("rerank", [])[:top_n]:
-        hid = item.get("id_") or item.get("index")
-        if hid in by_id:
-            h = dict(by_id[hid])
+        i = item.get("index")
+        if i is not None and 0 <= i < min(len(hits), 50):
+            h = dict(hits[i])
             h["rerank_score"] = item.get("relevance_score")
             ranked.append(h)
     if not ranked:
