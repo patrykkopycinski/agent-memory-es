@@ -20,6 +20,12 @@ MAPPINGS = {
             "visibility": {"type": "keyword"},
             "text": {"type": "text"},
             "entities": {"type": "keyword"},
+            "embedding": {
+                "type": "dense_vector",
+                "dims": 3072,
+                "index": True,
+                "similarity": "cosine",
+            },
             "occurred_at": {"type": "date"},
             "superseded_by": {"type": "keyword"},
             "supersedes": {"type": "keyword"},

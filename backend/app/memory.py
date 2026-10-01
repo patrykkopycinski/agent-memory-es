@@ -5,6 +5,7 @@ import uuid
 from typing import Any, Optional
 
 from .store import KINDS, es, idx, ensure_indices
+from . import embeddings
 
 VISIBILITIES = ("private", "team", "common")
 
@@ -35,6 +36,11 @@ def retain(owner_id: str, kind: str, text: str, visibility: str = "private",
         raise ValueError(f"kind must be one of {KINDS}")
     if visibility not in VISIBILITIES:
         raise ValueError(f"visibility must be one of {VISIBILITIES}")
+    vec = None
+    try:
+        vec = embeddings.embed([text])[0]
+    except Exception:
+        pass  # embeddings optional: BM25-only degrade
     doc = {
         "kind": kind,
         "owner_id": owner_id,
@@ -44,6 +50,8 @@ def retain(owner_id: str, kind: str, text: str, visibility: str = "private",
         "occurred_at": occurred_at or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "active": True,
     }
+    if vec is not None:
+        doc["embedding"] = vec
     r = es("POST", f"/{idx(kind)}/_doc?refresh=true", doc)
     doc["_id"] = r["_id"]
     return doc
@@ -58,22 +66,45 @@ def _visibility_filter(owner_id: str) -> dict:
 
 
 def recall(owner_id: str, query: str, kinds=None, size: int = 8) -> dict:
-    """Hybrid-ish BM25 recall with visibility isolation + entity boost."""
+    """Hybrid recall: BM25 + kNN fused per-kind, visibility isolation, RRF across kinds."""
     kinds = kinds or list(KINDS)
-    must = [{"multi_match": {"query": query, "fields": ["text^3", "entities"], "type": "most_fields"}}]
-    body = {
-        "size": size,
-        "query": {"bool": {
-            "must": must,
-            "filter": [{"term": {"active": True}}, _visibility_filter(owner_id)],
-        }},
-        "sort": [{"_score": {"order": "desc"}}, {"occurred_at": {"order": "desc"}}],
-    }
+    qvec = None
+    try:
+        qvec = embeddings.embed([query])[0]
+    except Exception:
+        pass
     results = {}
     for kind in kinds:
+        must = [{"multi_match": {"query": query, "fields": ["text^3", "entities"], "type": "most_fields"}}]
+        if qvec is not None:
+            body = {
+                "size": size,
+                "retriever": {"rrf": {
+                    "retrievers": [
+                        {"standard": {"query": {"bool": {
+                            "must": must,
+                            "filter": [{"term": {"active": True}}, _visibility_filter(owner_id)],
+                        }}}},
+                        {"knn": {"field": "embedding", "query_vector": qvec, "num_candidates": 100, "k": size,
+                                 "filter": [{"term": {"active": True}}, _visibility_filter(owner_id)]}},
+                    ],
+                    "rank_constant": 60,
+                    "rank_window_size": 50,
+                }},
+            }
+        else:
+            body = {
+                "size": size,
+                "query": {"bool": {
+                    "must": must,
+                    "filter": [{"term": {"active": True}}, _visibility_filter(owner_id)],
+                }},
+                "sort": [{"_score": {"order": "desc"}}, {"occurred_at": {"order": "desc"}}],
+            }
         r = es("POST", f"/{idx(kind)}/_search", body)
         results[kind] = [
-            {"id": h["_id"], "score": h["_score"], **{k: v for k, v in h["_source"].items() if k != "kind"}}
+            {"id": h["_id"], "score": h["_score"], **{k: v for k, v in h["_source"].items()
+                                                      if k not in ("kind", "embedding")}}
             for h in r["hits"]["hits"]
         ]
     # rank-fusion across kinds (simple RRF, k=60)
