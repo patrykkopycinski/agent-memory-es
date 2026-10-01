@@ -19,7 +19,7 @@ AMES_KEY = os.environ.get("AMES_SERVICE_KEY", "")
 DOCKER_ES = (
     "docker run -d --name ames-es -p 9268:9200 "
     "-e discovery.type=single-node -e xpack.security.enabled=false "
-    "-e ES_JAVA_OPTS='-Xms512m -Xmx512m' docker.elastic.co/elasticsearch/elasticsearch:8.14.1"
+    "-e ES_JAVA_OPTS='-Xms512m -Xmx512m' docker.elastic.co/elasticsearch/elasticsearch:9.5.4"
 )
 DOCKER_COMPOSE = "cd backend && docker compose up -d"
 

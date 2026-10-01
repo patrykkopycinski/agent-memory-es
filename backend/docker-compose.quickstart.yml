@@ -4,7 +4,7 @@ version: "3.8"
 #   docker compose -f docker-compose.quickstart.yml up -d
 services:
   ames-es:
-    image: docker.elastic.co/elasticsearch/elasticsearch:8.14.1
+    image: docker.elastic.co/elasticsearch/elasticsearch:9.5.4
     container_name: ames-es
     restart: unless-stopped
     environment:
