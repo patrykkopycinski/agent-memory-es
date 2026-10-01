@@ -16,12 +16,32 @@ def _keys_file() -> str:
                           os.path.join(os.path.dirname(__file__), "..", "data", "api_keys.json"))
 
 
+def _migrate_legacy(keys: dict) -> dict:
+    """Legacy/hand-written key files stored plaintext tokens under owner-name keys
+    ({"hermes-default": "ame_..."}). owner_of() looks up sha256 digests, so those
+    entries 401 for every token. Normalize: rewrite each plaintext entry as a
+    digest entry (plaintext token is never persisted by create_key; keep the
+    name-keyed copy too so hand-managed file expectations don't break)."""
+    changed = False
+    for name, val in list(keys.items()):
+        if isinstance(val, str) and val.startswith("ame_"):
+            digest = hashlib.sha256(val.encode()).hexdigest()
+            role = "owner"
+            if digest not in keys:
+                keys[digest] = {"owner_id": name, "role": role}
+                changed = True
+    if changed:
+        _save(keys)
+    return keys
+
+
 def _load() -> dict:
     path = _keys_file()
     if not os.path.exists(path):
         return {}
     with open(path) as f:
-        return json.load(f)
+        keys = json.load(f)
+    return _migrate_legacy(keys)
 
 
 def _save(keys: dict) -> None:
