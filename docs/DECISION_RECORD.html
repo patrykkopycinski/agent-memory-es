@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Decision Record — ES-Native Memory (Hindsight Replacement)</title>
+<style>
+:root{--bg:#07101F;--panel:#0B1628;--accent:#61A2FF;--fg:#D6E2F5;--muted:#8FA3BF;--border:#1B2A44;--ok:#7EE0A3;--bad:#F58CA0}
+body{background:var(--bg);color:var(--fg);font:15px/1.6 Inter,system-ui,sans-serif;margin:0;padding:32px}
+.wrap{max-width:1000px;margin:0 auto}
+h1{font-size:26px;letter-spacing:-.02em}h2{color:var(--accent);font-size:18px;margin-top:2em;border-bottom:1px solid var(--border);padding-bottom:6px}
+code{font:13px/1.4 "Roboto Mono",monospace;background:#101E33;border:1px solid var(--border);border-radius:4px;padding:1px 5px;color:var(--accent)}
+table{border-collapse:collapse;width:100%;margin:12px 0;font-size:14px}
+th,td{border:1px solid var(--border);padding:8px 10px;text-align:left;vertical-align:top}
+th{background:#101E33;color:var(--accent)}
+.ok{color:var(--ok)}.bad{color:var(--bad)}
+.card{background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:16px;margin:14px 0}
+.q{border-left:3px solid var(--accent)}
+a{color:var(--accent)}
+.small{color:var(--muted);font-size:13px}
+</style>
+</head>
+<body><div class="wrap">
+<h1>Decision Record — ES-Native Agent Memory (Hindsight Replacement)</h1>
+<p class="small">2026-10-01 · Shaping output · every ES capability cited to a verifiable URL; ES 9.6 does not exist (latest release <b>v9.5.4</b>, 2026-09-15, GitHub releases API) so all citations are ≤9.5 unless marked roadmap.</p>
+
+<h2>1. Ground truth on ES capabilities</h2>
+<table>
+<tr><th>Claimed capability</th><th>Status</th><th>Source</th></tr>
+<tr><td>"ES 9.6"</td><td class="bad">Does not exist. Latest tag v9.5.4 (2026-09-15); no 9.6 tag, release notes 404</td><td>api.github.com/repos/elastic/elasticsearch/releases</td></tr>
+<tr><td>"Context engine"</td><td class="bad">Marketing umbrella, not a feature. Nav page bundles vector DB + Agent Builder (GA) + MCP + agentic Workflows</td><td>elastic.co/elasticsearch/context-engineering</td></tr>
+<tr><td>semantic_text field</td><td class="ok">GA — native chunking + embeddings + inference API</td><td>elastic.co/docs/manage-data/data-store/text-retrieval/semantic-text</td></tr>
+<tr><td>Hybrid BM25+dense w/ RRF</td><td class="ok">GA retrievers</td><td>elastic.co/docs/solutions/search/vector/knn#combine-rrf</td></tr>
+<tr><td>Reranking (cross-encoder / rerank inference)</td><td class="ok">GA</td><td>elastic.co/docs/solutions/search/vector/knn#reranking</td></tr>
+<tr><td>Document/field-level security (DLS/FLS)</td><td class="ok">GA (Platinum)</td><td>elastic.co/docs/security/document-level-security</td></tr>
+<tr><td>Temporal retrieval</td><td class="ok">date fields + decay/painless; no natural-language time parser (build as app layer)</td><td>blog (below), ES date query docs</td></tr>
+<tr><td>Graph retrieval over entities</td><td class="bad">No ES-native equivalent</td><td>gap — see §2</td></tr>
+<tr><td>Elastic Workflows (native agentic loops in ES)</td><td class="ok">Shipped capability worth evaluating for the consolidation worker</td><td>elastic.co/elasticsearch/workflows</td></tr>
+</table>
+<p><b>Key external source (beyond Hindsight + OpenAPPA):</b> Elastic Search-Labs, 2026-06-16 — <i>"How we built a persistent agent memory layer on Elasticsearch with 0.89 recall and zero tenant leaks"</i> → <a href="https://www.elastic.co/search-labs/blog/agent-memory-elasticsearch">elastic.co/search-labs/blog/agent-memory-elasticsearch</a> + OSS implementation <a href="https://github.com/noamschwartz/atlas-memory-demo">noamschwartz/atlas-memory-demo</a> (existence verified via GitHub API). Others cited: elastic.co context-engineering &amp; workflows pages, Elastic CLI/Agent-Skills search-labs post (2026-09-14), ES docs DLS/semantic_text pages.</p>
+
+<h2>2. Hindsight → ES mapping</h2>
+<table>
+<tr><th>Hindsight capability (architecture deep-dive)</th><th>ES-native equivalent</th><th>Status</th></tr>
+<tr><td>retain → LLM fact extraction</td><td>App-layer extraction worker → 3 indices (episodic / semantic / procedural)</td><td class="ok">atlas pattern</td></tr>
+<tr><td>recall: semantic arm</td><td>semantic_text / dense kNN</td><td class="ok">native</td></tr>
+<tr><td>recall: BM25 arm</td><td>BM25</td><td class="ok">native</td></tr>
+<tr><td>recall fusion (rank-based) + cross-encoder rerank + token budget</td><td>RRF + rerank retriever; token budget = app layer</td><td class="ok">mostly native</td></tr>
+<tr><td>recall: <b>graph arm (2-hop entity links)</b></td><td>—</td><td class="bad">GAP. Mitigations: entity keyword fields + more-like-this expansion, or Neo4j sidecar; open question OQ-3</td></tr>
+<tr><td>recall: temporal arm (NL time parsing + spread)</td><td>date-range query + decay function</td><td class="ok">partial; NL time parser = app layer</td></tr>
+<tr><td>observations / consolidation / dedup / history</td><td>background consolidation job + supersession chains (audit preserved)</td><td class="ok">atlas pattern (supersession), needs build</td></tr>
+<tr><td>memory banks / isolation</td><td><b>DLS + per-user API keys</b> — server-enforced, measured zero tenant leaks, R@10 0.89</td><td class="ok">native (Platinum license)</td></tr>
+<tr><td>shared-vs-private recall</td><td>DLS filter <code>user_id == me OR no user_id</code> → shared catalog + private memory fused in ONE recall</td><td class="ok">atlas pattern</td></tr>
+<tr><td>reflect (agentic loop, priority sources, citations)</td><td>App layer (or Elastic Workflows)</td><td class="bad">GAP — build</td></tr>
+<tr><td>knowledge pages / mental models</td><td>Index of page docs + refresh worker; <code>hindsight fs mount</code> equivalent = sync to markdown tree</td><td class="bad">GAP — build</td></tr>
+</table>
+
+<h2>3. Decisions</h2>
+<div class="card"><b>D1 — Base architecture: fork/extend atlas-memory-demo.</b><br>Reason: Elastic-blessed, OSS, DLS isolation empirically validated (0.89 R@10, zero leaks), already implements the 3-index + hybrid + supersession + decay + DLS core. Rejected: clean-room (buys months of re-deriving proven code); stay-on-Hindsight-hybrid (doubles operating surface, keeps Postgres+pgvector dependency we want gone). <span class="small">⚠ Awaiting user confirmation — flagged OPEN in §5.</span></div>
+<div class="card"><b>D2 — Isolation: DLS + per-user API keys.</b><br>Reason: server-enforced — an app bug cannot leak across tenants; proven in the atlas eval. Per-index isolation leaks the moment code forgets a filter; dedicated clusters per team are operationally absurd at coding-farm scale.</div>
+<div class="card"><b>D3 — OpenAPPA: SPIKE-ONLY (adopt as optional write-guard, never core).</b><br>Reason: OpenAPPA is information-flow control ("is this data allowed to go to this destination"), not memory — 0% overlap with the store/retrieval/consolidation architecture. Its only fit: a deterministic guard in front of <i>shared-bank writes</i> (block private facts flowing into the common catalog). Project status is "Preview &amp; RFC — config and wire surfaces may break without shims", so it must not sit on the critical path. Phase-3 spike with a numeric accept/reject gate (blocks ≥95% of seeded private→shared leaks, <10% false blocks on legit shares).</div>
+<div class="card"><b>D4 — Consumption contract: Hermes memory-provider plugin + single MCP endpoint.</b><br>Reason: Hermes keeps native-speed retain/recall/reflect via the provider API; coding farm + teammates (Claude Code/Cursor/Codex etc.) hit the same service over MCP — one backend, two doors. MCP-everything adds protocol overhead on Hermes's hottest path. <span class="small">⚠ Awaiting user confirmation — flagged OPEN in §5.</span></div>
+<div class="card"><b>D5 — Tenancy model:</b> every memory doc carries <code>owner_id</code> (user or agent identity) and <code>visibility ∈ {private, team, common}</code>. Recall DLS: private → creator's key only; team → team role key; common → no filter. Common knowledge is copy-on-promote: a user (or OpenAPPA-guarded auto-promotion) explicitly promotes a private fact into the common bank — never auto-shared.</div>
+
+<h2>4. Phased plan (shape)</h2>
+<table>
+<tr><th>Phase</th><th>Delivers</th><th>Exit gate</th></tr>
+<tr><td>0 — Spike</td><td>atlas-memory-demo on m1max docker ES; Hermes hindsight-provider contract extracted</td><td>retain→recall round-trip from a script; DLS leak test: user B key cannot recall user A doc</td></tr>
+<tr><td>1 — Port</td><td>Hermes memory provider → atlas (retain/recall/reflect); config: bank per Hermes profile</td><td>Hindsight parity harness: 50 known Q/A from current bank recalled via new stack, ≥0.85 hit rate; Hindsight daemon idled on one profile for a week, zero regressions</td></tr>
+<tr><td>2 — Farm + share</td><td>MCP endpoint; per-agent API keys (coding farm workers); visibility field + promotion flow + team bank</td><td>coding-farm worker retains and recalls through MCP; cross-user leak test suite green; common bank answers a question none of the individuals stored whole</td></tr>
+<tr><td>3 — Intelligence gaps</td><td>reflect agentic loop; knowledge pages + markdown sync; graph-arm mitigation; OpenAPPA guard spike</td><td>per-gap eval: reflect answers ≥ Hindsight reflect on frozen question set (gemini-3-1-pro judge, per standing eval doctrine); OpenAPPA gate per D3</td></tr>
+</table>
+
+<h2>5. Open questions</h2>
+<div class="card q"><b>OQ-1 Base strategy (D1) &amp; contract (D4).</b> Unblocker: user answers the two flagged decisions (or "accept recommendations"). Nothing in Phase 0 depends on them.</div>
+<div class="card q"><b>OQ-2 ES license.</b> DLS is Platinum. Self-hosted basic license lacks DLS → isolation falls back to app-level API-key→filter middleware (weaker, tested by same leak suite). Unblocker: confirm whether the m1max/self-hosted ES runs Platinum (or Elastic-licensed) or we accept the middleware fallback.</div>
+<div class="card q"><b>OQ-3 Graph arm.</b> Is 2-hop entity recall ever load-bearing for a coding farm? If yes: Neo4j sidecar vs entity-expansion approximation — decide on measured delta, not vibes. Unblocker: replay 100 real recall queries from the current Hindsight bank, count how many were answered only via the graph arm.</div>
+<div class="card q"><b>OQ-4 ES 9.6.</b> No public 9.6 yet (verified). Re-check release notes at Phase-1 start for anything that deletes app-layer work (workflows/inference changes). Unblocker: time; also query Elastic-internal roadmap via work channels (you are Elastic).</div>
+
+<h2>6. Rejected options</h2>
+<table>
+<tr><th>Option</th><th>Why rejected</th></tr>
+<tr><td>Wait for a native ES "context engine"/memory product</td><td>It does not exist as a feature; only a marketing page exists today. Waiting blocks indefinitely with no shipped artifact.</td></tr>
+<tr><td>Stay on Hindsight, add ES as shared layer only</td><td>Two memory stacks to operate (Postgres+pgvector AND ES), two retrieval semantics, migration debt deferred not removed. Reconsider only if OQ-2 resolves "no Platinum".</td></tr>
+<tr><td>Adopt OpenAPPA as architecture</td><td>It is a guardrail algebra, not a memory system — nothing to adopt architecturally. Kept as optional guard only (D3).</td></tr>
+<tr><td>Clean-room ES design</td><td>Atlas already implements and benchmarked the target architecture; clean-room re-derives proven code at pure cost.</td></tr>
+</table>
+
+<h2>7. Explicit NON-goals (not built)</h2>
+<ul>
+<li>No Hindsight Cloud / SaaS dependency — self-hosted ES only.</li>
+<li>No auto-sharing of private memories — promotion is always explicit (D5).</li>
+<li>No OpenAPPA on the critical retain/recall path — optional write-guard at most (D3).</li>
+<li>No conversation-transcript storage — facts/procedural/episodic indices only, per atlas pattern.</li>
+<li>No graph database in v1 unless OQ-3 shows the graph arm is load-bearing.</li>
+</ul>
+</div></body></html>
