@@ -22,6 +22,10 @@ HTTP / curl ──┘   (auth · ops · worker)           └─ procedural (pla
 
 API key → owner identity, server-side visibility filter, hybrid BM25 + kNN recall fused with RRF, a guarded private→shared promotion path, and a propose-then-apply consolidation worker. Full detail with per-file source references: **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** — diagrams: [topology](docs/diagrams/architecture.svg) · [recall pipeline](docs/diagrams/recall-pipeline.svg) · interactive: [explainer](docs/explainer.html).
 
+## Landing page
+
+**https://patrykkopycinski.github.io/agent-memory-es/** — concept, architecture, quick start, interactive archify diagrams.
+
 ## Demo tour
 
 - **[Architecture overview](docs/ARCHITECTURE.md)** — every component, grounded in source
