@@ -113,3 +113,19 @@ def match_model(owner_id: str, query: str, size: int = 1) -> Optional[dict]:
     except Exception:
         pass  # staleness is advisory; never block recall on it
     return m
+
+
+def list_models(owner_id: str, status: str = "active", size: int = 50) -> list:
+    """All models of a status the owner can see (own + shared), newest first."""
+    ensure_models_index()
+    r = es("POST", f"/{PREFIX}am_models/_search", {
+        "size": size,
+        "query": {"bool": {"filter": [
+            {"term": {"status": status}},
+            {"bool": {"should": [
+                {"term": {"owner_id": owner_id}},
+                {"bool": {"must_not": {"term": {"visibility": "private"}}}},
+            ]}},
+        ]}},
+        "sort": [{"updated_at": {"order": "desc"}}]})
+    return [{"id": h["_id"], **h["_source"]} for h in r["hits"]["hits"]]

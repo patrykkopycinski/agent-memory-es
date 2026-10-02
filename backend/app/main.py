@@ -126,6 +126,48 @@ def model_upsert(body: ModelIn, who: dict = Depends(caller)):
                                body.visibility)
 
 
+@app.get("/memory/stats")
+def memory_stats(who: dict = Depends(caller)):
+    """Read-only inspector feed for the desktop plugin/UI: per-index counts the
+    owner can see, active mental models (with staleness flags), worker drafts,
+    and knowledge pages. No mutations."""
+    from .store import es, idx, PREFIX
+    owner = who["owner_id"]
+    counts = {}
+    for kind in ("episodic", "semantic", "procedural"):
+        r = es("POST", f"/{idx(kind)}/_search", {
+            "size": 0,
+            "query": {"bool": {"should": [
+                {"term": {"owner_id": owner}},
+                {"bool": {"must_not": {"term": {"visibility": "private"}}}},
+            ]}},
+            "aggs": {"by_vis": {"terms": {"field": "visibility", "size": 5}}}})
+        counts[kind] = {
+            "total": r["hits"]["total"]["value"],
+            "mine": sum(1 for _ in ()),
+            "by_visibility": {b["key"]: b["doc_count"]
+                              for b in r["aggregations"]["by_vis"]["buckets"]},
+        }
+    r = es("POST", f"/{idx('semantic')}/_search", {
+        "size": 5, "sort": [{"occurred_at": {"order": "desc"}}],
+        "query": {"bool": {"should": [
+            {"term": {"owner_id": owner}},
+            {"bool": {"must_not": {"term": {"visibility": "private"}}}},
+        ]}}})
+    recent = [{"id": h["_id"], "text": h["_source"]["text"][:140],
+               "visibility": h["_source"]["visibility"],
+               "occurred_at": h["_source"].get("occurred_at")}
+              for h in r["hits"]["hits"]]
+
+    drafts = mm_mod.list_drafts(owner)
+    models = mm_mod.list_models(owner, "active", 50)
+    for m in models:
+        m["stale"] = mm_mod.staleness(owner, m)
+    return {"owner_id": owner, "counts": counts, "recent_semantic": recent,
+            "models": models, "drafts": drafts,
+            "pages": pages_mod.list_pages(owner)}
+
+
 class RerankIn(BaseModel):
     query: str
     hits: list
