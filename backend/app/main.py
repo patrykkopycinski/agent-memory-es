@@ -144,7 +144,6 @@ def memory_stats(who: dict = Depends(caller)):
             "aggs": {"by_vis": {"terms": {"field": "visibility", "size": 5}}}})
         counts[kind] = {
             "total": r["hits"]["total"]["value"],
-            "mine": sum(1 for _ in ()),
             "by_visibility": {b["key"]: b["doc_count"]
                               for b in r["aggregations"]["by_vis"]["buckets"]},
         }
