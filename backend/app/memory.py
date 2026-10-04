@@ -1,4 +1,6 @@
 """Core memory operations: retain, recall, reflect-lite, promote, consolidate."""
+import datetime as _dt
+import math
 import re
 import time
 import uuid
@@ -9,6 +11,13 @@ from . import embeddings
 from . import tombstone
 
 VISIBILITIES = ("private", "team", "common")
+
+# --- recall quality knobs (see docs/quality_decisions) ---------------------
+RANK_CONSTANT = 60              # RRF rank constant; must match ES rrf rank_constant
+RECENCY_WEIGHT = 0.15           # recency arm weight, as a fraction of one RRF arm's top hit
+RECENCY_HALF_LIFE_DAYS = 30.0   # gauss decay half-life applied to occurred_at
+PER_DOC_BUDGET = 3              # max fused results from one source doc group
+DEDUP_SIM_THRESHOLD = 0.92      # cosine >= this in the same visibility scope => duplicate
 
 import re as _re
 _PRIVATE_MARKERS = _re.compile(
@@ -45,6 +54,99 @@ def extract_entities(text: str, limit: int = 12) -> list:
     return out
 
 
+def _parse_ts(value: Optional[str]):
+    """Parse AMES occurred_at strings (ISO datetime or date). None when unparseable."""
+    if not value:
+        return None
+    raw = value.replace("Z", "+00:00")
+    for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d"):
+        try:
+            return _dt.datetime.strptime(raw[:19], fmt).replace(tzinfo=_dt.timezone.utc)
+        except Exception:
+            continue
+    try:
+        return _dt.datetime.fromisoformat(raw)
+    except Exception:
+        return None
+
+
+def recency_decay(occurred_at: Optional[str], now=None,
+                  half_life_days: float = RECENCY_HALF_LIFE_DAYS) -> float:
+    """Gaussian recency decay in [0, 1]: 1.0 now, 0.5 at half_life_days, 0.0 when missing."""
+    ts = _parse_ts(occurred_at)
+    if ts is None:
+        return 0.0
+    now = now or _dt.datetime.now(_dt.timezone.utc)
+    age_days = max(0.0, (now - ts).total_seconds() / 86400.0)
+    sigma = half_life_days / math.sqrt(2.0 * math.log(2.0))
+    return math.exp(-0.5 * (age_days / sigma) ** 2)
+
+
+def _recency_boost(occurred_at: Optional[str], now=None) -> float:
+    """Recency contribution to the fused score, scaled to one RRF arm's top hit
+    (1/(RANK_CONSTANT+1)) so the small weight never outvotes lexical/kNN agreement."""
+    return RECENCY_WEIGHT * recency_decay(occurred_at, now) / (RANK_CONSTANT + 1)
+
+
+def _apply_budgets(ordered: list, size: int, per_kind_budget: Optional[int] = None,
+                   per_doc_budget: int = PER_DOC_BUDGET) -> list:
+    """Cap how much of the fused window any one kind or source doc can occupy.
+
+    Pass 1 admits at most per_kind_budget per kind and per_doc_budget per doc group
+    (doc_group defaults to the doc id), so one kind or one chunked/long retain cannot
+    fill the window. Pass 2 backfills any leftover slots with the best remaining hits
+    still respecting the per-doc cap, so a query whose matches live in one kind is not
+    starved. Returns the (score-ordered) window.
+    """
+    if per_kind_budget is None:
+        n = max(1, len({it.get("kind") for it in ordered}) or 1)
+        per_kind_budget = size if n == 1 else max(1, -(-size // n))
+    picked, kind_count, doc_count = [], {}, {}
+    overflow = []
+    for it in ordered:
+        kind = it.get("kind")
+        doc = it.get("doc_group") or it.get("id")
+        if kind_count.get(kind, 0) < per_kind_budget and doc_count.get(doc, 0) < per_doc_budget:
+            picked.append(it)
+            kind_count[kind] = kind_count.get(kind, 0) + 1
+            doc_count[doc] = doc_count.get(doc, 0) + 1
+        else:
+            overflow.append(it)
+    for it in overflow:
+        if len(picked) >= size:
+            break
+        doc = it.get("doc_group") or it.get("id")
+        if doc_count.get(doc, 0) < per_doc_budget:
+            picked.append(it)
+            doc_count[doc] = doc_count.get(doc, 0) + 1
+    picked.sort(key=lambda x: -x.get("score", 0.0))
+    return picked[:size]
+
+
+def _dedup_lookup(owner_id: str, kind: str, visibility: str, vec) -> Optional[str]:
+    """Existing doc id whose embedding is a near-duplicate (cosine >= DEDUP_SIM_THRESHOLD)
+    of vec, in the same kind + same visibility scope. None when no vector or no match.
+
+    Private scope is owner-scoped (a private dupe must not match another owner's doc);
+    team/common scope is shared, so cross-owner duplicates collapse onto one doc."""
+    if vec is None:
+        return None
+    filt = [{"term": {"active": True}}, {"term": {"visibility": visibility}}]
+    if visibility == "private":
+        filt.append({"term": {"owner_id": owner_id}})
+    r = es("POST", f"/{idx(kind)}/_search", {
+        "size": 1,
+        "knn": {"field": "embedding", "query_vector": vec, "k": 1,
+                "num_candidates": 50, "filter": filt},
+    })
+    hits = r["hits"]["hits"]
+    if not hits:
+        return None
+    # ES normalises cosine knn scores to (1 + cosine) / 2; invert to real cosine.
+    cosine = 2.0 * hits[0]["_score"] - 1.0
+    return hits[0]["_id"] if cosine >= DEDUP_SIM_THRESHOLD else None
+
+
 def retain(owner_id: str, kind: str, text: str, visibility: str = "private",
            occurred_at: Optional[str] = None) -> dict:
     if kind not in KINDS:
@@ -60,6 +162,11 @@ def retain(owner_id: str, kind: str, text: str, visibility: str = "private",
         vec = embeddings.embed([text])[0]
     except Exception:
         pass  # embeddings optional: BM25-only degrade
+    dup_id = _dedup_lookup(owner_id, kind, visibility, vec)
+    if dup_id:
+        existing = es("GET", f"/{idx(kind)}/_doc/{dup_id}")["_source"]
+        return {"_id": dup_id, "deduped": True, **existing,
+                "deduped_against_owner": existing.get("owner_id")}
     doc = {
         "kind": kind,
         "owner_id": owner_id,
@@ -73,6 +180,7 @@ def retain(owner_id: str, kind: str, text: str, visibility: str = "private",
         doc["embedding"] = vec
     r = es("POST", f"/{idx(kind)}/_doc?refresh=true", doc)
     doc["_id"] = r["_id"]
+    doc["deduped"] = False
     return doc
 
 
@@ -84,8 +192,14 @@ def _visibility_filter(owner_id: str) -> dict:
     ]}}
 
 
-def recall(owner_id: str, query: str, kinds=None, size: int = 8) -> dict:
-    """Hybrid recall: BM25 + kNN fused per-kind, visibility isolation, RRF across kinds."""
+def recall(owner_id: str, query: str, kinds=None, size: int = 8,
+           min_score: Optional[float] = None) -> dict:
+    """Hybrid recall: BM25 + kNN fused per-kind, visibility isolation, RRF across kinds.
+
+    Returns a single flat `results` list (RRF + recency fused, score-ordered) with
+    `kind`, `score` and `visibility` on every item. `by_kind` is a deprecated additive
+    field kept for compat. `min_score` post-filters the fused list and marks an empty
+    result `abstained: true`."""
     kinds = kinds or list(KINDS)
     qvec = None
     try:
@@ -122,16 +236,17 @@ def recall(owner_id: str, query: str, kinds=None, size: int = 8) -> dict:
             }
         r = es("POST", f"/{idx(kind)}/_search", body)
         results[kind] = [
-            {"id": h["_id"], "score": h["_score"], **{k: v for k, v in h["_source"].items()
-                                                      if k not in ("kind", "embedding")}}
+            {"id": h["_id"], "kind": kind, "score": h["_score"],
+             **{k: v for k, v in h["_source"].items()
+                if k not in ("kind", "embedding")}}
             for h in r["hits"]["hits"]
         ]
-    # rank-fusion across kinds (simple RRF, k=60)
+    # rank-fusion across kinds (simple RRF, k=RANK_CONSTANT)
     fused = {}
     for kind, hits in results.items():
         for rank, h in enumerate(hits):
             fused.setdefault(h["id"], {**h, "rrf": 0.0})
-            fused[h["id"]]["rrf"] += 1.0 / (60 + rank + 1)
+            fused[h["id"]]["rrf"] += 1.0 / (RANK_CONSTANT + rank + 1)
     GRAPH_RRF_WEIGHT = 0.01  # hop-2 evidence must not outvote lexical+kNN agreement
     # graph arm: entity two-hop expansion, fused by rank (never dominates other arms)
     try:
@@ -139,7 +254,7 @@ def recall(owner_id: str, query: str, kinds=None, size: int = 8) -> dict:
         for rank, h in enumerate(_graph.graph_expand(owner_id, query, size,
                                                      _visibility_filter(owner_id))):
             fused.setdefault(h["id"], {**h, "rrf": 0.0, "arm": "graph"})
-            fused[h["id"]]["rrf"] += GRAPH_RRF_WEIGHT / (60 + rank + 1)
+            fused[h["id"]]["rrf"] += GRAPH_RRF_WEIGHT / (RANK_CONSTANT + rank + 1)
             fused[h["id"]]["graph_hit"] = True
     except Exception:
         pass
@@ -162,18 +277,36 @@ def recall(owner_id: str, query: str, kinds=None, size: int = 8) -> dict:
                                    _visibility_filter(owner_id),
                                    {"range": {"occurred_at": {"gte": bs, "lte": be}}}],
                     }}, "sort": [{"occurred_at": {"order": "asc"}}]})
-                t_hits += [{"id": h["_id"], "score": h["_score"], "arm": "temporal",
-                            **{k: v for k, v in h["_source"].items() if k != "embedding"}}
+                t_hits += [{"id": h["_id"], "kind": "episodic", "score": h["_score"],
+                            "arm": "temporal",
+                            **{k: v for k, v in h["_source"].items()
+                               if k not in ("kind", "embedding")}}
                            for h in rb["hits"]["hits"]]
             for rank, h in enumerate(t_hits):
                 fused.setdefault(h["id"], {**h, "rrf": 0.0})
-                fused[h["id"]]["rrf"] += 1.0 / (60 + rank + 1)
+                fused[h["id"]]["rrf"] += 1.0 / (RANK_CONSTANT + rank + 1)
                 fused[h["id"]]["temporal_hit"] = True
             temporal_meta = {"window": [start, end], "buckets": len(buckets)}
     except Exception:
         pass
-    ordered = sorted(fused.values(), key=lambda x: -x["rrf"])
-    out = {"query": query, "by_kind": results, "fused": ordered[:size]}
+    # recency arm (always on, small weight): gauss decay over occurred_at, scaled to
+    # one RRF arm's top hit so it reorders near-ties without outvoting relevance.
+    _now = _dt.datetime.now(_dt.timezone.utc)
+    for h in fused.values():
+        h.setdefault("es_score", h.get("score"))
+        h["recency"] = _recency_boost(h.get("occurred_at"), _now)
+        h["score"] = h["rrf"] + h["recency"]
+    ordered = sorted(fused.values(), key=lambda x: -x["score"])
+    if min_score is not None:
+        ordered = [h for h in ordered if h["score"] >= min_score]
+    window = _apply_budgets(ordered, size)
+    out = {
+        "query": query,
+        "results": window,
+        "by_kind": results,   # deprecated: per-kind lists, kept for compat
+        "fused": window,      # deprecated alias of `results`
+        "abstained": bool(min_score is not None and not window),
+    }
     # mental-model priority tier surfaces above facts (like reflect's source order)
     try:
         from . import mental_models as _mm

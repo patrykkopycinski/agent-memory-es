@@ -46,10 +46,12 @@ res = memory.recall(O, "rivendell facts and conventions")
 assert "mental_model" in res and res["mental_model"]["status"] == "active", res.get("mental_model")
 print("PROMOTE-IN-TIER: PASS")
 
-# staleness: new fact AFTER model update → stale flag
+# staleness: new fact AFTER model update → stale flag.
+# The fact must be genuinely new: a near-duplicate would be collapsed by
+# dedup-on-write (cos >= 0.92) and never land, so staleness never fires.
 import time as _t
 _t.sleep(1.1)
-memory.retain(O, "semantic", "Rivendell staging moved from Fly.io to Railway in 2026")
+memory.retain(O, "semantic", "Rivendell now ships release artifacts through a Railway-hosted runner fleet")
 res = memory.recall(O, "rivendell facts and conventions")
 assert res["mental_model"].get("stale") is True, res["mental_model"]
 print("STALENESS: PASS")

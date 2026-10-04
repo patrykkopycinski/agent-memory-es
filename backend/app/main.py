@@ -36,6 +36,7 @@ class RecallIn(BaseModel):
     query: str
     kinds: Optional[list] = None
     size: int = 8
+    min_score: Optional[float] = None
 
 
 class PromoteIn(BaseModel):
@@ -65,7 +66,7 @@ def retain(body: RetainIn, who: dict = Depends(caller)):
 
 @app.post("/memory/recall")
 def recall(body: RecallIn, who: dict = Depends(caller)):
-    return memory.recall(who["owner_id"], body.query, body.kinds, body.size)
+    return memory.recall(who["owner_id"], body.query, body.kinds, body.size, body.min_score)
 
 
 @app.post("/memory/promote")
