@@ -32,7 +32,7 @@ RECALL_FETCH_CAP = 50
 # `size` passages). Default on; AMES_RERANK=0 or per-request rerank=false disables it. If the
 # endpoint is unavailable the fused order is kept and the response says reranked=false.
 RERANK_DEPTH = int(os.environ.get("AMES_RERANK_DEPTH", "50"))
-RERANK_DEFAULT = os.environ.get("AMES_RERANK", "1").strip().lower() not in ("0", "false", "no", "off", "")
+RERANK_DEFAULT = os.environ.get("AMES_RERANK", "0").strip().lower() in ("1", "true", "yes", "on")
 
 
 def _rerank_fused(query: str, ordered: list, depth: int = None) -> tuple:
@@ -50,14 +50,16 @@ def _rerank_fused(query: str, ordered: list, depth: int = None) -> tuple:
     out = _rr.rerank(query, head, top_n=len(head))
     if not out.get("reranked"):
         return ordered, False
+    scored = {h["id"] for h in out["hits"]}                  # ids the cross-encoder actually scored
     ranked = list(out["hits"])
-    seen = {h["id"] for h in ranked}
-    ranked += [h for h in head if h["id"] not in seen]      # never lose a candidate
+    ranked += [h for h in head if h["id"] not in scored]    # never lose a candidate
     new = []
     for i, h in enumerate(ranked + tail):
         h = dict(h)
         h["rerank_rank"] = i
-        if i >= len(ranked):
+        if h["id"] not in scored:
+            # an item the endpoint did not return must not carry a score it never received
+            # (covers both an omitted head item and every item beyond `depth`)
             h.pop("rerank_score", None)
         new.append(h)
     return new, True

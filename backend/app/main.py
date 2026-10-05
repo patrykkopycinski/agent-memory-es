@@ -42,7 +42,7 @@ class RecallIn(BaseModel):
     min_score: Optional[float] = None
     as_of: Optional[str] = None     # ISO-8601 instant the query is asked (cause 3)
     per_doc: Optional[int] = None   # max passages per source doc_group (default 3)
-    rerank: Optional[bool] = None   # ES cross-encoder rerank of the fused top-50 (default: AMES_RERANK, on)
+    rerank: Optional[bool] = None   # ES cross-encoder rerank of the fused top-50 (opt-in: AMES_RERANK, default off)
 
 
 class PromoteIn(BaseModel):

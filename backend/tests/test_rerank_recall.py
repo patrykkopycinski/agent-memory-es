@@ -113,9 +113,27 @@ def test_socket_level_failure_in_reranker_also_degrades(monkeypatch):
     assert out["reranked"] is False
 
 
-def test_default_constants():
+def test_rerank_is_opt_in_by_default():
+    # driver decision: merged as OPT-IN; the default must stay off
+    assert memory.RERANK_DEFAULT is False
     assert memory.RERANK_DEPTH == 50
+    assert reranker.RERANK_TIMEOUT >= 1
+
+
+def test_rerank_env_flag_and_timeout_are_read_from_config():
+    import importlib
+    os.environ["AMES_RERANK"] = "1"
+    importlib.reload(memory)
     assert memory.RERANK_DEFAULT is True
+    os.environ["AMES_RERANK"] = "0"
+    importlib.reload(memory)
+    assert memory.RERANK_DEFAULT is False
+    os.environ["AMES_RERANK_TIMEOUT"] = "7"
+    importlib.reload(reranker)
+    assert reranker.RERANK_TIMEOUT == 7
+    os.environ.pop("AMES_RERANK"); os.environ.pop("AMES_RERANK_TIMEOUT")
+    importlib.reload(memory); importlib.reload(reranker)
+    assert memory.RERANK_DEFAULT is False and reranker.RERANK_TIMEOUT >= 1
 
 
 # ------------------------------------------------------------------ integration with recall()
@@ -239,3 +257,29 @@ def test_items_the_endpoint_did_not_return_never_carry_a_rerank_score(monkeypatc
     assert "rerank_score" in by["p0"] and "rerank_score" in by["p5"]
     for tail_id in ("p8", "p9", "p10", "p11"):
         assert "rerank_score" not in by[tail_id], tail_id            # beyond depth
+    for omitted_id in ("p2", "p3"):                                  # in `head`, not returned
+        assert "rerank_score" not in by[omitted_id], omitted_id
+
+
+def test_http_rerank_true_actually_reaches_recall_and_default_stays_off(monkeypatch):
+    """Opt-in contract end to end: with the default OFF, only a plumbed `rerank: true` can turn it
+    on. (rerank=False alone cannot detect a dropped field once the default is off.)"""
+    from fastapi.testclient import TestClient
+    from app.main import app
+    from app import auth
+    _seed()
+    monkeypatch.setattr(reranker, "rerank", _fake([]))      # a reranker that "works"
+    c = TestClient(app); key = auth.create_key(OWNER)
+
+    def call(**extra):
+        r = c.post("/memory/recall", headers={"X-API-Key": key},
+                   json=dict(query=Q, kinds=["episodic"], size=3, as_of="2023-05-30", **extra))
+        assert r.status_code == 200, r.text
+        return r.json()["reranked"]
+
+    assert call() is False                       # default: off
+    assert call(rerank=True) is True             # request opt-in
+    assert call(rerank=False) is False
+    # the MCP/tool path takes the same field
+    from app import main as _m
+    assert "rerank" in _m.RecallIn.model_fields if hasattr(_m.RecallIn, "model_fields") else True
