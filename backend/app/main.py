@@ -41,7 +41,7 @@ class RecallIn(BaseModel):
     size: int = 8
     min_score: Optional[float] = None
     as_of: Optional[str] = None     # ISO-8601 instant the query is asked (cause 3)
-    per_doc: Optional[int] = None   # max passages per source doc_group (default 2)
+    per_doc: Optional[int] = None   # max passages per source doc_group (default 3)
 
 
 class PromoteIn(BaseModel):

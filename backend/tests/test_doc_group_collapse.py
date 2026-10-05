@@ -1,8 +1,7 @@
 """Round 2: recall collapses to at most `per_doc` passages per doc_group BEFORE the
 size cut, so a fixed-size window covers more distinct sessions.
 
-Measured motivation (v3 LongMemEval scopes, 100 questions): the old cap of 3 left the
-top-8 spanning a mean of 4.25 distinct sessions (23% of rows only 3).
+Default per-group cap is 3 (round 2 tried 2; no accuracy gain, temporal fell, reverted).
 
 Pure tests drive _apply_budgets directly; integration tests run against live ES like the
 rest of the suite:  docker compose ... run --rm --no-deps -v <repo>:/srv -w /srv/backend \
@@ -37,27 +36,36 @@ def _groups(window):
 
 
 # ------------------------------------------------------------------ pure units
-def test_default_budget_is_two_per_group():
-    assert memory.PER_DOC_BUDGET == 2
+def test_default_budget_is_three_per_group():
+    """Round 3: default reverted 2 -> 3 on measured evidence (see memory.py comment)."""
+    assert memory.PER_DOC_BUDGET == 3
+    assert memory.RECALL_FETCH_FACTOR >= 2          # the over-fetch stays
 
 
-def test_eight_slots_cover_at_least_four_groups_when_one_group_dominates():
+def test_default_cap_limits_a_dominant_group_to_the_default_budget():
     # group A owns the 6 best passages; B, C, D, E each have one lower-ranked passage
     spec = [("A", 1.0 - 0.01 * i) for i in range(6)]
     spec += [("B", 0.5), ("C", 0.4), ("D", 0.3), ("E", 0.2)]
     window = memory._apply_budgets(_items(spec), size=8, per_kind_budget=8,
                                    per_doc_budget=memory.PER_DOC_BUDGET)
     groups = _groups(window)
-    assert groups.count("A") == 2, groups
-    assert len(set(groups)) >= 4, groups
-    assert len(window) == 8 or len(window) == 6, len(window)
+    assert groups.count("A") == memory.PER_DOC_BUDGET == 3, groups
+    assert len(set(groups)) == 5, groups            # A + B, C, D, E all present
+    assert len(window) == 7, len(window)
 
 
-def test_old_budget_of_three_would_crowd_more():
+def test_cap_of_two_is_still_available_per_request():
+    spec = [("A", 1.0 - 0.01 * i) for i in range(6)]
+    spec += [("B", 0.5), ("C", 0.4), ("D", 0.3), ("E", 0.2)]
+    window = memory._apply_budgets(_items(spec), size=8, per_kind_budget=8, per_doc_budget=2)
+    assert _groups(window).count("A") == 2 and len(set(_groups(window))) >= 4
+
+
+def test_smaller_budget_means_fewer_passages_from_the_dominant_group():
     spec = [("A", 1.0 - 0.01 * i) for i in range(6)] + [("B", 0.5), ("C", 0.4)]
-    old = memory._apply_budgets(_items(spec), size=8, per_kind_budget=8, per_doc_budget=3)
-    new = memory._apply_budgets(_items(spec), size=8, per_kind_budget=8, per_doc_budget=2)
-    assert _groups(old).count("A") == 3 and _groups(new).count("A") == 2
+    three = memory._apply_budgets(_items(spec), size=8, per_kind_budget=8, per_doc_budget=3)
+    two = memory._apply_budgets(_items(spec), size=8, per_kind_budget=8, per_doc_budget=2)
+    assert _groups(three).count("A") == 3 and _groups(two).count("A") == 2
 
 
 def test_rank_is_preserved_inside_the_collapse():

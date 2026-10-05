@@ -18,11 +18,12 @@ VISIBILITIES = ("private", "team", "common")
 RANK_CONSTANT = 60              # RRF rank constant; must match ES rrf rank_constant
 RECENCY_WEIGHT = 0.15           # recency arm weight, as a fraction of one RRF arm's top hit
 RECENCY_HALF_LIFE_DAYS = 30.0   # gauss decay half-life applied to occurred_at
-# Max fused results from one source doc group (round 2: 3 -> 2). Measured on the v3
-# LongMemEval scopes the old cap of 3 still left a top-8 spanning only ~4.25 distinct
-# sessions (23% of rows: 3), so evidence from 4+ sessions competed for 8 slots. Override
-# per request with recall(per_doc=...) / AMES_PER_DOC_BUDGET.
-PER_DOC_BUDGET = int(os.environ.get("AMES_PER_DOC_BUDGET", "2"))
+# Max fused results from one source doc group. Default 3 (round 3). Round 2 tried 2:
+# it widened a top-8 from ~4.25 to ~5.3 distinct sessions but did NOT improve answer
+# accuracy on the frozen anchor (v3 77 > per_doc=3 75 > per_doc=2 73, McNemar n.s.) and
+# temporal-reasoning fell monotonically as the cap tightened (0.72/0.68/0.56). Override per
+# request with recall(per_doc=...) / the API `per_doc` field, or AMES_PER_DOC_BUDGET.
+PER_DOC_BUDGET = int(os.environ.get("AMES_PER_DOC_BUDGET", "3"))
 RECALL_FETCH_FACTOR = 4         # candidates fetched per arm = size * factor (capped)
 RECALL_FETCH_CAP = 50
 DEDUP_SIM_THRESHOLD = 0.92      # cosine >= this in the same visibility scope => near-dup
@@ -353,7 +354,7 @@ def recall(owner_id: str, query: str, kinds=None, size: int = 8,
     relative to today" nor resolve "last two weeks" against the wrong year.
 
     Round 2: `per_doc` caps how many passages of ONE source doc_group may enter the
-    window (default PER_DOC_BUDGET=2). Passages are ranked first, then collapsed to at
+    window (default PER_DOC_BUDGET=3). Passages are ranked first, then collapsed to at
     most `per_doc` per group BEFORE the size cut, so the window covers more distinct
     sessions. `doc_groups` in the response reports how many distinct groups it holds.
     """
