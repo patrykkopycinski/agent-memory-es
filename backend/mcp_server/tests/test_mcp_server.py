@@ -201,3 +201,57 @@ def test_non_json_2xx_becomes_ameserror():
     msg = str(ei.value)
     assert "non-JSON" in msg and "200" in msg and "text/html" in msg
     assert KEY not in msg
+
+
+# --- review c320b82 findings ---
+
+def test_visibility_filter_fetches_backend_max_even_for_large_k():
+    # finding 2: fetch must not be capped by a k-derived window
+    calls = []
+    mcp = build_server(_client(calls, results=ITEMS))
+    _call(mcp, "memory_recall", {"query": "q", "k": 50, "visibility": "team"})
+    _call(mcp, "memory_recall", {"query": "q", "k": 1, "visibility": "team"})
+    assert calls[0][3]["size"] == 50 and calls[1][3]["size"] == 50
+    _call(mcp, "memory_recall", {"query": "q", "k": 3})
+    assert calls[2][3]["size"] == 3  # no filter -> no over-fetch
+
+
+def test_visibility_filter_finds_sparse_match_deep_in_window():
+    deep = [{"id": str(n), "visibility": "private", "text": "p"} for n in range(45)]
+    deep.append({"id": "T", "visibility": "team", "text": "t"})
+    calls = []
+    mcp = build_server(_client(calls, results=deep))
+    out = _call(mcp, "memory_recall", {"query": "q", "k": 5, "visibility": "team"})
+    assert [r["id"] for r in out["results"]] == ["T"]
+    assert "note" not in out  # window not saturated
+
+
+def test_visibility_filter_saturated_window_reports_note():
+    full = [{"id": str(n), "visibility": "private", "text": "p"} for n in range(50)]
+    mcp = build_server(_client([], results=full))
+    out = _call(mcp, "memory_recall", {"query": "q", "k": 5, "visibility": "team"})
+    assert out["count"] == 0 and "top 50" in out["note"]
+
+
+def test_recall_ignores_deprecated_fused_alias_and_rejects_unknown_shape():
+    # finding 3: no silent dual-key tolerance
+    def handler(req):
+        return httpx.Response(200, json={"fused": [{"id": "1", "visibility": "private"}]})
+    c = AmesClient("http://ames.test", KEY, transport=httpx.MockTransport(handler))
+    with pytest.raises(Exception, match="no 'results' list"):
+        _call(build_server(c), "memory_recall", {"query": "q"})
+
+
+def test_amesError_surfaces_as_protocol_isError_without_key():
+    # finding 4: via the real MCP session, not just FastMCP.call_tool
+    from mcp.shared.memory import create_connected_server_and_client_session
+
+    async def go():
+        mcp = build_server(_client([], status=401))
+        async with create_connected_server_and_client_session(mcp._mcp_server) as s:
+            return await s.call_tool("memory_recall", {"query": "q"})
+    res = asyncio.run(go())
+    text = res.content[0].text
+    assert res.isError is True
+    assert "401" in text and "AMES_API_KEY" in text
+    assert KEY not in text and "Traceback" not in text
