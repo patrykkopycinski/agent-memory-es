@@ -2,6 +2,7 @@
 import datetime as _dt
 import hashlib
 import math
+import os
 import re
 import time
 import uuid
@@ -17,7 +18,13 @@ VISIBILITIES = ("private", "team", "common")
 RANK_CONSTANT = 60              # RRF rank constant; must match ES rrf rank_constant
 RECENCY_WEIGHT = 0.15           # recency arm weight, as a fraction of one RRF arm's top hit
 RECENCY_HALF_LIFE_DAYS = 30.0   # gauss decay half-life applied to occurred_at
-PER_DOC_BUDGET = 3              # max fused results from one source doc group
+# Max fused results from one source doc group (round 2: 3 -> 2). Measured on the v3
+# LongMemEval scopes the old cap of 3 still left a top-8 spanning only ~4.25 distinct
+# sessions (23% of rows: 3), so evidence from 4+ sessions competed for 8 slots. Override
+# per request with recall(per_doc=...) / AMES_PER_DOC_BUDGET.
+PER_DOC_BUDGET = int(os.environ.get("AMES_PER_DOC_BUDGET", "2"))
+RECALL_FETCH_FACTOR = 4         # candidates fetched per arm = size * factor (capped)
+RECALL_FETCH_CAP = 50
 DEDUP_SIM_THRESHOLD = 0.92      # cosine >= this in the same visibility scope => near-dup
 # NOTE (cause 1): dedup is exact-normalized-text-hash ONLY. The spec allowed the
 # alternative "cosine >= 0.99 over the full text", but e5-small embeds only the head,
@@ -331,7 +338,8 @@ def _visibility_filter(owner_id: str) -> dict:
 
 def recall(owner_id: str, query: str, kinds=None, size: int = 8,
            min_score: Optional[float] = None,
-           as_of: Optional[str] = None) -> dict:
+           as_of: Optional[str] = None,
+           per_doc: Optional[int] = None) -> dict:
     """Hybrid recall: BM25 + kNN fused per-kind, visibility isolation, RRF across kinds.
 
     Returns a single flat `results` list (RRF + recency fused, score-ordered) with
@@ -343,6 +351,11 @@ def recall(owner_id: str, query: str, kinds=None, size: int = 8,
     the recency decay and the relative time-window parser resolve against it instead of
     the wall clock, so a benchmark replaying old sessions does not rank by "recent
     relative to today" nor resolve "last two weeks" against the wrong year.
+
+    Round 2: `per_doc` caps how many passages of ONE source doc_group may enter the
+    window (default PER_DOC_BUDGET=2). Passages are ranked first, then collapsed to at
+    most `per_doc` per group BEFORE the size cut, so the window covers more distinct
+    sessions. `doc_groups` in the response reports how many distinct groups it holds.
     """
     now = None
     if as_of:
@@ -354,18 +367,22 @@ def recall(owner_id: str, query: str, kinds=None, size: int = 8,
     except Exception:
         pass
     results = {}
+    # Over-fetch: the per-doc collapse runs AFTER ranking and can only shrink the list,
+    # so each arm must return more than `size` candidates or a size-8 window would come
+    # back under-filled whenever a group hits its cap.
+    fetch = max(size, min(RECALL_FETCH_CAP, size * RECALL_FETCH_FACTOR))
     for kind in kinds:
         must = [{"multi_match": {"query": query, "fields": ["text^3", "entities"], "type": "most_fields"}}]
         if qvec is not None:
             body = {
-                "size": size,
+                "size": fetch,
                 "retriever": {"rrf": {
                     "retrievers": [
                         {"standard": {"query": {"bool": {
                             "must": must,
                             "filter": [{"term": {"active": True}}, _visibility_filter(owner_id)],
                         }}}},
-                        {"knn": {"field": "embedding", "query_vector": qvec, "num_candidates": 100, "k": size,
+                        {"knn": {"field": "embedding", "query_vector": qvec, "num_candidates": max(100, fetch * 2), "k": fetch,
                                  "filter": [{"term": {"active": True}}, _visibility_filter(owner_id)]}},
                     ],
                     "rank_constant": 60,
@@ -374,7 +391,7 @@ def recall(owner_id: str, query: str, kinds=None, size: int = 8,
             }
         else:
             body = {
-                "size": size,
+                "size": fetch,
                 "query": {"bool": {
                     "must": must,
                     "filter": [{"term": {"active": True}}, _visibility_filter(owner_id)],
@@ -446,13 +463,14 @@ def recall(owner_id: str, query: str, kinds=None, size: int = 8,
     ordered = sorted(fused.values(), key=lambda x: -x["score"])
     if min_score is not None:
         ordered = [h for h in ordered if h["score"] >= min_score]
-    window = _apply_budgets(ordered, size)
+    window = _apply_budgets(ordered, size, per_doc_budget=per_doc or PER_DOC_BUDGET)
     out = {
         "query": query,
         "results": window,
-        "by_kind": results,   # deprecated: per-kind lists, kept for compat
+        "by_kind": {k: v[:size] for k, v in results.items()},   # deprecated; compat shape
         "fused": window,      # deprecated alias of `results`
         "abstained": bool(min_score is not None and not window),
+        "doc_groups": len({it.get("doc_group") or it.get("id") for it in window}),
     }
     # mental-model priority tier surfaces above facts (like reflect's source order)
     try:
