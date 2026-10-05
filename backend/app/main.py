@@ -5,7 +5,7 @@ from typing import Optional
 from fastapi import Depends, FastAPI, Header, HTTPException
 from pydantic import BaseModel
 
-from . import auth, memory, pages as pages_mod, mental_models as mm_mod, reranker
+from . import auth, memory, pages as pages_mod, mental_models as mm_mod, reranker, tagfilter
 from .store import KINDS, ensure_indices
 
 app = FastAPI(title="agent-memory-es", version="0.2.0")
@@ -33,6 +33,8 @@ class RetainIn(BaseModel):
     doc_group: Optional[str] = None   # caller's stable id for the source document
                                       # (e.g. a session id); long text is written as
                                       # passages sharing it (cause 2)
+    tags: Optional[list] = None       # caller-supplied "key:value" tags (stored as keywords)
+    labels: Optional[list] = None     # label groups to LLM-extract into tags (off when absent)
 
 
 class RecallIn(BaseModel):
@@ -43,6 +45,8 @@ class RecallIn(BaseModel):
     as_of: Optional[str] = None     # ISO-8601 instant the query is asked (cause 3)
     per_doc: Optional[int] = None   # max passages per source doc_group (default 3)
     rerank: Optional[bool] = None   # ES cross-encoder rerank of the fused top-50 (opt-in: AMES_RERANK, default off)
+    filter: Optional[dict] = None   # {all, any, none, narrow_any}: tag filter applied inside ES;
+                                    # a filter that matches nothing abstains (results [])
 
 
 class PromoteIn(BaseModel):
@@ -66,15 +70,22 @@ def mint_key(owner_id: str, role: str = "member", _admin: str = Header(None, ali
 def retain(body: RetainIn, who: dict = Depends(caller)):
     try:
         return memory.retain(who["owner_id"], body.kind, body.text, body.visibility,
-                             body.occurred_at, body.doc_group)
+                             body.occurred_at, body.doc_group, body.tags, body.labels)
     except ValueError as e:
         raise HTTPException(422, str(e))
+    except tagfilter.ExtractionError as e:
+        # fail closed: nothing was written; silently untagged memories would be invisible to
+        # every narrowed recall. The caller retries.
+        raise HTTPException(502, str(e))
 
 
 @app.post("/memory/recall")
 def recall(body: RecallIn, who: dict = Depends(caller)):
-    return memory.recall(who["owner_id"], body.query, body.kinds, body.size,
-                         body.min_score, body.as_of, body.per_doc, body.rerank)
+    try:
+        return memory.recall(who["owner_id"], body.query, body.kinds, body.size,
+                             body.min_score, body.as_of, body.per_doc, body.rerank, body.filter)
+    except tagfilter.FilterError as e:
+        raise HTTPException(422, str(e))
 
 
 @app.post("/memory/promote")

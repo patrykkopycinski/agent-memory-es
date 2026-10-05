@@ -57,3 +57,28 @@ def rewrite_queries(question: str, n: int = 2) -> list:
     lines = [l.strip().lstrip("0123456789.-) ") for l in
              out["choices"][0]["message"]["content"].splitlines() if l.strip()]
     return lines[:n]
+
+
+def chat_json(system: str, user: str, timeout: int = 120) -> dict:
+    """One temperature-0 chat completion that must return a JSON object (label extraction).
+    Raises on transport errors, empty content or a non-object body: the caller decides policy."""
+    body = json.dumps({
+        "model": MODEL, "temperature": 0,
+        "response_format": {"type": "json_object"},
+        "messages": [{"role": "system", "content": system},
+                     {"role": "user", "content": user}],
+    }).encode()
+    req = urllib.request.Request(BASE + "/chat/completions", data=body, method="POST",
+                                 headers={"Content-Type": "application/json",
+                                          "Authorization": f"Bearer {KEY}"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        out = json.load(r)
+    content = (out["choices"][0]["message"].get("content") or "").strip()
+    if content.startswith("```"):                      # tolerate a fenced reply
+        content = content.strip("`")
+        if content[:4].lower() == "json":
+            content = content[4:]
+    obj = json.loads(content)
+    if not isinstance(obj, dict):
+        raise ValueError("extractor reply is not a JSON object")
+    return obj
