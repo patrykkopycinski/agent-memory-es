@@ -8,8 +8,13 @@ Deterministic lightweight parser: 'last N days/weeks/months', 'in YYYY', 'YYYY-M
 import re
 import datetime
 
+_NUM_WORDS = {"a": 1, "an": 1, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+              "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10, "eleven": 11,
+              "twelve": 12}
+
 _PATTERNS = [
-    (re.compile(r"(?i)\blast\s+(\d+)\s+(day|week|month)s?\b"), "last_n"),
+    (re.compile(r"(?i)\blast\s+(\d+|%s)\s+(day|week|month)s?\b"
+                % "|".join(_NUM_WORDS)), "last_n"),
     (re.compile(r"(?i)\b(?:in\s+)?(\d{4})-(\d{2})\b"), "ym"),
     (re.compile(r"(?i)\b(?:in\s+)?(\d{4})\b"), "year"),
     (re.compile(r"(?i)\bthis\s+(week|month|year)\b"), "this"),
@@ -17,15 +22,22 @@ _PATTERNS = [
 ]
 
 
+def _int(tok: str) -> int:
+    """Digits or an English number word (cause 3: 'last two weeks')."""
+    t = (tok or "").strip().lower()
+    return int(t) if t.isdigit() else _NUM_WORDS[t]
+
+
 def parse_window(query: str, now: datetime.datetime = None):
-    """Returns (start_iso, end_iso) or None."""
+    """Returns (start_iso, end_iso) or None. `now` is the instant the query is asked
+    (cause 3: pass the question date so 'last two weeks' resolves against it)."""
     now = now or datetime.datetime.now(datetime.timezone.utc)
     for pat, kind in _PATTERNS:
         m = pat.search(query)
         if not m:
             continue
         if kind == "last_n":
-            n, unit = int(m.group(1)), m.group(2)
+            n, unit = _int(m.group(1)), m.group(2)
             days = n * {"day": 1, "week": 7, "month": 30}[unit]
             return _iso(now - datetime.timedelta(days=days)), _iso(now)
         if kind == "ym":

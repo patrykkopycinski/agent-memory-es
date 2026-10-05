@@ -40,6 +40,7 @@ class RecallIn(BaseModel):
     kinds: Optional[list] = None
     size: int = 8
     min_score: Optional[float] = None
+    as_of: Optional[str] = None     # ISO-8601 instant the query is asked (cause 3)
 
 
 class PromoteIn(BaseModel):
@@ -70,7 +71,8 @@ def retain(body: RetainIn, who: dict = Depends(caller)):
 
 @app.post("/memory/recall")
 def recall(body: RecallIn, who: dict = Depends(caller)):
-    return memory.recall(who["owner_id"], body.query, body.kinds, body.size, body.min_score)
+    return memory.recall(who["owner_id"], body.query, body.kinds, body.size,
+                         body.min_score, body.as_of)
 
 
 @app.post("/memory/promote")
@@ -193,7 +195,9 @@ def mcp_tool(tool: str, body: dict, who: dict = Depends(caller)):
         "retain": lambda b: memory.retain(who["owner_id"], b["kind"], b["text"],
                                           b.get("visibility", "private"),
                                           b.get("occurred_at"), b.get("doc_group")),
-        "recall": lambda b: memory.recall(who["owner_id"], b["query"], b.get("kinds"), b.get("size", 8)),
+        "recall": lambda b: memory.recall(who["owner_id"], b["query"], b.get("kinds"),
+                                          b.get("size", 8), b.get("min_score"),
+                                          b.get("as_of")),
         "reflect": lambda b: memory.reflect(who["owner_id"], b["question"]),
         "promote": lambda b: memory.promote(who["owner_id"], b["kind"], b["doc_id"], b["to_visibility"]),
     }

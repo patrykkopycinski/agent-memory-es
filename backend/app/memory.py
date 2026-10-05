@@ -147,6 +147,24 @@ def text_hash(text: str) -> str:
     return hashlib.sha256(_norm_text(text).encode("utf-8")).hexdigest()
 
 
+def _parse_as_of(as_of: str) -> _dt.datetime:
+    """Parse a caller-supplied 'now' (ISO-8601 date or datetime) into an aware UTC dt.
+
+    Day precision is the useful granularity for the benchmark's question dates; a bare
+    date resolves to that day's END so a same-day session is inside the window.
+    """
+    s = (as_of or "").strip().replace("Z", "+00:00")
+    try:
+        d = _dt.datetime.fromisoformat(s)
+    except ValueError:
+        d = _dt.datetime.strptime(s[:10], "%Y-%m-%d")
+    if d.tzinfo is None:
+        d = d.replace(tzinfo=_dt.timezone.utc)
+    if len(s) == 10:
+        d = d + _dt.timedelta(days=1) - _dt.timedelta(seconds=1)
+    return d
+
+
 def _scope_filter(owner_id: str, kind: str, visibility: str) -> dict:
     filt = [{"term": {"active": True}}, {"term": {"visibility": visibility}}]
     if visibility == "private":
@@ -312,13 +330,23 @@ def _visibility_filter(owner_id: str) -> dict:
 
 
 def recall(owner_id: str, query: str, kinds=None, size: int = 8,
-           min_score: Optional[float] = None) -> dict:
+           min_score: Optional[float] = None,
+           as_of: Optional[str] = None) -> dict:
     """Hybrid recall: BM25 + kNN fused per-kind, visibility isolation, RRF across kinds.
 
     Returns a single flat `results` list (RRF + recency fused, score-ordered) with
     `kind`, `score` and `visibility` on every item. `by_kind` is a deprecated additive
     field kept for compat. `min_score` post-filters the fused list and marks an empty
-    result `abstained: true`."""
+    result `abstained: true`.
+
+    cause 3: `as_of` (ISO-8601 date/datetime) is the instant the query is asked. Both
+    the recency decay and the relative time-window parser resolve against it instead of
+    the wall clock, so a benchmark replaying old sessions does not rank by "recent
+    relative to today" nor resolve "last two weeks" against the wrong year.
+    """
+    now = None
+    if as_of:
+        now = _parse_as_of(as_of)
     kinds = kinds or list(KINDS)
     qvec = None
     try:
@@ -381,7 +409,7 @@ def recall(owner_id: str, query: str, kinds=None, size: int = 8,
     temporal_meta = None
     try:
         from . import temporal as _temporal
-        w = _temporal.parse_window(query)
+        w = _temporal.parse_window(query, now)
         if w:
             start, end = w
             buckets = _temporal.spread_buckets(start, end)
@@ -410,7 +438,7 @@ def recall(owner_id: str, query: str, kinds=None, size: int = 8,
         pass
     # recency arm (always on, small weight): gauss decay over occurred_at, scaled to
     # one RRF arm's top hit so it reorders near-ties without outvoting relevance.
-    _now = _dt.datetime.now(_dt.timezone.utc)
+    _now = now or _dt.datetime.now(_dt.timezone.utc)
     for h in fused.values():
         h.setdefault("es_score", h.get("score"))
         h["recency"] = _recency_boost(h.get("occurred_at"), _now)
