@@ -42,6 +42,7 @@ class RecallIn(BaseModel):
     min_score: Optional[float] = None
     as_of: Optional[str] = None     # ISO-8601 instant the query is asked (cause 3)
     per_doc: Optional[int] = None   # max passages per source doc_group (default 3)
+    rerank: Optional[bool] = None   # ES cross-encoder rerank of the fused top-50 (default: AMES_RERANK, on)
 
 
 class PromoteIn(BaseModel):
@@ -73,7 +74,7 @@ def retain(body: RetainIn, who: dict = Depends(caller)):
 @app.post("/memory/recall")
 def recall(body: RecallIn, who: dict = Depends(caller)):
     return memory.recall(who["owner_id"], body.query, body.kinds, body.size,
-                         body.min_score, body.as_of, body.per_doc)
+                         body.min_score, body.as_of, body.per_doc, body.rerank)
 
 
 @app.post("/memory/promote")
@@ -198,7 +199,7 @@ def mcp_tool(tool: str, body: dict, who: dict = Depends(caller)):
                                           b.get("occurred_at"), b.get("doc_group")),
         "recall": lambda b: memory.recall(who["owner_id"], b["query"], b.get("kinds"),
                                           b.get("size", 8), b.get("min_score"),
-                                          b.get("as_of"), b.get("per_doc")),
+                                          b.get("as_of"), b.get("per_doc"), b.get("rerank")),
         "reflect": lambda b: memory.reflect(who["owner_id"], b["question"]),
         "promote": lambda b: memory.promote(who["owner_id"], b["kind"], b["doc_id"], b["to_visibility"]),
     }

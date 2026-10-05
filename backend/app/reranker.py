@@ -26,7 +26,7 @@ def rerank(query: str, hits: list, top_n: int = 5,
     try:
         with urllib.request.urlopen(req, timeout=30) as r:
             out = json.load(r)
-    except (urllib.error.HTTPError, urllib.error.URLError, RuntimeError):
+    except (urllib.error.HTTPError, urllib.error.URLError, RuntimeError, OSError, ValueError):
         # license/mapping/model unavailable → honest fallback, no fake rerank
         return {"hits": hits[:top_n], "reranked": False}
     ranked = []

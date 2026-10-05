@@ -26,6 +26,41 @@ RECENCY_HALF_LIFE_DAYS = 30.0   # gauss decay half-life applied to occurred_at
 PER_DOC_BUDGET = int(os.environ.get("AMES_PER_DOC_BUDGET", "3"))
 RECALL_FETCH_FACTOR = 4         # candidates fetched per arm = size * factor (capped)
 RECALL_FETCH_CAP = 50
+
+# Round 5: ES-native cross-encoder rerank (_inference/rerank) over the fused top-RERANK_DEPTH,
+# applied BEFORE the per-doc budget and the size cut (the output budget is unchanged: still
+# `size` passages). Default on; AMES_RERANK=0 or per-request rerank=false disables it. If the
+# endpoint is unavailable the fused order is kept and the response says reranked=false.
+RERANK_DEPTH = int(os.environ.get("AMES_RERANK_DEPTH", "50"))
+RERANK_DEFAULT = os.environ.get("AMES_RERANK", "1").strip().lower() not in ("0", "false", "no", "off", "")
+
+
+def _rerank_fused(query: str, ordered: list, depth: int = None) -> tuple:
+    """Re-order the top `depth` of the fused list by cross-encoder relevance. Returns
+    (new_ordered, reranked: bool). `score` is NOT touched (it stays rrf + recency, so the
+    documented invariant and `min_score` semantics hold); the cross-encoder verdict is exposed as
+    `rerank_score` and the final position as `rerank_rank`, which _apply_budgets sorts by.
+    Candidates the endpoint did not return, and everything beyond `depth`, keep their relative
+    fused order strictly below the reranked ones."""
+    from . import reranker as _rr
+    depth = RERANK_DEPTH if depth is None else depth
+    head, tail = ordered[:depth], ordered[depth:]
+    if len(head) < 2:
+        return ordered, False
+    out = _rr.rerank(query, head, top_n=len(head))
+    if not out.get("reranked"):
+        return ordered, False
+    ranked = list(out["hits"])
+    seen = {h["id"] for h in ranked}
+    ranked += [h for h in head if h["id"] not in seen]      # never lose a candidate
+    new = []
+    for i, h in enumerate(ranked + tail):
+        h = dict(h)
+        h["rerank_rank"] = i
+        if i >= len(ranked):
+            h.pop("rerank_score", None)
+        new.append(h)
+    return new, True
 DEDUP_SIM_THRESHOLD = 0.92      # cosine >= this in the same visibility scope => near-dup
 # NOTE (cause 1): dedup is exact-normalized-text-hash ONLY. The spec allowed the
 # alternative "cosine >= 0.99 over the full text", but e5-small embeds only the head,
@@ -139,7 +174,8 @@ def _apply_budgets(ordered: list, size: int, per_kind_budget: Optional[int] = No
         if doc_count.get(doc, 0) < per_doc_budget:
             picked.append(it)
             doc_count[doc] = doc_count.get(doc, 0) + 1
-    picked.sort(key=lambda x: -x.get("score", 0.0))
+    # reranked lists carry rerank_rank (cross-encoder order); otherwise score-ordered
+    picked.sort(key=lambda x: (x["rerank_rank"],) if "rerank_rank" in x else (-x.get("score", 0.0),))
     return picked[:size]
 
 
@@ -340,7 +376,8 @@ def _visibility_filter(owner_id: str) -> dict:
 def recall(owner_id: str, query: str, kinds=None, size: int = 8,
            min_score: Optional[float] = None,
            as_of: Optional[str] = None,
-           per_doc: Optional[int] = None) -> dict:
+           per_doc: Optional[int] = None,
+           rerank: Optional[bool] = None) -> dict:
     """Hybrid recall: BM25 + kNN fused per-kind, visibility isolation, RRF across kinds.
 
     Returns a single flat `results` list (RRF + recency fused, score-ordered) with
@@ -464,6 +501,9 @@ def recall(owner_id: str, query: str, kinds=None, size: int = 8,
     ordered = sorted(fused.values(), key=lambda x: -x["score"])
     if min_score is not None:
         ordered = [h for h in ordered if h["score"] >= min_score]
+    reranked = False
+    if (RERANK_DEFAULT if rerank is None else rerank):
+        ordered, reranked = _rerank_fused(query, ordered)
     window = _apply_budgets(ordered, size, per_doc_budget=per_doc or PER_DOC_BUDGET)
     out = {
         "query": query,
@@ -472,6 +512,7 @@ def recall(owner_id: str, query: str, kinds=None, size: int = 8,
         "fused": window,      # deprecated alias of `results`
         "abstained": bool(min_score is not None and not window),
         "doc_groups": len({it.get("doc_group") or it.get("id") for it in window}),
+        "reranked": reranked,
     }
     # mental-model priority tier surfaces above facts (like reflect's source order)
     try:

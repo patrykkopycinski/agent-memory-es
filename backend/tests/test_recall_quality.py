@@ -113,7 +113,9 @@ def test_recency_boost_orders_recent_first(monkeypatch):
     memory.retain(OWNER, "semantic", new, occurred_at="2026-10-03T00:00:00Z")
 
     monkeypatch.setattr(memory, "RECENCY_WEIGHT", 5.0)
-    boosted = memory.recall(OWNER, "shard rebalance targets", size=8)["results"]
+    # the recency arm only orders the FUSED list; the (default-on) cross-encoder rerank replaces
+    # that order by relevance, so this contract is tested on the fused path (rerank=False).
+    boosted = memory.recall(OWNER, "shard rebalance targets", size=8, rerank=False)["results"]
     recent_first = next(h for h in boosted if h["text"] == new)
     old_second = next(h for h in boosted if h["text"] == old)
     assert boosted.index(recent_first) < boosted.index(old_second), [h["text"] for h in boosted]
