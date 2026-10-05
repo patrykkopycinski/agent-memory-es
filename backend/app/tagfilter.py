@@ -142,7 +142,8 @@ EXTRACT_SYSTEM = (
     "You label a piece of text for a memory store. For each label group below, read the TEXT and "
     "answer exactly as that group's description says. Use only what the TEXT supports; never "
     "invent. Reply with ONE JSON object and nothing else: keys are the group keys, values are "
-    "a string (types value/text) or a list of strings (types multi-value/multi-text). Use an "
+    "a string (types value/text) or a list of strings (types multi-value/multi-text). For groups "
+    "with allowed_values, answer with EXACTLY one of those strings (no descriptions). Use an "
     "empty list or empty string when a group does not apply."
 )
 
@@ -155,9 +156,13 @@ def build_extraction_prompt(text: str, groups: list) -> tuple:
     for g in groups:
         spec = {"key": g["key"], "type": g["type"], "description": g["description"]}
         if g["values"]:
-            spec["allowed_values"] = [v["value"] if not v["description"]
-                                      else "%s (%s)" % (v["value"], v["description"])
-                                      for v in g["values"]]
+            # Bare values only: a model asked to pick from "current (active)" echoes that whole
+            # string back, which then (correctly) fails the vocabulary check. Descriptions go in
+            # a separate field so the answer is exactly one of `allowed_values`.
+            spec["allowed_values"] = [v["value"] for v in g["values"]]
+            described = {v["value"]: v["description"] for v in g["values"] if v["description"]}
+            if described:
+                spec["value_descriptions"] = described
         lines.append(json.dumps(spec, ensure_ascii=False))
     user = "LABEL GROUPS (one JSON object per line):\n" + "\n".join(lines) + "\n\nTEXT:\n" + body
     return EXTRACT_SYSTEM, user, truncated

@@ -154,6 +154,13 @@
    "find": "    if not (all_t or none_t or any_g or narrow is not None):\n        return None",
    "replace": "    if not (all_t or none_t or any_g or narrow):\n        return None",
    "expect": "kill"
+  },
+  {
+   "name": "F23 allowed values rendered with their description (model echoes it back)",
+   "file": "backend/app/tagfilter.py",
+   "find": "            spec[\"allowed_values\"] = [v[\"value\"] for v in g[\"values\"]]",
+   "replace": "            spec[\"allowed_values\"] = [v[\"value\"] if not v[\"description\"] else \"%s (%s)\" % (v[\"value\"], v[\"description\"]) for v in g[\"values\"]]",
+   "expect": "kill"
   }
  ]
 }
