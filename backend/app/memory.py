@@ -50,14 +50,14 @@ def _rerank_fused(query: str, ordered: list, depth: int = None) -> tuple:
     out = _rr.rerank(query, head, top_n=len(head))
     if not out.get("reranked"):
         return ordered, False
-    scored = {h["id"] for h in out["hits"]}                  # ids the cross-encoder actually scored
+    scored = {h.get("id") for h in out["hits"] if h.get("id") is not None}
     ranked = list(out["hits"])
-    ranked += [h for h in head if h["id"] not in scored]    # never lose a candidate
+    ranked += [h for h in head if h.get("id") not in scored]    # never lose a candidate
     new = []
     for i, h in enumerate(ranked + tail):
         h = dict(h)
         h["rerank_rank"] = i
-        if h["id"] not in scored:
+        if h.get("id") not in scored:
             # an item the endpoint did not return must not carry a score it never received
             # (covers both an omitted head item and every item beyond `depth`)
             h.pop("rerank_score", None)

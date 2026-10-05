@@ -1,8 +1,11 @@
 """Round 5: ES-native rerank of the fused top-50, BEFORE the per-doc budget + size cut.
 The output budget is unchanged (size passages). Falls back honestly when the endpoint is down.
 """
+import json
 import os
 import sys
+
+import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -283,3 +286,90 @@ def test_http_rerank_true_actually_reaches_recall_and_default_stays_off(monkeypa
     # the MCP/tool path takes the same field
     from app import main as _m
     assert "rerank" in _m.RecallIn.model_fields if hasattr(_m.RecallIn, "model_fields") else True
+
+
+# ------------------------------------------------------------------ malformed / partial responses
+class _Resp:
+    """Minimal stand-in for the urlopen response object json.load() consumes."""
+
+    def __init__(self, payload):
+        self._payload = payload
+
+    def read(self):
+        return self._payload
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+def _serve(monkeypatch, payload):
+    monkeypatch.setattr(reranker.urllib.request, "urlopen",
+                        lambda *a, **k: _Resp(payload if isinstance(payload, bytes) else json.dumps(payload).encode()))
+
+
+def _three():
+    return [{"id": "a", "text": "x"}, {"id": "b", "text": "y"}, {"id": "c", "text": "z"}]
+
+
+
+@pytest.mark.parametrize("payload", [
+    ["nope"],                                  # a JSON list, not an object
+    "plain string",                            # not even a container
+    {"rerank": {"index": 0}},                  # "rerank" is not a list
+    {"rerank": "nope"},
+    {"rerank": [42, None]},                    # items are not objects
+    {"rerank": [{"index": "x"}]},              # unusable index
+    {"rerank": [{"index": 99}]},               # index out of range
+    {"no_rerank_key": []},                     # key missing entirely
+])
+def test_unusable_responses_fall_back_instead_of_raising(monkeypatch, payload):
+    _serve(monkeypatch, payload)
+    out = reranker.rerank(Q, _three(), top_n=3)
+    assert out["reranked"] is False, payload
+    assert [h["id"] for h in out["hits"]] == ["a", "b", "c"]
+
+
+def test_truncated_body_falls_back(monkeypatch):
+    _serve(monkeypatch, b'{"rerank": [{"index": 0, "relevance_sco')      # json.load raises ValueError
+    out = reranker.rerank(Q, _three(), top_n=3)
+    assert out["reranked"] is False and len(out["hits"]) == 3
+
+
+def test_numeric_string_index_is_accepted(monkeypatch):
+    _serve(monkeypatch, {"rerank": [{"index": "2", "relevance_score": 5.0}]})
+    out = reranker.rerank(Q, _three(), top_n=3)
+    assert out["reranked"] is True and out["hits"][0]["id"] == "c"
+
+
+def test_duplicate_indices_score_an_item_only_once(monkeypatch):
+    _serve(monkeypatch, {"rerank": [{"index": 1, "relevance_score": 9.0},
+                                    {"index": 1, "relevance_score": 1.0},
+                                    {"index": 0, "relevance_score": 2.0}]})
+    out = reranker.rerank(Q, _three(), top_n=3)
+    assert [h["id"] for h in out["hits"]] == ["b", "a"]
+
+
+def test_missing_relevance_score_is_none_not_a_guess(monkeypatch):
+    _serve(monkeypatch, {"rerank": [{"index": 0}]})
+    out = reranker.rerank(Q, _three(), top_n=3)
+    assert out["reranked"] is True and out["hits"][0]["rerank_score"] is None
+
+
+def test_partial_response_reranks_only_what_it_covers(monkeypatch):
+    _serve(monkeypatch, {"rerank": [{"index": 2, "relevance_score": 9.0}]})
+    out = reranker.rerank(Q, _three(), top_n=3)
+    assert out["reranked"] is True and [h["id"] for h in out["hits"]] == ["c"]
+    new, ok = memory._rerank_fused(Q, _items(3))
+    assert ok in (True, False)      # exercises the caller path, must not raise
+
+
+def test_fused_layer_survives_hits_without_ids(monkeypatch):
+    # a malformed hit must not KeyError the caller's id bookkeeping
+    monkeypatch.setattr(reranker, "rerank", lambda q, h, top_n=5, model=None:
+                        {"hits": [{k: v for k, v in x.items() if k != "id"} for x in h[:1]], "reranked": True})
+    new, ok = memory._rerank_fused(Q, _items(4))
+    assert ok is True
+    assert {x.get("id") for x in new} >= {"p0", "p1", "p2", "p3"}    # nothing lost, no KeyError

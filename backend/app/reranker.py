@@ -13,6 +13,20 @@ from .store import ES_URL
 RERANK_TIMEOUT = int(os.environ.get("AMES_RERANK_TIMEOUT", "30"))
 
 
+def _as_int(value):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _as_float(value):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def rerank(query: str, hits: list, top_n: int = 5,
            model: str = None) -> dict:
     """hits: [{'id','text',...}]. Returns {'hits': [...], 'reranked': bool}."""
@@ -33,13 +47,25 @@ def rerank(query: str, hits: list, top_n: int = 5,
     except (urllib.error.HTTPError, urllib.error.URLError, RuntimeError, OSError, ValueError):
         # license/mapping/model unavailable → honest fallback, no fake rerank
         return {"hits": hits[:top_n], "reranked": False}
-    ranked = []
-    for item in out.get("rerank", [])[:top_n]:
-        i = item.get("index")
-        if i is not None and 0 <= i < min(len(hits), 50):
-            h = dict(hits[i])
-            h["rerank_score"] = item.get("relevance_score")
-            ranked.append(h)
+    if not isinstance(out, dict):
+        return {"hits": hits[:top_n], "reranked": False}
+    raw = out.get("rerank")
+    if not isinstance(raw, list):
+        return {"hits": hits[:top_n], "reranked": False}
+    cap = min(len(hits), 50)
+    ranked, seen = [], set()
+    for item in raw[:top_n]:
+        # a partial or malformed response is DROPPED item by item (never raises, never invents a
+        # score): the caller keeps the fused order for everything the endpoint did not cover.
+        if not isinstance(item, dict):
+            continue
+        i = _as_int(item.get("index"))
+        if i is None or not (0 <= i < cap) or i in seen:
+            continue
+        with_score = dict(hits[i])
+        with_score["rerank_score"] = _as_float(item.get("relevance_score"))
+        ranked.append(with_score)
+        seen.add(i)
     if not ranked:
         return {"hits": hits[:top_n], "reranked": False}
     return {"hits": ranked, "reranked": True}
