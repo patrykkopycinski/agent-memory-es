@@ -357,3 +357,34 @@ def test_retain_without_tags_or_labels_stores_the_same_fields_as_before():
                         "passages_total", "entities", "occurred_at", "active"}   # == main@615dde0, probed
     assert set(r) == {"_id", "ids", "doc_group", "passages", "deduped", "dedup_reason", "owner_id",
                       "visibility", "occurred_at", "text_hash"}
+
+
+# ── the BM25-only fallback (embedder unavailable) honours the filter too ─────
+
+def _no_embedder(monkeypatch):
+    def down(texts):
+        raise RuntimeError("embedder down")
+    monkeypatch.setattr("app.embeddings.embed", down)
+
+
+def test_bm25_only_fallback_still_applies_the_filter(monkeypatch):
+    _corpus()
+    _no_embedder(monkeypatch)
+    bodies = _capture(monkeypatch)
+    r = memory.recall(OWNER, "pears", size=10, filter={"all": ["name:pear"], "none": ["state:historical"]})
+    assert _ids(r) == ["pear-1"]
+    plain = [b for b in bodies if "query" in b and "retriever" not in b]
+    assert plain, "the fallback (no rrf retriever) body was not exercised"
+    for b in plain:
+        assert {"term": {"tags": "name:pear"}} in b["query"]["bool"]["filter"]
+        assert b["query"]["bool"]["must_not"] == [{"terms": {"tags": ["state:historical"]}}]
+
+
+def test_bm25_only_fallback_without_a_filter_is_unchanged(monkeypatch):
+    _corpus()
+    _no_embedder(monkeypatch)
+    bodies = _capture(monkeypatch)
+    memory.recall(OWNER, "pears", size=10)
+    plain = [b for b in bodies if "query" in b and "retriever" not in b]
+    assert plain and all("must_not" not in b["query"]["bool"] for b in plain)
+    assert all(len(b["query"]["bool"]["filter"]) == 2 for b in plain)
