@@ -57,16 +57,26 @@ def build_server(client: AmesClient, allow_write: bool = False,
         as_of: ISO-8601 instant the question is asked; resolves 'recent'/'last week'.
         """
         k = max(1, min(int(k), MAX_K))
-        # backend has no visibility param: over-fetch, filter client-side, then cut to k
-        fetch = k if visibility is None else min(MAX_K, max(k * 4, 20))
+        # backend has no visibility param: filter client-side. With a filter, always
+        # fetch the backend maximum (not a multiple of k) so a sparse visibility is not
+        # starved by the k-sized window; then cut to k.
+        fetch = k if visibility is None else MAX_K
         resp = client.recall(query, fetch, list(kinds) if kinds else None, as_of)
-        items = resp.get("results") or resp.get("fused") or []
+        items = resp.get("results") if isinstance(resp, dict) else None
+        if not isinstance(items, list):
+            raise AmesError("AMES recall response has no 'results' list "
+                            "(backend/API version mismatch?)")
+        scanned = len(items)
         if visibility is not None:
             items = [i for i in items if i.get("visibility") == visibility]
         items = items[:k]
         out = {"query": query, "count": len(items),
                "results": [_slim(i) for i in items],
                "abstained": bool(resp.get("abstained"))}
+        if visibility is not None and len(items) < k and scanned >= MAX_K:
+            out["note"] = (f"visibility filter applied to the top {scanned} backend hits "
+                           f"only; more '{visibility}' memories may exist below that. "
+                           "Narrow the query or drop the filter.")
         if resp.get("mental_model"):
             out["mental_model"] = resp["mental_model"]
         return out
