@@ -1,0 +1,159 @@
+{
+ "comment": "Mutation table for AMES tag filtering (filtering round). Each filter clause, each recall arm that must honour the filter, the fuzzy rule, abstention, fail-closed extraction and validation is reverted once; the suite must go red for every one. Applied by tests/tools/mutation_proof.py (machine verdict, byte-identical restore).",
+ "mutants": [
+  {
+   "name": "F1 `all` clause dropped",
+   "file": "backend/app/tagfilter.py",
+   "find": "    for t in parsed[\"all\"]:\n        flt.append({\"term\": {TAG_FIELD: t}})",
+   "replace": "    for t in []:\n        flt.append({\"term\": {TAG_FIELD: t}})",
+   "expect": "kill"
+  },
+  {
+   "name": "F2 `any` clause dropped",
+   "file": "backend/app/tagfilter.py",
+   "find": "    for grp in parsed[\"any\"]:\n        flt.append({\"terms\": {TAG_FIELD: list(grp)}})",
+   "replace": "    for grp in []:\n        flt.append({\"terms\": {TAG_FIELD: list(grp)}})",
+   "expect": "kill"
+  },
+  {
+   "name": "F3 `none` clause dropped",
+   "file": "backend/app/tagfilter.py",
+   "find": "    if parsed[\"none\"]:\n        must_not.append",
+   "replace": "    if False:\n        must_not.append",
+   "expect": "kill"
+  },
+  {
+   "name": "F4 `narrow_any` clause dropped",
+   "file": "backend/app/tagfilter.py",
+   "find": "    if parsed[\"narrow_any\"] is not None:\n        flt.append({\"terms\": {TAG_FIELD: list(narrow_tags or [])}})",
+   "replace": "    if False:\n        flt.append({\"terms\": {TAG_FIELD: list(narrow_tags or [])}})",
+   "expect": "kill"
+  },
+  {
+   "name": "F5 abstention removed (unresolved narrow falls through to an unfiltered search)",
+   "file": "backend/app/memory.py",
+   "find": "            if not narrow_tags:\n                return _abstained(query, parsed, resolved, vocab_truncated)",
+   "replace": "            if not narrow_tags:\n                parsed = None; flt_extra, flt_not = [], []",
+   "expect": "kill"
+  },
+  {
+   "name": "F6 BM25 arm of the rrf search unfiltered",
+   "file": "backend/app/memory.py",
+   "find": "                            \"filter\": [{\"term\": {\"active\": True}}, _visibility_filter(owner_id)] + flt_extra,\n                            **({\"must_not\": flt_not} if flt_not else {}),\n                        }}}},",
+   "replace": "                            \"filter\": [{\"term\": {\"active\": True}}, _visibility_filter(owner_id)],\n                        }}}},",
+   "expect": "kill"
+  },
+  {
+   "name": "F7 kNN pre-filter unfiltered",
+   "file": "backend/app/memory.py",
+   "find": "                                           [{\"term\": {\"active\": True}}, _visibility_filter(owner_id)] + flt_extra}},",
+   "replace": "                                           [{\"term\": {\"active\": True}}, _visibility_filter(owner_id)]}},",
+   "expect": "kill"
+  },
+  {
+   "name": "F8 BM25-only fallback search unfiltered",
+   "file": "backend/app/memory.py",
+   "find": "                    \"filter\": [{\"term\": {\"active\": True}}, _visibility_filter(owner_id)] + flt_extra,\n                    **({\"must_not\": flt_not} if flt_not else {}),\n                }},\n                \"sort\"",
+   "replace": "                    \"filter\": [{\"term\": {\"active\": True}}, _visibility_filter(owner_id)],\n                }},\n                \"sort\"",
+   "expect": "kill"
+  },
+  {
+   "name": "F9 temporal-window arm unfiltered",
+   "file": "backend/app/memory.py",
+   "find": "                                   {\"range\": {\"occurred_at\": {\"gte\": bs, \"lte\": be}}}] + flt_extra,\n                        **({\"must_not\": flt_not} if flt_not else {}),",
+   "replace": "                                   {\"range\": {\"occurred_at\": {\"gte\": bs, \"lte\": be}}}],",
+   "expect": "kill"
+  },
+  {
+   "name": "F10 graph arm still runs under a filter",
+   "file": "backend/app/memory.py",
+   "find": "        for rank, h in enumerate([] if parsed is not None else\n                                 _graph.graph_expand(",
+   "replace": "        for rank, h in enumerate(\n                                 _graph.graph_expand(",
+   "expect": "kill"
+  },
+  {
+   "name": "F11 mental-model tier still surfaces under a filter",
+   "file": "backend/app/memory.py",
+   "find": "        m = None if parsed is not None else _mm.match_model(owner_id, query)",
+   "replace": "        m = _mm.match_model(owner_id, query)",
+   "expect": "kill"
+  },
+  {
+   "name": "F12 fuzzy threshold 0.3 -> 0.0 (everything of the key matches)",
+   "file": "backend/app/tagfilter.py",
+   "find": "FUZZY_MIN_SIM = float(os.environ.get(\"AMES_FUZZY_MIN_SIM\", \"0.3\"))",
+   "replace": "FUZZY_MIN_SIM = float(os.environ.get(\"AMES_FUZZY_MIN_SIM\", \"0.0\"))",
+   "expect": "kill"
+  },
+  {
+   "name": "F13 fuzzy resolution ignores the tag key",
+   "file": "backend/app/tagfilter.py",
+   "find": "        if skey == key and similarity(value, svalue) >= thr:",
+   "replace": "        if similarity(value, svalue) >= thr:",
+   "expect": "kill"
+  },
+  {
+   "name": "F14 fuzzy threshold comparison made exclusive",
+   "file": "backend/app/tagfilter.py",
+   "find": "similarity(value, svalue) >= thr:",
+   "replace": "similarity(value, svalue) > thr:",
+   "expect": "kill"
+  },
+  {
+   "name": "F15 failed extraction swallowed (write goes through untagged)",
+   "file": "backend/app/tagfilter.py",
+   "find": "    raise ExtractionError(\"label extraction failed after %d attempts: %s\"\n                          % (EXTRACT_RETRIES + 1, last))",
+   "replace": "    return [], {\"missing\": [], \"capped\": False, \"truncated\": truncated}",
+   "expect": "kill"
+  },
+  {
+   "name": "F16 tags not stored on the document",
+   "file": "backend/app/memory.py",
+   "find": "        if write_tags:\n            doc[_tf.TAG_FIELD] = list(write_tags)",
+   "replace": "        if False:\n            doc[_tf.TAG_FIELD] = list(write_tags)",
+   "expect": "kill"
+  },
+  {
+   "name": "F17 value normalisation lost (case/separators no longer equivalent)",
+   "file": "backend/app/tagfilter.py",
+   "find": "    return \" \".join(_WORDS.findall(str(value).lower()))",
+   "replace": "    return str(value)",
+   "expect": "kill"
+  },
+  {
+   "name": "F18 extraction trusts out-of-vocabulary values",
+   "file": "backend/app/tagfilter.py",
+   "find": "                if nv not in allowed:\n                    continue",
+   "replace": "                if False:\n                    continue",
+   "expect": "kill"
+  },
+  {
+   "name": "F19 fuzzy vocabulary not owner-scoped",
+   "file": "backend/app/memory.py",
+   "find": "                \"query\": {\"bool\": {\"filter\": [{\"term\": {\"active\": True}}, _visibility_filter(owner_id)]}},\n                \"aggs\"",
+   "replace": "                \"query\": {\"match_all\": {}},\n                \"aggs\"",
+   "expect": "kill"
+  },
+  {
+   "name": "F20 duplicate write calls the LLM before the dedup check (A3)",
+   "file": "backend/app/memory.py",
+   "find": "    extraction = None\n    if label_groups:",
+   "replace": "    extraction = None\n    if label_groups and False:",
+   "expect": "kill"
+  },
+  {
+   "name": "F21 malformed filter accepted instead of rejected",
+   "file": "backend/app/tagfilter.py",
+   "find": "    unknown = sorted(set(spec) - set(FILTER_KEYS))\n    if unknown:",
+   "replace": "    unknown = []\n    if unknown:",
+   "expect": "kill"
+  },
+  {
+   "name": "F22 empty-but-present narrow_any treated as no filter",
+   "file": "backend/app/tagfilter.py",
+   "find": "    if not (all_t or none_t or any_g or narrow is not None):\n        return None",
+   "replace": "    if not (all_t or none_t or any_g or narrow):\n        return None",
+   "expect": "kill"
+  }
+ ]
+}

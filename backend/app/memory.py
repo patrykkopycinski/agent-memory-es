@@ -10,6 +10,7 @@ from typing import Any, Optional
 
 from .store import KINDS, es, idx, ensure_indices
 from . import embeddings
+from . import tagfilter as _tf
 from . import tombstone
 
 VISIBILITIES = ("private", "team", "common")
@@ -288,7 +289,8 @@ def _nearest_dup(owner_id: str, kind: str, visibility: str, vec):
 
 
 def retain(owner_id: str, kind: str, text: str, visibility: str = "private",
-           occurred_at: Optional[str] = None, doc_group: Optional[str] = None) -> dict:
+           occurred_at: Optional[str] = None, doc_group: Optional[str] = None,
+           tags: Optional[list] = None, labels: Optional[list] = None) -> dict:
     """Write a memory. Long text is split into verbatim passages (cause 2) that share
     a `doc_group` (the caller's stable id for the source document, e.g. a session id);
     recall returns each passage with its group + occurred_at, so callers can treat a
@@ -298,6 +300,9 @@ def retain(owner_id: str, kind: str, text: str, visibility: str = "private",
         raise ValueError(f"kind must be one of {KINDS}")
     if visibility not in VISIBILITIES:
         raise ValueError(f"visibility must be one of {VISIBILITIES}")
+    # Tag filtering (decision record): both inputs are optional; absent => nothing below runs.
+    write_tags = _tf.norm_tags(tags)              # FilterError (a ValueError) -> HTTP 422
+    label_groups = _tf.validate_labels(labels)
     if kind == "semantic":
         rej = tombstone.is_rejected(owner_id, text)
         if rej:
@@ -309,6 +314,17 @@ def retain(owner_id: str, kind: str, text: str, visibility: str = "private",
         return {"_id": dup_id, "doc_group": existing.get("doc_group") or dup_id,
                 "deduped": True, "dedup_reason": "exact_text_hash",
                 **existing, "deduped_against_owner": existing.get("owner_id")}
+    extraction = None
+    if label_groups:
+        # A3: after the exact-duplicate check, so a duplicate costs no LLM call. Fail closed:
+        # ExtractionError propagates (HTTP 502) BEFORE anything is written.
+        extracted, extraction = _tf.extract_tags(text, label_groups)
+        for t in extracted:
+            if t not in write_tags:
+                write_tags.append(t)
+        if len(write_tags) > _tf.MAX_TAGS_PER_WRITE:
+            write_tags = write_tags[:_tf.MAX_TAGS_PER_WRITE]
+            extraction["capped"] = True
     passages = chunk_text(text)
     group = doc_group or ("dg_%s" % uuid.uuid4().hex)
     occurred = occurred_at or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
@@ -333,6 +349,8 @@ def retain(owner_id: str, kind: str, text: str, visibility: str = "private",
             "occurred_at": occurred,
             "active": True,
         }
+        if write_tags:
+            doc[_tf.TAG_FIELD] = list(write_tags)
         if vec is not None:
             # Each passage gets its OWN embedding (that is the point of chunking);
             # reuse the already-computed head vector for passage 0.
@@ -350,6 +368,10 @@ def retain(owner_id: str, kind: str, text: str, visibility: str = "private",
     out = {"_id": ids[0], "ids": ids, "doc_group": group, "passages": len(passages),
            "deduped": False, "dedup_reason": "distinct", "owner_id": owner_id,
            "visibility": visibility, "occurred_at": occurred, "text_hash": h}
+    if write_tags:
+        out["tags"] = list(write_tags)
+    if extraction is not None:
+        out["extraction"] = extraction
     if near and near[1] >= DEDUP_SIM_THRESHOLD:
         # Near-duplicate group (0.92 <= cosine < 0.99): WRITE the newer passages and
         # link both ends. Both stay active: this is coexistence (a later session about
@@ -375,11 +397,40 @@ def _visibility_filter(owner_id: str) -> dict:
     ]}}
 
 
+def _abstained(query: str, parsed: dict, resolved: dict, vocab_truncated: bool) -> dict:
+    """A filter whose narrow_any resolved to nothing: answer without touching ES at all, so there
+    is no code path that could fall back to an unfiltered search."""
+    out = {"query": query, "results": [], "by_kind": {}, "fused": [], "abstained": True,
+           "doc_groups": 0, "reranked": False,
+           "filter": {"applied": True, "resolved": resolved}}
+    if vocab_truncated:
+        out["filter"]["vocab_truncated"] = True
+    return out
+
+
+def _tag_vocabulary(owner_id: str, kinds: list, keys: list) -> tuple:
+    """Distinct stored tags for `keys`, in this owner's visible scope. -> (tags, truncated)."""
+    out, truncated = set(), False
+    for kind in kinds:
+        body = {"size": 0,
+                "query": {"bool": {"filter": [{"term": {"active": True}}, _visibility_filter(owner_id)]}},
+                "aggs": {"t": {"terms": {"field": _tf.TAG_FIELD, "size": _tf.FUZZY_VOCAB_CAP,
+                                         **({"include": "(" + "|".join(re.escape(k) for k in keys) + "):.*"}
+                                            if keys else {})}}}}
+        r = es("POST", f"/{idx(kind)}/_search", body)
+        agg = r.get("aggregations", {}).get("t", {})
+        out.update(b["key"] for b in agg.get("buckets", []))
+        if agg.get("sum_other_doc_count", 0) > 0:
+            truncated = True
+    return out, truncated
+
+
 def recall(owner_id: str, query: str, kinds=None, size: int = 8,
            min_score: Optional[float] = None,
            as_of: Optional[str] = None,
            per_doc: Optional[int] = None,
-           rerank: Optional[bool] = None) -> dict:
+           rerank: Optional[bool] = None,
+           filter: Optional[dict] = None) -> dict:
     """Hybrid recall: BM25 + kNN fused per-kind, visibility isolation, RRF across kinds.
 
     Returns a single flat `results` list (RRF + recency fused, score-ordered) with
@@ -396,7 +447,25 @@ def recall(owner_id: str, query: str, kinds=None, size: int = 8,
     window (default PER_DOC_BUDGET=3). Passages are ranked first, then collapsed to at
     most `per_doc` per group BEFORE the size cut, so the window covers more distinct
     sessions. `doc_groups` in the response reports how many distinct groups it holds.
+
+    Tag filtering: `filter` ({all, any, none, narrow_any}, see tagfilter.py) restricts the
+    candidate set INSIDE Elasticsearch (BM25 filter + kNN pre-filter + temporal arm). A filter
+    that matches nothing returns `results: []` with `abstained: true` and never an unfiltered
+    top-k. With no filter this function is unchanged.
     """
+    parsed = _tf.parse_filter(filter)             # FilterError (a ValueError) -> HTTP 422
+    flt_extra, flt_not, narrow_tags, resolved, vocab_truncated = [], [], None, {}, False
+    if parsed is not None:
+        if parsed["narrow_any"] is not None:
+            def _vocab(keys):
+                nonlocal vocab_truncated
+                vocab, trunc = _tag_vocabulary(owner_id, kinds or list(KINDS), keys)
+                vocab_truncated = vocab_truncated or trunc
+                return vocab
+            narrow_tags, resolved = _tf.resolve_narrow(parsed["narrow_any"], _vocab)
+            if not narrow_tags:
+                return _abstained(query, parsed, resolved, vocab_truncated)
+        flt_extra, flt_not = _tf.es_clauses(parsed, narrow_tags)
     now = None
     if as_of:
         now = _parse_as_of(as_of)
@@ -420,10 +489,13 @@ def recall(owner_id: str, query: str, kinds=None, size: int = 8,
                     "retrievers": [
                         {"standard": {"query": {"bool": {
                             "must": must,
-                            "filter": [{"term": {"active": True}}, _visibility_filter(owner_id)],
+                            "filter": [{"term": {"active": True}}, _visibility_filter(owner_id)] + flt_extra,
+                            **({"must_not": flt_not} if flt_not else {}),
                         }}}},
                         {"knn": {"field": "embedding", "query_vector": qvec, "num_candidates": max(100, fetch * 2), "k": fetch,
-                                 "filter": [{"term": {"active": True}}, _visibility_filter(owner_id)]}},
+                                 "filter": {"bool": {"filter": [{"term": {"active": True}}, _visibility_filter(owner_id)] + flt_extra,
+                                                     "must_not": flt_not}} if flt_not else
+                                           [{"term": {"active": True}}, _visibility_filter(owner_id)] + flt_extra}},
                     ],
                     "rank_constant": 60,
                     "rank_window_size": 50,
@@ -434,7 +506,8 @@ def recall(owner_id: str, query: str, kinds=None, size: int = 8,
                 "size": fetch,
                 "query": {"bool": {
                     "must": must,
-                    "filter": [{"term": {"active": True}}, _visibility_filter(owner_id)],
+                    "filter": [{"term": {"active": True}}, _visibility_filter(owner_id)] + flt_extra,
+                    **({"must_not": flt_not} if flt_not else {}),
                 }},
                 "sort": [{"_score": {"order": "desc"}}, {"occurred_at": {"order": "desc"}}],
             }
@@ -455,7 +528,8 @@ def recall(owner_id: str, query: str, kinds=None, size: int = 8,
     # graph arm: entity two-hop expansion, fused by rank (never dominates other arms)
     try:
         from . import graph as _graph
-        for rank, h in enumerate(_graph.graph_expand(owner_id, query, size,
+        for rank, h in enumerate([] if parsed is not None else
+                                 _graph.graph_expand(owner_id, query, size,
                                                      _visibility_filter(owner_id))):
             fused.setdefault(h["id"], {**h, "rrf": 0.0, "arm": "graph"})
             fused[h["id"]]["rrf"] += GRAPH_RRF_WEIGHT / (RANK_CONSTANT + rank + 1)
@@ -479,7 +553,8 @@ def recall(owner_id: str, query: str, kinds=None, size: int = 8,
                         "must": [{"match_all": {}}],
                         "filter": [{"term": {"active": True}},
                                    _visibility_filter(owner_id),
-                                   {"range": {"occurred_at": {"gte": bs, "lte": be}}}],
+                                   {"range": {"occurred_at": {"gte": bs, "lte": be}}}] + flt_extra,
+                        **({"must_not": flt_not} if flt_not else {}),
                     }}, "sort": [{"occurred_at": {"order": "asc"}}]})
                 t_hits += [{"id": h["_id"], "kind": "episodic", "score": h["_score"],
                             "arm": "temporal",
@@ -516,10 +591,17 @@ def recall(owner_id: str, query: str, kinds=None, size: int = 8,
         "doc_groups": len({it.get("doc_group") or it.get("id") for it in window}),
         "reranked": reranked,
     }
-    # mental-model priority tier surfaces above facts (like reflect's source order)
+    if parsed is not None:
+        out["filter"] = {"applied": True, "resolved": resolved}
+        if vocab_truncated:
+            out["filter"]["vocab_truncated"] = True
+        if not window:
+            out["abstained"] = True
+    # mental-model priority tier surfaces above facts (like reflect's source order);
+    # omitted under a filter: it is a separate index of synthesized pages, not tagged memories
     try:
         from . import mental_models as _mm
-        m = _mm.match_model(owner_id, query)
+        m = None if parsed is not None else _mm.match_model(owner_id, query)
         if m:
             out["mental_model"] = m
     except Exception:
