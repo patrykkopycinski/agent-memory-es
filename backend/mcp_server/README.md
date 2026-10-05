@@ -35,7 +35,10 @@ Claude Code:  `claude mcp add ames -e AMES_API_KEY=... -e AMES_URL=http://localh
 Hermes (`config.yaml`): `mcp_servers: {ames: {command: python3, args: ["-m","mcp_server"], cwd: .../backend, env: {AMES_API_KEY: ..., ALLOW_WRITE: "0"}}}`
 
 Docker: `docker build -f backend/mcp_server/Dockerfile -t ames-mcp backend/` then
-`docker run -i --rm --network host -e AMES_API_KEY ames-mcp` (stdio).
+`docker run -i --rm --network host -e AMES_API_KEY -e AMES_URL=http://localhost:8123 ames-mcp` (stdio).
+The image defaults `AMES_URL` to `http://host.docker.internal:8123` (Docker Desktop bridge); under
+`--network host` on Linux `host.docker.internal` does not resolve, so set `AMES_URL=http://localhost:8123`
+explicitly as above (on the host network the backend is reachable at `localhost`).
 
 ## Tests
     cd backend && python -m pytest mcp_server/tests            # unit (mocked backend)

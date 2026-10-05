@@ -86,6 +86,13 @@ def test_make_server_from_env_gating():
     assert "memory_retain" in _tools(make_server_from_env({**base, "ALLOW_WRITE": "1"}))
 
 
+def test_make_server_from_env_forwards_fastmcp_kwargs():
+    mcp = make_server_from_env({"AMES_API_KEY": KEY, "AMES_URL": "http://ames.test"},
+                               host="0.0.0.0", port=9999)
+    assert mcp.settings.host == "0.0.0.0"
+    assert mcp.settings.port == 9999
+
+
 def test_missing_key_refuses_to_start():
     with pytest.raises(AmesError, match="AMES_API_KEY"):
         make_server_from_env({"AMES_URL": "http://ames.test"})
@@ -182,3 +189,15 @@ def test_unreachable_backend_error_is_clean():
     with pytest.raises(AmesError) as ei:
         c.stats()
     assert KEY not in str(ei.value) and "unreachable" in str(ei.value)
+
+
+def test_non_json_2xx_becomes_ameserror():
+    def html(req):
+        return httpx.Response(200, content=b"<html>proxy</html>",
+                              headers={"content-type": "text/html"})
+    c = AmesClient("http://ames.test", KEY, transport=httpx.MockTransport(html))
+    with pytest.raises(AmesError) as ei:
+        c.stats()
+    msg = str(ei.value)
+    assert "non-JSON" in msg and "200" in msg and "text/html" in msg
+    assert KEY not in msg

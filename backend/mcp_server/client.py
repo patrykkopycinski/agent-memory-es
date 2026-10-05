@@ -37,7 +37,13 @@ class AmesClient:
             except Exception:
                 pass
             raise AmesError(f"AMES backend error {r.status_code}: {detail}".rstrip(": "))
-        return r.json()
+        try:
+            return r.json()
+        except ValueError:  # 2xx but not JSON (proxy/HTML/empty body)
+            ctype = r.headers.get("content-type", "unknown")
+            raise AmesError(
+                f"AMES backend returned a non-JSON {r.status_code} response "
+                f"(content-type: {ctype})") from None
 
     def recall(self, query: str, size: int, kinds: Optional[list] = None,
                as_of: Optional[str] = None) -> dict:
