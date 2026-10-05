@@ -8,6 +8,10 @@ import urllib.request
 
 from .store import ES_URL
 
+# Cross-encoder call timeout (seconds). Configurable: a cold, CPU-only ES node needs several
+# seconds per 50-passage batch, so this is where a deployment trades latency for recall quality.
+RERANK_TIMEOUT = int(os.environ.get("AMES_RERANK_TIMEOUT", "30"))
+
 
 def rerank(query: str, hits: list, top_n: int = 5,
            model: str = None) -> dict:
@@ -24,9 +28,9 @@ def rerank(query: str, hits: list, top_n: int = 5,
         ES_URL + f"/_inference/rerank/{model}", data=body, method="POST",
         headers={"Content-Type": "application/json"})
     try:
-        with urllib.request.urlopen(req, timeout=30) as r:
+        with urllib.request.urlopen(req, timeout=RERANK_TIMEOUT) as r:
             out = json.load(r)
-    except (urllib.error.HTTPError, urllib.error.URLError, RuntimeError):
+    except (urllib.error.HTTPError, urllib.error.URLError, RuntimeError, OSError, ValueError):
         # license/mapping/model unavailable → honest fallback, no fake rerank
         return {"hits": hits[:top_n], "reranked": False}
     ranked = []
