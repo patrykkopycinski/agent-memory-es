@@ -1,5 +1,6 @@
 """Core memory operations: retain, recall, reflect-lite, promote, consolidate."""
 import datetime as _dt
+import hashlib
 import math
 import re
 import time
@@ -17,7 +18,13 @@ RANK_CONSTANT = 60              # RRF rank constant; must match ES rrf rank_cons
 RECENCY_WEIGHT = 0.15           # recency arm weight, as a fraction of one RRF arm's top hit
 RECENCY_HALF_LIFE_DAYS = 30.0   # gauss decay half-life applied to occurred_at
 PER_DOC_BUDGET = 3              # max fused results from one source doc group
-DEDUP_SIM_THRESHOLD = 0.92      # cosine >= this in the same visibility scope => duplicate
+DEDUP_SIM_THRESHOLD = 0.92      # cosine >= this in the same visibility scope => near-dup
+# NOTE (cause 1): dedup is exact-normalized-text-hash ONLY. The spec allowed the
+# alternative "cosine >= 0.99 over the full text", but e5-small embeds only the head,
+# so two sessions sharing an opening line score ~1.0 and the newer one would be
+# dropped again — the exact failure being fixed. The threshold is kept as the
+# near-duplicate LINK threshold below and referenced by tests.
+DEDUP_DROP_SIM = 0.99
 
 import re as _re
 _PRIVATE_MARKERS = _re.compile(
@@ -123,28 +130,61 @@ def _apply_budgets(ordered: list, size: int, per_kind_budget: Optional[int] = No
     return picked[:size]
 
 
-def _dedup_lookup(owner_id: str, kind: str, visibility: str, vec) -> Optional[str]:
-    """Existing doc id whose embedding is a near-duplicate (cosine >= DEDUP_SIM_THRESHOLD)
-    of vec, in the same kind + same visibility scope. None when no vector or no match.
+def _norm_text(text: str) -> str:
+    """Whitespace-collapsed lowercase form used for exact-text identity."""
+    return re.sub(r"\s+", " ", (text or "").strip().lower())
 
-    Private scope is owner-scoped (a private dupe must not match another owner's doc);
-    team/common scope is shared, so cross-owner duplicates collapse onto one doc."""
-    if vec is None:
-        return None
+
+def text_hash(text: str) -> str:
+    """sha256 of the normalized text: the ONLY cheap, truncation-proof identity for
+    'the same memory'. Embedding similarity is not an identity test (e5-small only
+    sees the first ~512 tokens, so same-topic sessions score 0.93-0.97)."""
+    return hashlib.sha256(_norm_text(text).encode("utf-8")).hexdigest()
+
+
+def _scope_filter(owner_id: str, kind: str, visibility: str) -> dict:
     filt = [{"term": {"active": True}}, {"term": {"visibility": visibility}}]
     if visibility == "private":
         filt.append({"term": {"owner_id": owner_id}})
+    return {"bool": {"filter": filt}}
+
+
+def _dedup_lookup(owner_id: str, kind: str, visibility: str, vec, text_hash_v=None):
+    """Exact-text duplicate id, in the same kind + same visibility scope.
+
+    Exact normalized-text hash only. Private scope is owner-scoped (a private dupe
+    must not match another owner's doc); team/common scope is shared, so identical
+    text collapses onto one doc. Cosine similarity is deliberately NOT an identity
+    test here: near-duplicates are written and linked instead (see _nearest_dup)."""
+    if not text_hash_v:
+        return None
+    r = es("POST", f"/{idx(kind)}/_search", {
+        "size": 1,
+        "query": {"bool": {
+            "filter": _scope_filter(owner_id, kind, visibility)["bool"]["filter"] +
+                      [{"term": {"text_hash": text_hash_v}}],
+        }},
+    })
+    hits = r["hits"]["hits"]
+    return hits[0]["_id"] if hits else None
+
+
+def _nearest_dup(owner_id: str, kind: str, visibility: str, vec):
+    """(id, cosine) of the nearest active doc in scope, or None. Used to LINK a
+    near-duplicate write (supersedes/superseded_by), never to drop it."""
+    if vec is None:
+        return None
     r = es("POST", f"/{idx(kind)}/_search", {
         "size": 1,
         "knn": {"field": "embedding", "query_vector": vec, "k": 1,
-                "num_candidates": 50, "filter": filt},
+                "num_candidates": 50,
+                "filter": _scope_filter(owner_id, kind, visibility)["bool"]["filter"]},
     })
     hits = r["hits"]["hits"]
     if not hits:
         return None
     # ES normalises cosine knn scores to (1 + cosine) / 2; invert to real cosine.
-    cosine = 2.0 * hits[0]["_score"] - 1.0
-    return hits[0]["_id"] if cosine >= DEDUP_SIM_THRESHOLD else None
+    return hits[0]["_id"], 2.0 * hits[0]["_score"] - 1.0
 
 
 def retain(owner_id: str, kind: str, text: str, visibility: str = "private",
@@ -157,21 +197,24 @@ def retain(owner_id: str, kind: str, text: str, visibility: str = "private",
         rej = tombstone.is_rejected(owner_id, text)
         if rej:
             raise ValueError(f"rejected value: {rej['reason']}")
+    h = text_hash(text)
+    dup_id = _dedup_lookup(owner_id, kind, visibility, None, h)
+    if dup_id:
+        existing = es("GET", f"/{idx(kind)}/_doc/{dup_id}")["_source"]
+        return {"_id": dup_id, "deduped": True, "dedup_reason": "exact_text_hash",
+                **existing, "deduped_against_owner": existing.get("owner_id")}
     vec = None
     try:
         vec = embeddings.embed([text])[0]
     except Exception:
         pass  # embeddings optional: BM25-only degrade
-    dup_id = _dedup_lookup(owner_id, kind, visibility, vec)
-    if dup_id:
-        existing = es("GET", f"/{idx(kind)}/_doc/{dup_id}")["_source"]
-        return {"_id": dup_id, "deduped": True, **existing,
-                "deduped_against_owner": existing.get("owner_id")}
+    near = _nearest_dup(owner_id, kind, visibility, vec)
     doc = {
         "kind": kind,
         "owner_id": owner_id,
         "visibility": visibility,
         "text": text,
+        "text_hash": h,
         "entities": extract_entities(text),
         "occurred_at": occurred_at or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "active": True,
@@ -179,8 +222,24 @@ def retain(owner_id: str, kind: str, text: str, visibility: str = "private",
     if vec is not None:
         doc["embedding"] = vec
     r = es("POST", f"/{idx(kind)}/_doc?refresh=true", doc)
-    doc["_id"] = r["_id"]
+    new_id = r["_id"]
+    doc["_id"] = new_id
     doc["deduped"] = False
+    doc["dedup_reason"] = "distinct"
+    if near and near[1] >= DEDUP_SIM_THRESHOLD:
+        # Near-duplicate (0.92 <= cosine < 0.99): WRITE the newer doc and link both
+        # ends. Both stay active: this is coexistence (a later session about the same
+        # topic), not a replacement. `_supersede` remains the explicit, owner-checked
+        # merge path that deactivates the old doc; here deactivating would re-lose the
+        # newer session, which is the entire bug being fixed.
+        old_id = near[0]
+        es("POST", f"/{idx(kind)}/_update/{new_id}?refresh=true",
+           {"doc": {"supersedes": [old_id]}})
+        es("POST", f"/{idx(kind)}/_update/{old_id}?refresh=true",
+           {"doc": {"superseded_by": new_id}})
+        doc["dedup_reason"] = "near_duplicate_linked"
+        doc["supersedes"] = [old_id]
+        doc["cosine"] = near[1]
     return doc
 
 

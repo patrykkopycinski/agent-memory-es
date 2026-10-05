@@ -32,6 +32,7 @@ MAPPINGS = {
             "occurred_at": {"type": "date"},
             "superseded_by": {"type": "keyword"},
             "supersedes": {"type": "keyword"},
+            "text_hash": {"type": "keyword"},
             "active": {"type": "boolean"},
             "promoted_from": {"type": "keyword"},
         },
@@ -58,6 +59,15 @@ def ensure_indices() -> None:
             es("GET", f"/{idx(kind)}")
         except RuntimeError:
             es("PUT", f"/{idx(kind)}", MAPPINGS)
+            continue
+        # Additive mapping migration: indices created before a field existed must
+        # still accept it (dynamic:strict would otherwise reject the write). PUT
+        # _mapping is idempotent for unchanged field types.
+        try:
+            es("PUT", f"/{idx(kind)}/_mapping",
+               {"properties": {"text_hash": {"type": "keyword"}}})
+        except RuntimeError:
+            pass  # older cluster / no permission: exact-hash dedup degrades to kNN
 
 
 def idx(kind: str) -> str:

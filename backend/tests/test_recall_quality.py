@@ -150,22 +150,36 @@ def test_min_score_post_filters_and_keeps_best():
 
 # ------------------------------------------------------------ dedup on write
 
-def test_dedup_on_write_exact_and_near_dupe():
+def test_dedup_on_write_exact_hash_only_near_dupes_are_linked():
+    """Cause 1: only an EXACT normalized-text match dedupes. A near-duplicate is
+    WRITTEN and linked (supersedes/superseded_by), because e5-small sees only the
+    first ~512 tokens and same-topic sessions score 0.93-0.97 — dropping those
+    silently lost the NEWER session and 38 gold sessions across the 100 questions."""
     _wipe("qdedup")
     first = memory.retain("qdedup", "semantic", "OmniRoute heap watchdog warns at 9450MB")
-    assert first["deduped"] is False
-    again = memory.retain("qdedup", "semantic", "OmniRoute heap watchdog warns at 9450MB")
+    assert first["deduped"] is False and first["dedup_reason"] == "distinct"
+    # exact text (whitespace/case-normalized) still collapses onto the same doc
+    again = memory.retain("qdedup", "semantic", "OmniRoute  heap watchdog warns at 9450MB")
     assert again["deduped"] is True and again["_id"] == first["_id"], again
+    assert again["dedup_reason"] == "exact_text_hash", again
     assert again["deduped_against_owner"] == "qdedup", again
     assert _count("qdedup") == 1
+    # near-duplicate: WRITTEN, not dropped, and linked to the earlier doc
     near = memory.retain("qdedup", "semantic",
                          "The OmniRoute heap watchdog warns at 9450MB before restart")
-    assert near["deduped"] is True and near["_id"] == first["_id"], near
-    assert _count("qdedup") == 1
+    assert near["deduped"] is False and near["_id"] != first["_id"], near
+    assert near["dedup_reason"] == "near_duplicate_linked", near
+    assert near["supersedes"] == [first["_id"]], near
+    assert _count("qdedup") == 2
+    # the OLD doc is still active (coexistence link, not a merge): both retrievable
+    old = es("GET", f"/{idx('semantic')}/_doc/{first['_id']}")["_source"]
+    assert old["active"] is True and old["superseded_by"] == near["_id"], old
+    # an unrelated fact is neither deduped nor linked
     distinct = memory.retain("qdedup", "semantic",
                              "Vue is the frontend framework used for the dashboard")
-    assert distinct["deduped"] is False and distinct["_id"] != first["_id"]
-    assert _count("qdedup") == 2
+    assert distinct["deduped"] is False and distinct["_id"] not in (first["_id"], near["_id"])
+    assert distinct["dedup_reason"] == "distinct"
+    assert _count("qdedup") == 3
 
 
 def test_dedup_respects_visibility_scope():
