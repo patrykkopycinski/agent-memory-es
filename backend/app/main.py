@@ -30,6 +30,9 @@ class RetainIn(BaseModel):
     text: str
     visibility: str = "private"
     occurred_at: Optional[str] = None
+    doc_group: Optional[str] = None   # caller's stable id for the source document
+                                      # (e.g. a session id); long text is written as
+                                      # passages sharing it (cause 2)
 
 
 class RecallIn(BaseModel):
@@ -59,7 +62,8 @@ def mint_key(owner_id: str, role: str = "member", _admin: str = Header(None, ali
 @app.post("/memory/retain")
 def retain(body: RetainIn, who: dict = Depends(caller)):
     try:
-        return memory.retain(who["owner_id"], body.kind, body.text, body.visibility, body.occurred_at)
+        return memory.retain(who["owner_id"], body.kind, body.text, body.visibility,
+                             body.occurred_at, body.doc_group)
     except ValueError as e:
         raise HTTPException(422, str(e))
 
@@ -186,7 +190,9 @@ def rerank_ep(body: RerankIn, who: dict = Depends(caller)):
 def mcp_tool(tool: str, body: dict, who: dict = Depends(caller)):
     """Minimal MCP-style tools surface (JSON in/out) for coding-farm clients."""
     handlers = {
-        "retain": lambda b: memory.retain(who["owner_id"], b["kind"], b["text"], b.get("visibility", "private"), b.get("occurred_at")),
+        "retain": lambda b: memory.retain(who["owner_id"], b["kind"], b["text"],
+                                          b.get("visibility", "private"),
+                                          b.get("occurred_at"), b.get("doc_group")),
         "recall": lambda b: memory.recall(who["owner_id"], b["query"], b.get("kinds"), b.get("size", 8)),
         "reflect": lambda b: memory.reflect(who["owner_id"], b["question"]),
         "promote": lambda b: memory.promote(who["owner_id"], b["kind"], b["doc_id"], b["to_visibility"]),

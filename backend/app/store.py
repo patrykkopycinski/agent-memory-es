@@ -33,6 +33,9 @@ MAPPINGS = {
             "superseded_by": {"type": "keyword"},
             "supersedes": {"type": "keyword"},
             "text_hash": {"type": "keyword"},
+            "doc_group": {"type": "keyword"},
+            "passage_index": {"type": "integer"},
+            "passages_total": {"type": "integer"},
             "active": {"type": "boolean"},
             "promoted_from": {"type": "keyword"},
         },
@@ -65,7 +68,10 @@ def ensure_indices() -> None:
         # _mapping is idempotent for unchanged field types.
         try:
             es("PUT", f"/{idx(kind)}/_mapping",
-               {"properties": {"text_hash": {"type": "keyword"}}})
+               {"properties": {"text_hash": {"type": "keyword"},
+                               "doc_group": {"type": "keyword"},
+                               "passage_index": {"type": "integer"},
+                               "passages_total": {"type": "integer"}}})
         except RuntimeError:
             pass  # older cluster / no permission: exact-hash dedup degrades to kNN
 

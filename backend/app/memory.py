@@ -26,6 +26,11 @@ DEDUP_SIM_THRESHOLD = 0.92      # cosine >= this in the same visibility scope =>
 # near-duplicate LINK threshold below and referenced by tests.
 DEDUP_DROP_SIM = 0.99
 
+# --- chunking (cause 2) ---------------------------------------------------
+CHUNK_TARGET_CHARS = 1800       # ~450 tokens: under e5-small's 512-token window
+CHUNK_OVERLAP_CHARS = 240       # ~60 tokens of shared tail between passages
+CHUNK_MIN_CHARS = 400           # shorter than this is never split
+
 import re as _re
 _PRIVATE_MARKERS = _re.compile(
     r"(?i)\b(api[_ -]?key|token|password|passwd|secret|credential|ssh[_ -]?key|"
@@ -149,6 +154,37 @@ def _scope_filter(owner_id: str, kind: str, visibility: str) -> dict:
     return {"bool": {"filter": filt}}
 
 
+def chunk_text(text: str, target: int = CHUNK_TARGET_CHARS, overlap: int = CHUNK_OVERLAP_CHARS,
+               min_chars: int = CHUNK_MIN_CHARS) -> list:
+    """Split a long memory into contiguous VERBATIM passages with a shared tail.
+
+    Cause 2: a whole-session doc (median ~10.5k chars) is embedded only at its head,
+    so the answer turn at char 3k-6k never entered the vector arm. Passages of
+    ~450 tokens keep every turn inside the embedding window; `overlap` chars of the
+    previous passage are repeated so a fact straddling a cut is still retrievable.
+    Text is never rewritten: every passage is a contiguous slice of the input, cut on
+    a line/sentence boundary when one falls in the last 60% of the window. Short
+    texts stay a single passage, so nothing changes for them.
+    """
+    text = text or ""
+    if len(text) <= target:
+        return [text]
+    spans, start, n = [], 0, len(text)
+    while start < n:
+        end = min(n, start + target)
+        if end < n:
+            window = text[start:end]
+            cut = max(window.rfind("\n"), window.rfind(". "), window.rfind("? "),
+                      window.rfind("! "))
+            if cut >= int(target * 0.4):
+                end = start + cut + 1
+        spans.append((start, end))
+        if end >= n:
+            break
+        start = max(end - overlap, start + 1)
+    return [text[a:b] for a, b in spans]
+
+
 def _dedup_lookup(owner_id: str, kind: str, visibility: str, vec, text_hash_v=None):
     """Exact-text duplicate id, in the same kind + same visibility scope.
 
@@ -188,7 +224,12 @@ def _nearest_dup(owner_id: str, kind: str, visibility: str, vec):
 
 
 def retain(owner_id: str, kind: str, text: str, visibility: str = "private",
-           occurred_at: Optional[str] = None) -> dict:
+           occurred_at: Optional[str] = None, doc_group: Optional[str] = None) -> dict:
+    """Write a memory. Long text is split into verbatim passages (cause 2) that share
+    a `doc_group` (the caller's stable id for the source document, e.g. a session id);
+    recall returns each passage with its group + occurred_at, so callers can treat a
+    group as one document. Identity/dedup is per GROUP: one exact-text-hash match
+    collapses the whole write, near-duplicates are linked, never dropped (cause 1)."""
     if kind not in KINDS:
         raise ValueError(f"kind must be one of {KINDS}")
     if visibility not in VISIBILITIES:
@@ -201,46 +242,65 @@ def retain(owner_id: str, kind: str, text: str, visibility: str = "private",
     dup_id = _dedup_lookup(owner_id, kind, visibility, None, h)
     if dup_id:
         existing = es("GET", f"/{idx(kind)}/_doc/{dup_id}")["_source"]
-        return {"_id": dup_id, "deduped": True, "dedup_reason": "exact_text_hash",
+        return {"_id": dup_id, "doc_group": existing.get("doc_group") or dup_id,
+                "deduped": True, "dedup_reason": "exact_text_hash",
                 **existing, "deduped_against_owner": existing.get("owner_id")}
+    passages = chunk_text(text)
+    group = doc_group or ("dg_%s" % uuid.uuid4().hex)
+    occurred = occurred_at or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     vec = None
     try:
-        vec = embeddings.embed([text])[0]
+        vec = embeddings.embed([passages[0]])[0]
     except Exception:
         pass  # embeddings optional: BM25-only degrade
     near = _nearest_dup(owner_id, kind, visibility, vec)
-    doc = {
-        "kind": kind,
-        "owner_id": owner_id,
-        "visibility": visibility,
-        "text": text,
-        "text_hash": h,
-        "entities": extract_entities(text),
-        "occurred_at": occurred_at or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "active": True,
-    }
-    if vec is not None:
-        doc["embedding"] = vec
-    r = es("POST", f"/{idx(kind)}/_doc?refresh=true", doc)
-    new_id = r["_id"]
-    doc["_id"] = new_id
-    doc["deduped"] = False
-    doc["dedup_reason"] = "distinct"
+    ids = []
+    for i, passage in enumerate(passages):
+        doc = {
+            "kind": kind,
+            "owner_id": owner_id,
+            "visibility": visibility,
+            "text": passage,
+            "text_hash": h,          # group identity: identical re-writes collapse
+            "doc_group": group,
+            "passage_index": i,
+            "passages_total": len(passages),
+            "entities": extract_entities(passage),
+            "occurred_at": occurred,
+            "active": True,
+        }
+        if vec is not None:
+            # Each passage gets its OWN embedding (that is the point of chunking);
+            # reuse the already-computed head vector for passage 0.
+            if i == 0:
+                doc["embedding"] = vec
+            else:
+                try:
+                    doc["embedding"] = embeddings.embed([passage])[0]
+                except Exception:
+                    pass
+        r = es("POST", f"/{idx(kind)}/_doc?refresh=true", doc)
+        ids.append(r["_id"])
+    # `_id` stays a CONCRETE document id (first passage): promote/consolidate/supersede
+    # and every existing caller key off a real doc id. The group is separate metadata.
+    out = {"_id": ids[0], "ids": ids, "doc_group": group, "passages": len(passages),
+           "deduped": False, "dedup_reason": "distinct", "owner_id": owner_id,
+           "visibility": visibility, "occurred_at": occurred, "text_hash": h}
     if near and near[1] >= DEDUP_SIM_THRESHOLD:
-        # Near-duplicate (0.92 <= cosine < 0.99): WRITE the newer doc and link both
-        # ends. Both stay active: this is coexistence (a later session about the same
-        # topic), not a replacement. `_supersede` remains the explicit, owner-checked
-        # merge path that deactivates the old doc; here deactivating would re-lose the
-        # newer session, which is the entire bug being fixed.
+        # Near-duplicate group (0.92 <= cosine < 0.99): WRITE the newer passages and
+        # link both ends. Both stay active: this is coexistence (a later session about
+        # the same topic), not a replacement. `_supersede` remains the explicit,
+        # owner-checked merge path that deactivates the old doc; deactivating here
+        # would re-lose the newer session, which is the entire bug being fixed.
         old_id = near[0]
-        es("POST", f"/{idx(kind)}/_update/{new_id}?refresh=true",
+        es("POST", f"/{idx(kind)}/_update/{ids[0]}?refresh=true",
            {"doc": {"supersedes": [old_id]}})
         es("POST", f"/{idx(kind)}/_update/{old_id}?refresh=true",
-           {"doc": {"superseded_by": new_id}})
-        doc["dedup_reason"] = "near_duplicate_linked"
-        doc["supersedes"] = [old_id]
-        doc["cosine"] = near[1]
-    return doc
+           {"doc": {"superseded_by": ids[0]}})
+        out["dedup_reason"] = "near_duplicate_linked"
+        out["supersedes"] = [old_id]
+        out["cosine"] = near[1]
+    return out
 
 
 def _visibility_filter(owner_id: str) -> dict:

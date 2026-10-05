@@ -169,11 +169,11 @@ def test_dedup_on_write_exact_hash_only_near_dupes_are_linked():
                          "The OmniRoute heap watchdog warns at 9450MB before restart")
     assert near["deduped"] is False and near["_id"] != first["_id"], near
     assert near["dedup_reason"] == "near_duplicate_linked", near
-    assert near["supersedes"] == [first["_id"]], near
+    assert near["supersedes"] == [first["ids"][0]], near
     assert _count("qdedup") == 2
     # the OLD doc is still active (coexistence link, not a merge): both retrievable
-    old = es("GET", f"/{idx('semantic')}/_doc/{first['_id']}")["_source"]
-    assert old["active"] is True and old["superseded_by"] == near["_id"], old
+    old = es("GET", f"/{idx('semantic')}/_doc/{first['ids'][0]}")["_source"]
+    assert old["active"] is True and old["superseded_by"] == near["ids"][0], old
     # an unrelated fact is neither deduped nor linked
     distinct = memory.retain("qdedup", "semantic",
                              "Vue is the frontend framework used for the dashboard")

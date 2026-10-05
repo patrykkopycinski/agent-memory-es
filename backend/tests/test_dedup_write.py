@@ -80,7 +80,7 @@ def test_cosine_similarity_alone_never_drops_the_newer_session():
     first = memory.retain(OWNER, "episodic", "user: standup notes live in the wiki\n"
                                              "assistant: noted")
     orig = memory._nearest_dup
-    memory._nearest_dup = lambda *a, **k: (first["_id"], 1.0)   # identical heads
+    memory._nearest_dup = lambda *a, **k: (first["ids"][0], 1.0)   # identical heads
     try:
         second = memory.retain(
             OWNER, "episodic",
@@ -99,17 +99,17 @@ def test_near_duplicate_is_written_and_linked_both_ways():
     _wipe()
     first = memory.retain(OWNER, "semantic", "Deploy window is Tuesday 09:00 UTC")
     orig = memory._nearest_dup
-    memory._nearest_dup = lambda *a, **k: (first["_id"], 0.95)
+    memory._nearest_dup = lambda *a, **k: (first["ids"][0], 0.95)
     try:
         second = memory.retain(OWNER, "semantic", "The deploy window moved to Tuesday 09:00 UTC")
     finally:
         memory._nearest_dup = orig
     assert second["deduped"] is False, second
     assert second["dedup_reason"] == "near_duplicate_linked", second
-    assert second["supersedes"] == [first["_id"]]
+    assert second["supersedes"] == [first["ids"][0]]
     assert _count() == 2, "the newer near-duplicate must be stored"
-    old = es("GET", f"/{idx('semantic')}/_doc/{first['_id']}")["_source"]
-    assert old["superseded_by"] == second["_id"]
+    old = es("GET", f"/{idx('semantic')}/_doc/{first['ids'][0]}")["_source"]
+    assert old["superseded_by"] == second["ids"][0]
     assert old["active"] is True, "near-dup link is coexistence, not a merge"
 
 
