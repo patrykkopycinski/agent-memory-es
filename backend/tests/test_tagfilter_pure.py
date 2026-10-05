@@ -177,8 +177,18 @@ def test_extraction_prompt_carries_groups_and_caps_the_text(monkeypatch):
     g = tf.validate_labels([_g()])
     system, user, truncated = tf.build_extraction_prompt("x" * 50, g)
     assert truncated is True and "x" * 11 not in user and "x" * 10 in user
-    assert '"key": "colour"' in user and "red (r)" in user and "blue" in user
+    assert '"key": "colour"' in user and "blue" in user
     assert "never invent" in system
+
+
+def test_allowed_values_are_bare_so_the_model_cannot_echo_a_description():
+    import json as _json
+    g = tf.validate_labels([_g()])
+    _, user, _ = tf.build_extraction_prompt("t", g)
+    spec = _json.loads(user.split("\n")[1])
+    assert spec["allowed_values"] == ["red", "blue"]          # exactly the vocabulary, nothing appended
+    assert spec["value_descriptions"] == {"red": "r"}         # descriptions travel separately
+    assert "(" not in "".join(spec["allowed_values"])
 
 
 # ── filter parsing ────────────────────────────────────────────────────────────
