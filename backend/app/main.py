@@ -79,6 +79,34 @@ def fact_drain(who: dict = Depends(caller)):
     return result
 
 
+@app.post("/memory/facts/jobs/{job_id}/retry")
+def fact_job_retry(job_id: str, who: dict = Depends(caller)):
+    try:
+        return facts.retry_failed_job(who["owner_id"], job_id)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from None
+    except RuntimeError as exc:
+        if "-> 404:" in str(exc):
+            raise HTTPException(404, "job not found") from None
+        if "-> 409:" in str(exc):
+            raise HTTPException(409, "job changed; retry request") from None
+        raise
+
+
+@app.post("/memory/facts/backfill/retry")
+def fact_backfill_retry(visibility: str = "private", who: dict = Depends(caller)):
+    try:
+        return facts.retry_failed_backfill(who["owner_id"], visibility)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from None
+    except RuntimeError as exc:
+        if "-> 404:" in str(exc):
+            raise HTTPException(404, "backfill not found") from None
+        if "-> 409:" in str(exc):
+            raise HTTPException(409, "backfill changed; retry request") from None
+        raise
+
+
 @app.post("/memory/facts/backfill")
 def fact_backfill(who: dict = Depends(caller)):
     """Backfill this key's private episodic documents in chronological order."""

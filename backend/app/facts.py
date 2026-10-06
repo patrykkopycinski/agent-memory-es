@@ -103,6 +103,41 @@ def status(owner_id):
             "drained": not (missing or counts.get("pending", 0) or counts.get("running", 0) or counts.get("failed", 0))}
 
 
+def retry_failed_job(owner_id, job_id):
+    """Explicit owner-scoped retry; CAS prevents rearming an active or completed job."""
+    current = es("GET", f"/{QUEUE}/_doc/{job_id}")
+    doc = current["_source"]
+    if doc["owner_id"] != owner_id:
+        raise ValueError("job not found for owner")
+    if doc["state"] == "pending":
+        return {"state": "pending", "job_id": job_id}
+    if doc["state"] != "failed":
+        raise ValueError("only failed jobs can be retried")
+    es("POST", f"/{QUEUE}/_update/{job_id}?if_seq_no={current['_seq_no']}&if_primary_term={current['_primary_term']}&refresh=true",
+       {"doc": {"state": "pending", "attempts": 0, "next_at": _iso(_now()),
+                "error": "", "finished_at": None, "lease_token": None, "lease_until": None}})
+    return {"state": "pending", "job_id": job_id}
+
+
+def retry_failed_backfill(owner_id, visibility):
+    """Resume at the saved cursor, not at the beginning; source jobs remain keyed."""
+    if visibility not in ("private", "team", "common"):
+        raise ValueError("invalid visibility")
+    key = _backfill_id(owner_id, visibility)
+    current = es("GET", f"/{BACKFILLS}/_doc/{key}")
+    doc = current["_source"]
+    if doc["owner_id"] != owner_id or doc["visibility"] != visibility:
+        raise ValueError("backfill not found for owner/scope")
+    if doc["state"] == "pending":
+        return backfill_status(owner_id, visibility)
+    if doc["state"] != "failed":
+        raise ValueError("only failed backfills can be retried")
+    es("POST", f"/{BACKFILLS}/_update/{key}?if_seq_no={current['_seq_no']}&if_primary_term={current['_primary_term']}&refresh=true",
+       {"doc": {"state": "pending", "error": "", "finished_at": None,
+                "lease_token": None, "lease_until": None}})
+    return backfill_status(owner_id, visibility)
+
+
 def claim(owner_id=None, job_id=None):
     now = _now()
     response = es("POST", f"/{QUEUE}/_search", {"size": 20, "seq_no_primary_term": True,

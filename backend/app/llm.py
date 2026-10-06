@@ -73,12 +73,24 @@ def chat_json(system: str, user: str, timeout: int = 120) -> dict:
                                           "Authorization": f"Bearer {KEY}"})
     with urllib.request.urlopen(req, timeout=timeout) as r:
         out = json.load(r)
-    content = (out["choices"][0]["message"].get("content") or "").strip()
+    choice = out["choices"][0]
+    raw = choice["message"].get("content") or ""
+    content = raw.strip()
     if content.startswith("```"):                      # tolerate a fenced reply
         content = content.strip("`")
         if content[:4].lower() == "json":
             content = content[4:]
-    obj = json.loads(content)
+    reason = choice.get("finish_reason")
+    reason = reason if reason in ("stop", "length", "content_filter", "tool_calls") else "other"
+    try:
+        obj = json.loads(content)
+    except json.JSONDecodeError as exc:
+        # Do not include the completion or the parser exception (which carries it).
+        raise ValueError(f"invalid JSON reply: finish_reason={reason!r} "
+                         f"raw_length={len(raw)} parsed_length={len(content)} "
+                         f"error_position={exc.pos}") from None
     if not isinstance(obj, dict):
-        raise ValueError("extractor reply is not a JSON object")
+        raise ValueError(f"extractor reply is not a JSON object: "
+                         f"finish_reason={reason!r} "
+                         f"raw_length={len(raw)} parsed_length={len(content)}")
     return obj
