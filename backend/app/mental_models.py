@@ -51,7 +51,11 @@ def upsert_model(owner_id: str, question_pattern: str, summary: str,
 def propose_draft(owner_id: str, question_pattern: str, summary: str,
                   source_ids: list, visibility: str = "private") -> dict:
     """Worker-proposed draft — NEVER enters the priority tier; promotion is
-    an explicit upsert_model by the owner."""
+    an explicit upsert_model by the owner. Idempotent per (owner,
+    question_pattern): an existing draft is updated in place (summary,
+    source_ids, visibility) instead of creating a duplicate — the worker
+    loop re-proposes every cluster each AMES_CONSOLIDATE_INTERVAL, and
+    match_model() only counts active models as coverage."""
     ensure_models_index()
     doc = {
         "owner_id": owner_id, "visibility": visibility,
@@ -59,8 +63,32 @@ def propose_draft(owner_id: str, question_pattern: str, summary: str,
         "updated_at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "status": "draft", "source_ids": source_ids,
     }
+    existing = _find_existing_draft(owner_id, question_pattern)
+    if existing is not None:
+        es("POST", f"/{PREFIX}am_models/_update/{existing['id']}?refresh=true",
+           {"doc": doc})
+        return {"id": existing["id"], **doc}
     r = es("POST", f"/{PREFIX}am_models/_doc?refresh=true", doc)
     return {"id": r["_id"], **doc}
+
+
+def _find_existing_draft(owner_id: str, question_pattern: str) -> dict | None:
+    """Newest draft with this exact owner + question_pattern, or None."""
+    ensure_models_index()
+    # question_pattern is a text field (loose matching elsewhere), so filter
+    # by match_phrase then verify the exact string client-side.
+    r = es("POST", f"/{PREFIX}am_models/_search", {
+        "size": 20,
+        "query": {"bool": {"filter": [
+            {"term": {"owner_id": owner_id}},
+            {"term": {"status": "draft"}},
+        ], "must": [{"match_phrase": {"question_pattern": question_pattern}}]}},
+        "sort": [{"updated_at": {"order": "desc"}}],
+    })
+    for h in r["hits"]["hits"]:
+        if h["_source"]["question_pattern"] == question_pattern:
+            return {"id": h["_id"], **h["_source"]}
+    return None
 
 
 def list_drafts(owner_id: str) -> list:
