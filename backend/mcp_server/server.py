@@ -21,7 +21,7 @@ from .client import AmesClient, AmesError
 Visibility = Literal["private", "team", "common"]
 Kind = Literal["episodic", "semantic", "procedural"]
 
-MAX_K = 50
+MAX_K = 50  # client-side ceiling on k and the filtered over-fetch (matches the backend size cap)
 _TRUE = {"1", "true", "yes", "on"}
 
 # fields of a recalled item worth sending to the model (drops embeddings, rrf internals)
@@ -57,9 +57,9 @@ def build_server(client: AmesClient, allow_write: bool = False,
         as_of: ISO-8601 instant the question is asked; resolves 'recent'/'last week'.
         """
         k = max(1, min(int(k), MAX_K))
-        # backend has no visibility param: filter client-side. With a filter, always
-        # fetch the backend maximum (not a multiple of k) so a sparse visibility is not
-        # starved by the k-sized window; then cut to k.
+        # The backend has no visibility param, so filtering happens client-side in this
+        # server. With a filter set, fetch MAX_K (this server's ceiling, not a multiple
+        # of k) so a sparse visibility is not starved by a k-sized window; then cut to k.
         fetch = k if visibility is None else MAX_K
         resp = client.recall(query, fetch, list(kinds) if kinds else None, as_of)
         items = resp.get("results") if isinstance(resp, dict) else None
@@ -74,9 +74,8 @@ def build_server(client: AmesClient, allow_write: bool = False,
                "results": [_slim(i) for i in items],
                "abstained": bool(resp.get("abstained"))}
         if visibility is not None and len(items) < k and scanned >= MAX_K:
-            out["note"] = (f"visibility filter applied to the top {scanned} backend hits "
-                           f"only; more '{visibility}' memories may exist below that. "
-                           "Narrow the query or drop the filter.")
+            out["note"] = (f"best effort: visibility filter applied to the top {scanned} "
+                           f"backend hits; more '{visibility}' matches may exist below that.")
         if resp.get("mental_model"):
             out["mental_model"] = resp["mental_model"]
         return out
