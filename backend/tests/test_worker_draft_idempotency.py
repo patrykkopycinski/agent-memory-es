@@ -38,7 +38,9 @@ _wipe(O)
 auth.create_key(O)
 # Filler facts keep rivendell below the AMES_DRAFT_MAX_ENTITY_DF (0.3)
 # cutoff: with only the cluster facts, rivendell DF=1.0 and is (correctly)
-# skipped as noise. Idempotency is what this file tests, not clustering.
+# skipped as noise. 12 fillers + 4 rivendell facts = 16 total, so rivendell
+# DF = 4/16 = 0.25 < 0.3. Idempotency is what this file tests, not
+# clustering.
 for t in ["Kafka consumer lag alerts page the on-call rotation",
           "The design system uses tokens for spacing and color",
           "Quarterly planning happens in a shared roadmap doc",
@@ -48,6 +50,10 @@ for t in ["Kafka consumer lag alerts page the on-call rotation",
           "The CI pipeline caches pnpm stores between builds",
           "Incident reviews are blameless and written up",
           "Data quality dashboards track freshness SLAs",
+          "Mobile releases go through a staged rollout",
+          "The style guide bans magic numbers in layouts",
+          "Accessibility audits gate every major release",
+          "The API versioning policy forbids breaking changes",
           "Runbooks are rehearsed before game days"]:
     memory.retain(O, "semantic", t)
 memory.retain(O, "semantic", "Rivendell deploys via GitHub Actions on main merge")

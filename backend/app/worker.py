@@ -103,12 +103,14 @@ def run_once() -> dict:
                 drafts = []
         else:
             drafts = []
-        # Count only genuinely-new proposals (existing drafts are skipped
-        # entirely by _already_covered, and non-draft returns don't count).
+        # Count only NEW drafts: existing drafts are re-proposed every pass
+        # and updated in place (propose_draft returns created=False for
+        # them); non-draft returns (promotion raced us) don't count either.
         stats[owner] = {"proposals": len(plan.get("proposals", [])),
                         "superseded": applied.get("superseded", 0),
                         "model_drafts": sum(
-                            1 for d in drafts if d.get("status") == "draft")}
+                            1 for d in drafts
+                            if d.get("status") == "draft" and d.get("created"))}
     return stats
 
 

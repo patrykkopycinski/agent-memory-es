@@ -94,9 +94,9 @@ def propose_draft(owner_id: str, question_pattern: str, summary: str,
     if existing is not None:
         es("POST", f"/{PREFIX}am_models/_update/{existing['id']}?refresh=true",
            {"doc": doc})
-        return {"id": existing["id"], **doc}
+        return {"id": existing["id"], "created": False, **doc}
     r = es("POST", f"/{PREFIX}am_models/_doc?refresh=true", doc)
-    return {"id": r["_id"], **doc}
+    return {"id": r["_id"], "created": True, **doc}
 
 
 def _find_existing_draft(owner_id: str, question_pattern: str) -> dict | None:

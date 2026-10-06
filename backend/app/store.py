@@ -5,16 +5,23 @@ import urllib.error
 import urllib.request
 from typing import Any, Optional
 
-_raw_es_url = os.environ.get("AMES_ES_URL")
-if not _raw_es_url:
-    # Fail fast, before any request: there is no safe default. The historical
-    # default (http://localhost:9268) is an ssh tunnel to the PRODUCTION AMES
-    # cluster and has been polluted by accidental test runs before.
-    raise RuntimeError(
-        "AMES_ES_URL is not set. Refusing to guess an Elasticsearch target "
-        "(the old default localhost:9268 is the PROD tunnel). Set it "
-        "explicitly — e.g. http://localhost:9200 or http://ames-es:9200.")
-ES_URL = _raw_es_url
+_NO_ES_URL_MSG = (
+    "AMES_ES_URL is not set. Refusing to guess an Elasticsearch target "
+    "(the old default localhost:9268 is the PROD tunnel). Set it "
+    "explicitly — e.g. http://localhost:9200 or http://ames-es:9200.")
+
+
+def _es_url() -> str:
+    """Lazily resolved AMES_ES_URL.
+
+    Checked per request, NOT at import time: an import-time check breaks
+    mocked tests (mcp_server) that never touch ES. Any actual request
+    without the env var still fails before a connection is attempted.
+    """
+    url = os.environ.get("AMES_ES_URL")
+    if not url:
+        raise RuntimeError(_NO_ES_URL_MSG)
+    return url
 API_KEYS_FILE = os.environ.get("AMES_API_KEYS_FILE", os.path.join(os.path.dirname(__file__), "..", "data", "api_keys.json"))
 # Test isolation: prefix all indices (e.g. amtest_) so suites never read/write
 # the live cluster's shared data. Empty in production.
@@ -99,7 +106,7 @@ def es(method: str, path: str, body: Optional[dict] = None) -> dict:
         _guard_path(path, method)
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(
-        ES_URL + path, data=data, method=method,
+        _es_url() + path, data=data, method=method,
         headers={"Content-Type": "application/json"},
     )
     try:

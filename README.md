@@ -13,6 +13,9 @@ HTTP / curl ──┘   (auth · ops · worker)           └─ procedural (pla
 ```bash
 # 1. everything up (ES + API + worker, named volumes):
 cd backend && docker compose -f docker-compose.quickstart.yml up -d
+# 1b. host-side tools (importer, doctor) talk to the compose ES — NEVER to
+#     :9268, which may be an ssh tunnel to someone's PROD cluster:
+export AMES_ES_URL=http://localhost:19200
 # 2. mint a key:
 curl -X POST -H 'X-Admin-Token: dev-admin' \
   'http://localhost:8123/admin/keys?owner_id=you'
@@ -107,14 +110,6 @@ docs/       architecture, decision records, diagrams
 scripts/    doctor, importers, MCP bridge, seed, isolation tests
 ```
 
-## Status
-
-Deployed and in daily use (self-hosted): Hermes memory provider swapped in, MCP farm workers onboarded, consolidation worker running. API surface is small and stable; consolidation and reflect are evolving. History: docs/PHASE0_PLAN.md, docs/AUDIT.md.
-
-## License
-
-MIT
-
 ## Mental-model drafts
 
 Drafts are gated by two knobs: a cluster-key entity needs at least
@@ -126,3 +121,12 @@ Because of the DF cutoff, 3 cluster facts need at least 7 unrelated filler
 facts to stay under the 30% bar, so **an owner needs >= 10 active semantic
 facts before any model draft can appear** (3 cluster facts + 7 fillers);
 the first draft shows up at the next consolidation pass after that.
+
+## Status
+
+Deployed and in daily use (self-hosted): Hermes memory provider swapped in, MCP farm workers onboarded, consolidation worker running. API surface is small and stable; consolidation and reflect are evolving. History: docs/PHASE0_PLAN.md, docs/AUDIT.md.
+
+## License
+
+MIT
+

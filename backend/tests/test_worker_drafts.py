@@ -60,6 +60,10 @@ FILLER_FACTS = [
 ]
 
 
+def _all_drafts(owner):
+    return [d for d in mm.list_drafts(owner)]
+
+
 def _filler(owner, n=20):
     for t in FILLER_FACTS[:n]:
         memory.retain(owner, "semantic", t)
@@ -169,6 +173,25 @@ assert "rivendell facts and conventions" in pats, pats
 assert not any("facts and conventions" in p and "rivendell" not in p for p in pats), pats  # every other entity <3 docs or >30% DF with dedup residue
 print("DF-3OF20-DRAFT: PASS")
 
+# --- fail-closed: cover-lookup error must suppress ALL proposals -----------
+_wipe(O)
+_seed(O)
+_before = len(_all_drafts(O))
+_orig_find = mm.find_models
+
+
+def _boom(*a, **k):
+    raise RuntimeError("simulated ES outage during cover lookup")
+
+
+mm.find_models = _boom
+try:
+    assert _candidate_clusters(O, min_facts=3) == []  # fail closed
+finally:
+    mm.find_models = _orig_find
+assert len(_all_drafts(O)) == _before, "fail-closed pass must not create a draft"
+print("FAIL-CLOSED-NO-DRAFT: PASS")
+
 # --- denylist entity never clusters ----------------------------------------
 _wipe(O)
 for i in range(4):
@@ -177,27 +200,51 @@ pats = [x["question_pattern"] for x in _candidate_clusters(O, min_facts=3)]
 assert "memory facts and conventions" not in pats, pats
 print("DENYLIST: PASS")
 
-# --- run_once counts only status=='draft' returns --------------------------
-_seed(O)
-# Pre-existing rivendell draft (from _seed + a candidate pass below) is
-# covered by _already_covered, so propose_draft is called only for new
-# patterns — the fake below must be reached for counting to be exercised.
+# --- run_once counts only genuinely NEW drafts ------------------------------
+# _seed wipes models, so the rivendell draft does not exist yet: run_once
+# must create it via propose_draft (created=True) and count it. A fake
+# propose_draft returning a non-draft must NOT be counted even with
+# created=True — promotion raced us, the return is not a draft.
+
+
+def _counting_section():
+    _seed(O)
+
+    class _FakeMM:
+        def propose_draft(self, *a, **k):
+            return {"status": "active", "created": True}  # promotion raced us
+
+    _orig = mm.propose_draft
+    mm.propose_draft = _FakeMM().propose_draft
+    try:
+        stats = run_once()
+        assert stats[O]["model_drafts"] == 0, stats[O]
+    finally:
+        mm.propose_draft = _orig
+    print("ACTIVE-RETURN-NOT-COUNTED: PASS")
+
+    # Real path: first pass creates and counts; a second pass re-proposes the
+    # SAME pattern (existing drafts are not coverage) and updates it in place
+    # — created=False, so model_drafts must be 0 on the refresh pass.
+    s1 = run_once()
+    assert s1[O]["model_drafts"] == 1, s1[O]
+    _first = [d for d in mm.list_drafts(O) if "rivendell" in d["question_pattern"]]
+    assert len(_first) == 1, _first
+    _new_id = memory.retain(O, "semantic", "Rivendell secrets stay in vault one",
+                            occurred_at="2099-01-02T00:00:00Z")["_id"]
+    s2 = run_once()
+    assert s2[O]["model_drafts"] == 0, s2[O]
+    _refreshed = [d for d in mm.list_drafts(O) if "rivendell" in d["question_pattern"]]
+    assert len(_refreshed) == 1 and _refreshed[0]["id"] == _first[0]["id"], _refreshed
+    assert _new_id in _refreshed[0]["source_ids"], _refreshed[0]["source_ids"]
+    print("REFRESH-PASS-NOT-COUNTED: PASS")
+
+
 os.environ["AMES_MODEL_DRAFTS"] = "1"
-
-
-class _FakeMM:
-    def propose_draft(self, *a, **k):
-        return {"status": "active"}  # pretend promotion raced us
-
-
-_orig = mm.propose_draft
-mm.propose_draft = _FakeMM().propose_draft
 try:
-    stats = run_once()
+    _counting_section()
 finally:
-    mm.propose_draft = _orig
-assert stats[O]["model_drafts"] == 0, stats[O]
-print("ACTIVE-RETURN-NOT-COUNTED: PASS")
+    os.environ.pop("AMES_MODEL_DRAFTS", None)
 
 # --- manual promotion → now in tier ----------------------------------------
 _seed(O)
