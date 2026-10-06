@@ -297,7 +297,3 @@ def test_max_k_matches_backend_fetch_cap():
     import app.memory as mem
     from mcp_server import server as srv
     assert srv.MAX_K == mem.RECALL_FETCH_CAP == 50
-    # and the backend really cannot exceed it, whatever `size` we send
-    assert mem.recall.__doc__ is not None  # import sanity
-    fetch_expr_cap = 50
-    assert max(fetch_expr_cap, min(mem.RECALL_FETCH_CAP, 50 * 4)) == mem.RECALL_FETCH_CAP
