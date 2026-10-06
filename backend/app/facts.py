@@ -395,7 +395,7 @@ def _run_backfill(key, doc, token):
         body = {"size": 1, "query": {"bool": {"filter": [
             {"term": {"owner_id": owner_id}}, {"term": {"visibility": visibility}},
             {"term": {"passage_index": 0}}, {"term": {"active": True}}]}},
-            "sort": [{"occurred_at": "asc"}, {"_id": "asc"}]}
+            "sort": [{"occurred_at": "asc"}, {"doc_group": "asc"}]}
         if after is not None:
             body["search_after"] = after
         hits = es("POST", f"/{idx('episodic')}/_search", body)["hits"]["hits"]
