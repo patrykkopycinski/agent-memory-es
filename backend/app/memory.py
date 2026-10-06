@@ -358,8 +358,9 @@ def retain(owner_id: str, kind: str, text: str, visibility: str = "private",
             "entities": extract_entities(passage),
             "occurred_at": occurred,
             "active": True,
-            "fact_requested": bool(kind == "episodic" and extract_facts),
         }
+        if kind == "episodic" and extract_facts:
+            doc["fact_requested"] = True
         if write_tags:
             doc[_tf.TAG_FIELD] = list(write_tags)
         if vec is not None:
