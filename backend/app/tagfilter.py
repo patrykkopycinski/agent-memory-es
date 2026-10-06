@@ -143,8 +143,8 @@ EXTRACT_SYSTEM = (
     "answer exactly as that group's description says. Use only what the TEXT supports; never "
     "invent. Reply with ONE JSON object and nothing else: keys are the group keys, values are "
     "a string (types value/text) or a list of strings (types multi-value/multi-text). For groups "
-    "with allowed_values, answer with EXACTLY one of those strings (no descriptions). Use an "
-    "empty list or empty string when a group does not apply."
+    "with an allowed_values list, each answer must be exactly one of those strings, with no "
+    "other text. Use an empty list or empty string when a group does not apply."
 )
 
 
