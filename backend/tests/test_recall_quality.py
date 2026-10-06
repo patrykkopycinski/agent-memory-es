@@ -5,7 +5,7 @@ recency arm, min_score abstention, dedup-on-write. Integration tests run against
 live ES (AMES_ES_URL). Run in the backend image:
 
   docker run --rm -v <repo>:/srv -w /srv/backend \
-    -e AMES_ES_URL=http://host.docker.internal:9268 \
+    -e AMES_ES_URL=http://127.0.0.1:19281 \
     backend-ames-backend python -m pytest tests/test_recall_quality.py -v
 """
 import datetime as dt

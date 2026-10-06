@@ -44,14 +44,14 @@ def _refused_get(path):
 def test_mixed_index_lists_refused():
     # mixed: the second name is a PROD index even though the first is prefixed
     _refused(f"/{P}x,am_semantic/_delete_by_query")
-    _refused("/am_semantic,amtest_*/_search")  # order must not matter
+    _refused(f"/am_semantic,{P}x/_search")  # order must not matter
     _refused(f"/{P}x,*/_search")
     _refused(f"/{P}x,/_search")
 
 
 def test_wildcards_and_all_refused():
     _refused("/_all/_delete_by_query")
-    _refused("/amtest_*/_delete_by_query")
+    _refused(f"/{P}*/_delete_by_query")
     _refused("/am_*/_search")
 
 
