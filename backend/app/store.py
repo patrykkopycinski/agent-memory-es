@@ -40,6 +40,7 @@ MAPPINGS = {
             "promoted_from": {"type": "keyword"},
             "tags": {"type": "keyword"},   # "key:value" labels (caller-supplied or extracted)
             "source_id": {"type": "keyword"},
+            "fact_requested": {"type": "boolean"},
             "valid_from": {"type": "date"},
             "valid_to": {"type": "date"},
         },
@@ -78,6 +79,7 @@ def ensure_indices() -> None:
                                "passages_total": {"type": "integer"},
                                "tags": {"type": "keyword"},
                                "source_id": {"type": "keyword"},
+                               "fact_requested": {"type": "boolean"},
                                "valid_from": {"type": "date"},
                                "valid_to": {"type": "date"}}})
         except RuntimeError:

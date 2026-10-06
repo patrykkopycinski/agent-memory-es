@@ -87,6 +87,7 @@ if __name__ == "__main__":
     import sys
     if "--facts" in sys.argv:
         from .facts import loop
-        loop()
+        scope_owner = os.environ.get("AMES_FACT_OWNER")
+        loop(scope_owner)
     else:
         run_forever()

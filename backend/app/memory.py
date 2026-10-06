@@ -312,9 +312,18 @@ def retain(owner_id: str, kind: str, text: str, visibility: str = "private",
     dup_id = _dedup_lookup(owner_id, kind, visibility, None, h)
     if dup_id:
         existing = es("GET", f"/{idx(kind)}/_doc/{dup_id}")["_source"]
-        return {"_id": dup_id, "doc_group": existing.get("doc_group") or dup_id,
-                "deduped": True, "dedup_reason": "exact_text_hash",
-                **existing, "deduped_against_owner": existing.get("owner_id")}
+        out = {"_id": dup_id, "doc_group": existing.get("doc_group") or dup_id,
+               "deduped": True, "dedup_reason": "exact_text_hash",
+               **existing, "deduped_against_owner": existing.get("owner_id")}
+        if kind == "episodic" and extract_facts:
+            from . import facts
+            out["fact_jobs"] = []
+            try:
+                out["fact_jobs"].append(facts.enqueue(owner_id, dup_id))
+            except Exception as exc:
+                out["fact_enqueue_errors"] = [{"source_id": dup_id, "error": str(exc)[:200]}]
+                out["fact_extraction_complete"] = False
+        return out
     extraction = None
     if label_groups:
         # A3: after the exact-duplicate check, so a duplicate costs no LLM call. Fail closed:
@@ -349,6 +358,7 @@ def retain(owner_id: str, kind: str, text: str, visibility: str = "private",
             "entities": extract_entities(passage),
             "occurred_at": occurred,
             "active": True,
+            "fact_requested": bool(kind == "episodic" and extract_facts),
         }
         if write_tags:
             doc[_tf.TAG_FIELD] = list(write_tags)
@@ -390,13 +400,14 @@ def retain(owner_id: str, kind: str, text: str, visibility: str = "private",
     if kind == "episodic" and extract_facts:
         from . import facts
         out["fact_jobs"] = []
-        for source_id in ids:
+        for source_id in ids[:1]:
             try:
                 out["fact_jobs"].append(facts.enqueue(owner_id, source_id))
             except Exception as exc:
                 import logging
                 logging.getLogger(__name__).exception("fact enqueue failed for %s", source_id)
                 out.setdefault("fact_enqueue_errors", []).append({"source_id": source_id, "error": str(exc)[:200]})
+                out["fact_extraction_complete"] = False
     return out
 
 
@@ -493,6 +504,13 @@ def recall(owner_id: str, query: str, kinds=None, size: int = 8,
     fetch = max(size, min(RECALL_FETCH_CAP, size * RECALL_FETCH_FACTOR))
     for kind in kinds:
         must = [{"multi_match": {"query": query, "fields": ["text^3", "entities"], "type": "most_fields"}}]
+        validity = []
+        if now is not None:
+            instant = now.isoformat()
+            validity = [{"bool": {"should": [{"bool": {"must_not": {"exists": {"field": "valid_from"}}}},
+                          {"range": {"valid_from": {"lte": instant}}}], "minimum_should_match": 1}},
+                        {"bool": {"should": [{"bool": {"must_not": {"exists": {"field": "valid_to"}}}},
+                          {"range": {"valid_to": {"gt": instant}}}], "minimum_should_match": 1}}]
         if qvec is not None:
             body = {
                 "size": fetch,
@@ -500,13 +518,13 @@ def recall(owner_id: str, query: str, kinds=None, size: int = 8,
                     "retrievers": [
                         {"standard": {"query": {"bool": {
                             "must": must,
-                            "filter": [{"term": {"active": True}}, _visibility_filter(owner_id)] + flt_extra,
+                            "filter": [{"term": {"active": True}}, _visibility_filter(owner_id)] + flt_extra + validity,
                             **({"must_not": flt_not} if flt_not else {}),
                         }}}},
                         {"knn": {"field": "embedding", "query_vector": qvec, "num_candidates": max(100, fetch * 2), "k": fetch,
-                                 "filter": {"bool": {"filter": [{"term": {"active": True}}, _visibility_filter(owner_id)] + flt_extra,
+                                 "filter": {"bool": {"filter": [{"term": {"active": True}}, _visibility_filter(owner_id)] + flt_extra + validity,
                                                      "must_not": flt_not}} if flt_not else
-                                           [{"term": {"active": True}}, _visibility_filter(owner_id)] + flt_extra}},
+                                           [{"term": {"active": True}}, _visibility_filter(owner_id)] + flt_extra + validity}},
                     ],
                     "rank_constant": 60,
                     "rank_window_size": 50,
@@ -517,7 +535,7 @@ def recall(owner_id: str, query: str, kinds=None, size: int = 8,
                 "size": fetch,
                 "query": {"bool": {
                     "must": must,
-                    "filter": [{"term": {"active": True}}, _visibility_filter(owner_id)] + flt_extra,
+                    "filter": [{"term": {"active": True}}, _visibility_filter(owner_id)] + flt_extra + validity,
                     **({"must_not": flt_not} if flt_not else {}),
                 }},
                 "sort": [{"_score": {"order": "desc"}}, {"occurred_at": {"order": "desc"}}],
@@ -564,7 +582,7 @@ def recall(owner_id: str, query: str, kinds=None, size: int = 8,
                         "must": [{"match_all": {}}],
                         "filter": [{"term": {"active": True}},
                                    _visibility_filter(owner_id),
-                                   {"range": {"occurred_at": {"gte": bs, "lte": be}}}] + flt_extra,
+                                   {"range": {"occurred_at": {"gte": bs, "lte": be}}}] + flt_extra + validity,
                         **({"must_not": flt_not} if flt_not else {}),
                     }}, "sort": [{"occurred_at": {"order": "asc"}}]})
                 t_hits += [{"id": h["_id"], "kind": "episodic", "score": h["_score"],
