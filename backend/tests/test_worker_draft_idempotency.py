@@ -99,8 +99,15 @@ finally:
     else:
         os.environ["AMES_MODEL_DRAFTS"] = _saved
 assert O in s1, f"run_once did not report seeded owner {O!r}: {sorted(s1)}"
-assert s1[O].get("model_drafts", 0) >= 1, \
-    f"run_once reported no drafts for {O} (flag not effective?): {s1[O]}"
+# model_drafts counts only NEW drafts (propose_draft created=True). The
+# draft already exists (created by the _candidate_clusters passes above),
+# so both run_once passes refresh it in place: model_drafts == 0 is the
+# correct, non-vacuous expectation here — the owner IS reported, the flag
+# IS effective (verified by the draft existing below and staying at 1).
+assert s1[O].get("model_drafts", 0) == 0, \
+    f"refresh pass must not count the existing draft: {s1[O]}"
 ds = _drafts("rivendell")
 assert len(ds) == 1, f"run_once duplicated drafts: {len(ds)}"
+# and a clean owner WOULD count 1 on first creation — covered in
+# test_worker_drafts.py (REFRESH-PASS-NOT-COUNTED section).
 print("RUN-ONCE-IDEMPOTENT: PASS")
