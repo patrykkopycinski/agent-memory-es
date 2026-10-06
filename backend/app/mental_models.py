@@ -48,6 +48,33 @@ def upsert_model(owner_id: str, question_pattern: str, summary: str,
     return {"id": r["_id"], **doc}
 
 
+def normalize_pattern(pattern: str) -> str:
+    """Canonical form for exact draft/cover matching: lowercase,
+    whitespace-collapsed."""
+    return " ".join(pattern.lower().split())
+
+
+def find_models(owner_id: str, pattern: str,
+                status: Optional[str] = None) -> list:
+    """Exact normalized question_pattern matches among the owner's models;
+    optional status filter. Unlike match_model (BM25, loose), this is exact —
+    worker cover checks need it because every generated pattern shares the
+    'facts and conventions' tail."""
+    ensure_models_index()
+    q: dict = {"term": {"owner_id": owner_id}}
+    if status:
+        q = {"bool": {"filter": [{"term": {"owner_id": owner_id}},
+                                 {"term": {"status": status}}]}}
+    r = es("POST", f"/{PREFIX}am_models/_search", {
+        "size": 20,
+        "query": {"bool": {"filter": [q],
+                           "must": [{"match_phrase": {"question_pattern":
+                                                      pattern}}]}}})
+    return [h["_source"] for h in r["hits"]["hits"]
+            if normalize_pattern(h["_source"]["question_pattern"])
+            == normalize_pattern(pattern)]
+
+
 def propose_draft(owner_id: str, question_pattern: str, summary: str,
                   source_ids: list, visibility: str = "private") -> dict:
     """Worker-proposed draft — NEVER enters the priority tier; promotion is
@@ -76,7 +103,7 @@ def _find_existing_draft(owner_id: str, question_pattern: str) -> dict | None:
     """Newest draft with this exact owner + question_pattern, or None."""
     ensure_models_index()
     # question_pattern is a text field (loose matching elsewhere), so filter
-    # by match_phrase then verify the exact string client-side.
+    # by match_phrase then verify the exact normalized string client-side.
     r = es("POST", f"/{PREFIX}am_models/_search", {
         "size": 20,
         "query": {"bool": {"filter": [
@@ -86,7 +113,8 @@ def _find_existing_draft(owner_id: str, question_pattern: str) -> dict | None:
         "sort": [{"updated_at": {"order": "desc"}}],
     })
     for h in r["hits"]["hits"]:
-        if h["_source"]["question_pattern"] == question_pattern:
+        if normalize_pattern(h["_source"]["question_pattern"]) \
+                == normalize_pattern(question_pattern):
             return {"id": h["_id"], **h["_source"]}
     return None
 

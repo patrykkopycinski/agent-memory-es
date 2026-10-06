@@ -54,7 +54,7 @@ Beyond the hybrid core:
 - **Temporal arm** — time expressions in queries ("last 3 months", "in 2024") parse into a window, filled spread across equal buckets so results aren't all from one end.
 - **Reranker** — ES-native `_inference` rerank endpoint; honest fallback (`reranked: false`) when model/license unavailable — never faked.
 - **Reflect multi-round** — bounded LLM query rewrites extend evidence before synthesis; mental-model tier consulted first.
-- **Mental models** — curated summaries for frequent questions, matched by BM25 on question pattern, surfaced as a priority tier in recall and reflect. `POST /memory/models`.
+- **Mental models** — curated summaries for frequent questions, matched by BM25 on question pattern, surfaced as a priority tier in recall and reflect. `POST /memory/models`. Worker draft proposals are off by default; set `AMES_MODEL_DRAFTS=1` (or `true`) to enable. Drafts are idempotent per (owner, pattern) — one draft, refreshed in place, never auto-promoted. `AMES_DRAFT_MAX_ENTITY_DF` (default `0.3`) caps cluster entities at that fraction of the owner’s active facts — entities appearing on more facts (extraction artifacts like `memory`/`facts`/`conventions`) are skipped as cluster keys.
 
 ## Landing page
 

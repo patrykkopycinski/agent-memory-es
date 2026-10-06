@@ -33,6 +33,22 @@ def _drafts(substr=""):
 
 # --- setup: clean owner, seed a rivendell cluster ---
 _wipe(O)
+# Filler facts keep rivendell below the AMES_DRAFT_MAX_ENTITY_DF (0.3)
+# cutoff: with only the cluster facts, rivendell DF=1.0 and is (correctly)
+# skipped as noise. Idempotency is what this file tests, not clustering.
+for t in ["Kafka consumer lag alerts page the on-call rotation",
+          "The design system uses tokens for spacing and color",
+          "Quarterly planning happens in a shared roadmap doc",
+          "Postgres backups are verified by restore drills",
+          "Onboarding includes a pairing week with a buddy",
+          "Feature flags roll out gradually by cohort",
+          "The CI pipeline caches pnpm stores between builds",
+          "Incident reviews are blameless and written up",
+          "Mobile releases go through a staged rollout",
+          "The style guide bans magic numbers in layouts",
+          "Service meshes route internal traffic with mTLS",
+          "Data quality dashboards track freshness SLAs"]:
+    memory.retain(O, "semantic", t)
 memory.retain(O, "semantic", "Rivendell deploys via GitHub Actions on main merge")
 memory.retain(O, "semantic", "Rivendell uses conventional commits scope config")
 memory.retain(O, "semantic", "Rivendell release workflow tags from CHANGELOG.md")
@@ -48,7 +64,11 @@ assert not riv_ids or riv_ids == [ds[0]["id"]], riv_ids
 print("IDEMPOTENT-PASS2: PASS", ds[0]["id"], ds[0]["source_ids"])
 
 # --- changed facts (new fact joins the cluster) -> one draft, updated ---
-new_id = memory.retain(O, "semantic", "Rivendell staging environment runs on Fly.io")["_id"]
+# explicit occurred_at: with local inference the seed retains can land in
+# the same wall-clock second, so the occurred_at sort would not place the
+# new fact first.
+new_id = memory.retain(O, "semantic", "Rivendell staging environment runs on Fly.io",
+                       occurred_at="2099-01-01T00:00:00Z")["_id"]
 _candidate_clusters(O, min_facts=3)
 ds = _drafts("rivendell")
 assert len(ds) == 1, f"expected 1 draft after changed facts, got {len(ds)}"
