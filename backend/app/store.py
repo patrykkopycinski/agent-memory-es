@@ -44,7 +44,25 @@ MAPPINGS = {
 }
 
 
+def _guard_path(path: str, method: str) -> None:
+    """Under tests (AMES_TEST_GUARD=1, set by tests/conftest.py): refuse any
+    request whose path is not an amtest_-prefixed index operation or an ES
+    cluster/API path (/_...). Belt-and-braces with the conftest session guard
+    — a mis-set prefix must fail loudly here, before bytes hit the wire."""
+    p = path.split("?", 1)[0].lstrip("/")
+    if p.startswith("_") or p == "":
+        return  # cluster-level APIs (_search across indices, _cat, /_bulk...)
+    index = p.split("/", 1)[0]
+    if not index.startswith(PREFIX):
+        raise RuntimeError(
+            f"ES test guard: refusing {method} {path} — index {index!r} does "
+            f"not start with required test prefix {PREFIX!r}. This would hit "
+            "non-test data; check AMES_INDEX_PREFIX.")
+
+
 def es(method: str, path: str, body: Optional[dict] = None) -> dict:
+    if os.environ.get("AMES_TEST_GUARD") == "1":
+        _guard_path(path, method)
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(
         ES_URL + path, data=data, method=method,
