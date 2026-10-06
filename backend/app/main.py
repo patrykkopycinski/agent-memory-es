@@ -5,7 +5,7 @@ from typing import Optional
 from fastapi import Depends, FastAPI, Header, HTTPException
 from pydantic import BaseModel
 
-from . import auth, memory, pages as pages_mod, mental_models as mm_mod, reranker, tagfilter
+from . import auth, memory, pages as pages_mod, mental_models as mm_mod, reranker, tagfilter, facts
 from .store import KINDS, ensure_indices
 
 app = FastAPI(title="agent-memory-es", version="0.2.0")
@@ -14,6 +14,7 @@ app = FastAPI(title="agent-memory-es", version="0.2.0")
 @app.on_event("startup")
 def _startup():
     ensure_indices()
+    facts.ensure_queue()
     pages_mod.ensure_pages_index()
     mm_mod.ensure_models_index()
 
@@ -33,6 +34,7 @@ class RetainIn(BaseModel):
     doc_group: Optional[str] = None   # caller's stable id for the source document
                                       # (e.g. a session id); long text is written as
                                       # passages sharing it (cause 2)
+    extract_facts: bool = True  # opt out of asynchronous fact extraction for bulk imports
     tags: Optional[list] = None       # caller-supplied "key:value" tags (stored as keywords)
     labels: Optional[list] = None     # label groups to LLM-extract into tags (off when absent)
 
@@ -66,11 +68,17 @@ def mint_key(owner_id: str, role: str = "member", _admin: str = Header(None, ali
     return {"api_key": auth.create_key(owner_id, role), "owner_id": owner_id}
 
 
+@app.get("/memory/facts/drain")
+def fact_drain(who: dict = Depends(caller)):
+    return facts.status(who["owner_id"])
+
+
 @app.post("/memory/retain")
 def retain(body: RetainIn, who: dict = Depends(caller)):
     try:
         return memory.retain(who["owner_id"], body.kind, body.text, body.visibility,
-                             body.occurred_at, body.doc_group, body.tags, body.labels)
+                             body.occurred_at, body.doc_group, body.tags, body.labels,
+                             body.extract_facts)
     except ValueError as e:
         raise HTTPException(422, str(e))
     except tagfilter.ExtractionError as e:

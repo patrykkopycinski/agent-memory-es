@@ -39,6 +39,9 @@ MAPPINGS = {
             "active": {"type": "boolean"},
             "promoted_from": {"type": "keyword"},
             "tags": {"type": "keyword"},   # "key:value" labels (caller-supplied or extracted)
+            "source_id": {"type": "keyword"},
+            "valid_from": {"type": "date"},
+            "valid_to": {"type": "date"},
         },
     },
 }
@@ -73,7 +76,10 @@ def ensure_indices() -> None:
                                "doc_group": {"type": "keyword"},
                                "passage_index": {"type": "integer"},
                                "passages_total": {"type": "integer"},
-                               "tags": {"type": "keyword"}}})
+                               "tags": {"type": "keyword"},
+                               "source_id": {"type": "keyword"},
+                               "valid_from": {"type": "date"},
+                               "valid_to": {"type": "date"}}})
         except RuntimeError:
             pass  # older cluster / no permission: exact-hash dedup degrades to kNN
 

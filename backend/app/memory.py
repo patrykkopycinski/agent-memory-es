@@ -290,7 +290,8 @@ def _nearest_dup(owner_id: str, kind: str, visibility: str, vec):
 
 def retain(owner_id: str, kind: str, text: str, visibility: str = "private",
            occurred_at: Optional[str] = None, doc_group: Optional[str] = None,
-           tags: Optional[list] = None, labels: Optional[list] = None) -> dict:
+           tags: Optional[list] = None, labels: Optional[list] = None,
+           extract_facts: bool = True) -> dict:
     """Write a memory. Long text is split into verbatim passages (cause 2) that share
     a `doc_group` (the caller's stable id for the source document, e.g. a session id);
     recall returns each passage with its group + occurred_at, so callers can treat a
@@ -386,6 +387,16 @@ def retain(owner_id: str, kind: str, text: str, visibility: str = "private",
         out["dedup_reason"] = "near_duplicate_linked"
         out["supersedes"] = [old_id]
         out["cosine"] = near[1]
+    if kind == "episodic" and extract_facts:
+        from . import facts
+        out["fact_jobs"] = []
+        for source_id in ids:
+            try:
+                out["fact_jobs"].append(facts.enqueue(owner_id, source_id))
+            except Exception as exc:
+                import logging
+                logging.getLogger(__name__).exception("fact enqueue failed for %s", source_id)
+                out.setdefault("fact_enqueue_errors", []).append({"source_id": source_id, "error": str(exc)[:200]})
     return out
 
 
@@ -582,9 +593,17 @@ def recall(owner_id: str, query: str, kinds=None, size: int = 8,
     if (RERANK_DEFAULT if rerank is None else rerank):
         ordered, reranked = _rerank_fused(query, ordered)
     window = _apply_budgets(ordered, size, per_doc_budget=per_doc or PER_DOC_BUDGET)
+    # Extracted facts have a separate evidence lane and do not displace chunks.
+    fact_hits = [h for h in results.get("semantic", []) if h.get("source_id")][:24] if "semantic" in kinds else []
+    chunks = [h for h in ordered if not h.get("source_id")][:8]
+    evidence = fact_hits + chunks
     out = {
         "query": query,
         "results": window,
+        "evidence": evidence,
+        "context_chars": sum(len(h.get("text", "")) for h in evidence),
+        "fact_count": len(fact_hits),
+        "chunk_count": len(chunks),
         "by_kind": {k: v[:size] for k, v in results.items()},   # deprecated; compat shape
         "fused": window,      # deprecated alias of `results`
         "abstained": bool(min_score is not None and not window),
@@ -695,7 +714,8 @@ def reflect(owner_id: str, question: str, llm_answer_fn=None, rounds: int = 3) -
     from . import mental_models as _mm
     model = _mm.match_model(owner_id, question)
     evidence = recall(owner_id, question)
-    sources = [h for h in evidence["fused"][:5]]
+    sources = evidence.get("evidence") or [h for h in evidence["fused"][:5]]
+    has_facts = bool(evidence.get("fact_count"))
     queries_run = [question]
     # multi-round: bounded query rewrites extend evidence whenever the LLM is
     # reachable (Hindsight runs its loop unconditionally; thin-evidence gating
@@ -709,8 +729,8 @@ def reflect(owner_id: str, question: str, llm_answer_fn=None, rounds: int = 3) -
                 queries_run.append(q)
                 more = recall(owner_id, q)
                 seen = {s["id"] for s in sources}
-                for h in more["fused"]:
-                    if h["id"] not in seen and len(sources) < 5:
+                for h in (more.get("evidence", more["fused"]) if has_facts else more["fused"]):
+                    if h["id"] not in seen and len(sources) < (32 if has_facts else 5):
                         sources.append(h)
         except Exception:
             pass  # rewrite unavailable → single-pass reflect, never fake rounds

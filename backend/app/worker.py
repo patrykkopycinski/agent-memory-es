@@ -84,4 +84,9 @@ def run_forever(interval_s: int = 0):
 
 
 if __name__ == "__main__":
-    run_forever()
+    import sys
+    if "--facts" in sys.argv:
+        from .facts import loop
+        loop()
+    else:
+        run_forever()
