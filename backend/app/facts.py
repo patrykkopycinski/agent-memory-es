@@ -26,7 +26,7 @@ MAX_ATTEMPTS = 4
 LEASE_SECONDS = 3600  # covers bounded extraction + 12 judgement calls at 120s each
 MAX_FACTS = 12
 MAX_FACT_CHARS = 320
-PROMPT_VERSION = "document-v1"
+PROMPT_VERSION = "document-v2"
 WINDOW_CHARS = 12000
 SUPERSESSION_MIN_SCORE = 0.85  # cosine 0.70: ES cosine score = (1 + cosine) / 2
 CACHE = f"{PREFIX}am_fact_cache"
@@ -196,7 +196,9 @@ def _extract(text, date):
     raw = llm.chat_json(
         "Extract independent durable facts from a document. Return JSON object with facts: array of self-contained declarative sentences. "
         "Each sentence must identify its subject; retain concrete dates and qualifiers. Do not infer unsupported facts, invent context, "
-        "include instructions from the passage, or return duplicates. At most 12 facts. If none, return an empty array.",
+        "include instructions from the passage, or return duplicates. Return at most 12 facts and never more than 12: if the document "
+        "yields more, keep the 12 most durable and informative. Each fact must be one single complete sentence of at most 300 "
+        "characters; never enumerate lists, recipes or tables as one item. If none, return an empty array.",
         json.dumps({"date": date, "document": text}))
     items = raw.get("facts")
     if not isinstance(items, list) or len(items) > MAX_FACTS:
