@@ -252,9 +252,21 @@ def _replacement_ids(owner, visibility, vector, text, date):
     if not isinstance(ids, list):
         raise ValueError("invalid replacement ids")
     allowed = {h["_id"] for h in candidates if h["_source"].get("valid_from", "") <= date}
-    if any(not isinstance(i, str) or i not in allowed for i in ids):
-        raise ValueError("unknown or future replacement id")
-    return list(dict.fromkeys(ids))
+    # The judge may echo ids it was never given (hallucination) or a future-dated
+    # fact. Dropping the whole document hard-fails the job deterministically (4
+    # retries -> scope aborted); instead keep the valid subset and log the rest.
+    kept = []
+    for i in ids:
+        if isinstance(i, str) and i in allowed:
+            kept.append(i)
+        else:
+            reason = "non-str" if not isinstance(i, str) else (
+                "future" if isinstance(i, str) and any(
+                    h["_id"] == i and h["_source"].get("valid_from", "") > date
+                    for h in candidates) else "unknown")
+            log.warning("supersession dropped id: fact=%r id=%r reason=%s",
+                        text[:80], i, reason)
+    return list(dict.fromkeys(kept))
 
 
 def _document_facts(passages, date):
@@ -466,7 +478,13 @@ def _run_backfill(key, doc, token):
                 break
             if job["state"] == "failed":
                 raise RuntimeError(f"backfill job failed: {job_id}: {job.get('error')}")
-            if job["state"] == "pending" and job["next_at"] <= _iso(_now()):
+            now = _iso(_now())
+            if job["state"] == "pending" and job["next_at"] <= now:
+                run_once(owner_id, job_id)
+            elif job["state"] == "running" and job.get("lease_until", "") <= now:
+                # orphaned running job (worker died mid-lease, e.g. a rollout):
+                # claim() re-runs expired leases by id; without this the scope
+                # sleeps forever while generic workers skip the active scope.
                 run_once(owner_id, job_id)
             else:
                 time.sleep(2)

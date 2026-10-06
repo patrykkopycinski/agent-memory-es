@@ -45,8 +45,9 @@ def test_replacement_only_owner_scope_and_older_dates():
     assert {"term": {"owner_id": "alice"}} in body["knn"]["filter"]
     assert {"term": {"visibility": "private"}} in body["knn"]["filter"]
     with patch.object(facts, "es", fake_es), patch.object(facts.llm, "chat_json", return_value={"replace_ids": ["future"]}):
-        with pytest.raises(ValueError):
-            facts._replacement_ids("alice", "private", [0.1], "x", "2021-01-01")
+        # v4: a future-dated (or hallucinated) id is DROPPED with a logged warning,
+        # not a hard failure — the document's other facts still supersede normally.
+        assert facts._replacement_ids("alice", "private", [0.1], "x", "2021-01-01") == []
 
 
 def test_fail_open_write_and_opt_out():
