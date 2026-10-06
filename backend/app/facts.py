@@ -192,6 +192,12 @@ def _date(value):
         raise ValueError("invalid occurred_at date")
 
 
+# Cumulative (process-wide) tolerance counters: model output can exceed the cap or
+# contain malformed items; we keep the good facts instead of failing the whole
+# document, and never let that be silent.
+DROPPED = {"invalid": 0, "overflow": 0}
+
+
 def _extract(text, date):
     raw = llm.chat_json(
         "Extract independent durable facts from a document. Return JSON object with facts: array of self-contained declarative sentences. "
@@ -201,17 +207,28 @@ def _extract(text, date):
         "characters; never enumerate lists, recipes or tables as one item. If none, return an empty array.",
         json.dumps({"date": date, "document": text}))
     items = raw.get("facts")
-    if not isinstance(items, list) or len(items) > MAX_FACTS:
+    if not isinstance(items, list):
         raise ValueError("invalid facts array")
     facts = []
+    invalid = 0
     for item in items:
         if not isinstance(item, str) or not 8 <= len(item.strip()) <= MAX_FACT_CHARS:
-            raise ValueError("invalid fact sentence")
+            invalid += 1
+            continue
         sentence = re.sub(r"^\[\d{4}-\d{2}-\d{2}\]\s*", "", item.strip())
         fact = f"[{date}] {sentence}"
         if fact not in facts:
             facts.append(fact)
-    return facts
+    if items and not facts:
+        # The model returned content but none of it was usable: retryable signal.
+        raise ValueError("invalid fact sentence")
+    overflow = max(0, len(facts) - MAX_FACTS)
+    if overflow or invalid:
+        log.info("extract dropped items: source items=%d kept=%d dropped_invalid=%d dropped_overflow=%d",
+                 len(items), len(facts) - overflow, invalid, overflow)
+        DROPPED["invalid"] += invalid
+        DROPPED["overflow"] += overflow
+    return facts[:MAX_FACTS]
 
 
 def _replacement_ids(owner, visibility, vector, text, date):

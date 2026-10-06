@@ -71,6 +71,8 @@ def mint_key(owner_id: str, role: str = "member", _admin: str = Header(None, ali
 @app.get("/memory/facts/drain")
 def fact_drain(who: dict = Depends(caller)):
     result = facts.status(who["owner_id"])
+    result["facts_dropped_invalid"] = facts.DROPPED["invalid"]
+    result["facts_dropped_overflow"] = facts.DROPPED["overflow"]
     backfill = facts.backfill_status(who["owner_id"], "private")
     if backfill:
         result["backfill"] = backfill
