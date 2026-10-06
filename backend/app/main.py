@@ -70,7 +70,19 @@ def mint_key(owner_id: str, role: str = "member", _admin: str = Header(None, ali
 
 @app.get("/memory/facts/drain")
 def fact_drain(who: dict = Depends(caller)):
-    return facts.status(who["owner_id"])
+    result = facts.status(who["owner_id"])
+    backfill = facts.backfill_status(who["owner_id"], "private")
+    if backfill:
+        result["backfill"] = backfill
+        if backfill["state"] != "completed":
+            result["drained"] = False
+    return result
+
+
+@app.post("/memory/facts/backfill")
+def fact_backfill(who: dict = Depends(caller)):
+    """Backfill this key's private episodic documents in chronological order."""
+    return facts.backfill(who["owner_id"], "private")
 
 
 @app.post("/memory/retain")

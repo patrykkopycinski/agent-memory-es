@@ -7,12 +7,21 @@ import os
 import re
 import time
 import uuid
+import threading
 
 from . import embeddings, llm
 from .store import es, idx, PREFIX
 
 log = logging.getLogger(__name__)
 QUEUE = f"{PREFIX}am_fact_jobs"
+BACKFILLS = f"{PREFIX}am_fact_backfills"
+BACKFILL_MAPPING = {"settings": {"number_of_shards": 1, "number_of_replicas": 0},
+    "mappings": {"dynamic": "strict", "properties": {
+        "owner_id": {"type": "keyword"}, "visibility": {"type": "keyword"},
+        "state": {"type": "keyword"}, "cursor": {"type": "keyword"},
+        "queued": {"type": "integer"}, "error": {"type": "keyword", "ignore_above": 1024},
+        "lease_token": {"type": "keyword"}, "lease_until": {"type": "date"},
+        "created_at": {"type": "date"}, "finished_at": {"type": "date"}}}}
 MAX_ATTEMPTS = 4
 LEASE_SECONDS = 3600  # covers bounded extraction + 12 judgement calls at 120s each
 MAX_FACTS = 12
@@ -41,12 +50,17 @@ def _iso(value):
 
 
 def ensure_queue():
-    try:
-        es("GET", f"/{QUEUE}")
-    except RuntimeError as exc:
-        if "-> 404:" not in str(exc):
-            raise
-        es("PUT", f"/{QUEUE}", JOB_MAPPING)
+    for index, mapping in ((QUEUE, JOB_MAPPING), (BACKFILLS, BACKFILL_MAPPING)):
+        try:
+            es("GET", f"/{index}")
+        except RuntimeError as exc:
+            if "-> 404:" not in str(exc):
+                raise
+            try:
+                es("PUT", f"/{index}", mapping)
+            except RuntimeError as race:
+                if "-> 400:" not in str(race):
+                    raise
     try:
         es("GET", f"/{CACHE}")
     except RuntimeError as exc:
@@ -89,15 +103,24 @@ def status(owner_id):
             "drained": not (missing or counts.get("pending", 0) or counts.get("running", 0) or counts.get("failed", 0))}
 
 
-def claim(owner_id=None):
+def claim(owner_id=None, job_id=None):
     now = _now()
     response = es("POST", f"/{QUEUE}/_search", {"size": 20, "seq_no_primary_term": True,
         "sort": [{"next_at": {"order": "asc", "missing": "_last"}}], "query": {"bool": {"should": [
             {"bool": {"filter": [{"term": {"state": "pending"}}, {"range": {"next_at": {"lte": _iso(now)}}}]}},
             {"bool": {"filter": [{"term": {"state": "running"}}, {"range": {"lease_until": {"lte": _iso(now)}}}]}}
         ], "minimum_should_match": 1,
-        **({"filter": {"term": {"owner_id": owner_id}}} if owner_id else {})}}})
+        **({"filter": {"term": {"_id": job_id}}} if job_id else
+           {"filter": {"term": {"owner_id": owner_id}}} if owner_id else {})}}})
     for hit in response["hits"]["hits"]:
+        if not job_id:
+            # Generic workers must not process jobs from a scope whose backfill
+            # owns chronological extraction. The backfill runner claims its exact id.
+            active = es("POST", f"/{BACKFILLS}/_count", {"query": {"bool": {"filter": [
+                {"term": {"owner_id": hit["_source"]["owner_id"]}},
+                {"terms": {"state": ["pending", "running"]}}]}}})["count"]
+            if active:
+                continue
         token = uuid.uuid4().hex
         try:
             es("POST", f"/{QUEUE}/_update/{hit['_id']}?if_seq_no={hit['_seq_no']}&if_primary_term={hit['_primary_term']}&refresh=true",
@@ -265,8 +288,8 @@ def process(source_id, owner_id):
                 "params": {"owner": owner_id, "scope": source["visibility"], "newid": fact_id, "date": date}}})
 
 
-def run_once(owner_id=None):
-    claimed = claim(owner_id) if owner_id else claim()
+def run_once(owner_id=None, job_id=None):
+    claimed = claim(owner_id, job_id) if owner_id or job_id else claim()
     if claimed is None:
         return False
     job_id, job, token = claimed
@@ -296,12 +319,80 @@ def loop(owner_id=None):
             time.sleep(5)
 
 
-def backfill(owner_id, visibility, batch_size=200):
-    """Queue and drain each document head before its successor in this owner/scope."""
-    after = None
-    queued = 0
+def _backfill_id(owner_id, visibility):
+    return hashlib.sha256(f"{owner_id}\0{visibility}".encode()).hexdigest()
+
+
+def backfill(owner_id, visibility):
+    """Durably schedule a scope; repeated calls return the same job."""
+    if visibility not in ("private", "team", "common"):
+        raise ValueError("invalid visibility")
+    key = _backfill_id(owner_id, visibility)
+    try:
+        es("PUT", f"/{BACKFILLS}/_create/{key}?refresh=true", {
+            "owner_id": owner_id, "visibility": visibility, "state": "pending",
+            "queued": 0, "created_at": _iso(_now()), "error": ""})
+    except RuntimeError as exc:
+        if "-> 409:" not in str(exc):
+            raise
+    return backfill_status(owner_id, visibility)
+
+
+def backfill_status(owner_id, visibility):
+    try:
+        doc = es("GET", f"/{BACKFILLS}/_doc/{_backfill_id(owner_id, visibility)}")["_source"]
+    except RuntimeError as exc:
+        if "-> 404:" not in str(exc):
+            raise
+        return None
+    return {field: doc.get(field) for field in
+            ("owner_id", "visibility", "state", "queued", "error", "created_at", "finished_at")}
+
+
+def _update_backfill(key, token, **fields):
+    current = es("GET", f"/{BACKFILLS}/_doc/{key}")
+    if current["_source"].get("lease_token") != token or current["_source"]["state"] != "running":
+        raise RuntimeError("backfill lease lost")
+    es("POST", f"/{BACKFILLS}/_update/{key}?if_seq_no={current['_seq_no']}&if_primary_term={current['_primary_term']}&refresh=true",
+       {"doc": fields})
+
+
+def _heartbeat(key, token, stop):
+    while not stop.wait(30):
+        try:
+            _update_backfill(key, token, lease_until=_iso(_now() + dt.timedelta(seconds=LEASE_SECONDS)))
+        except Exception:
+            log.exception("backfill lease renewal failed: %s", key)
+            return
+
+
+def claim_backfill():
+    now = _iso(_now())
+    hits = es("POST", f"/{BACKFILLS}/_search", {"size": 30, "seq_no_primary_term": True,
+        "sort": [{"created_at": "asc"}], "query": {"bool": {"should": [
+            {"term": {"state": "pending"}},
+            {"bool": {"filter": [{"term": {"state": "running"}},
+                                  {"range": {"lease_until": {"lte": now}}}]}}],
+            "minimum_should_match": 1}}})["hits"]["hits"]
+    for hit in hits:
+        token = uuid.uuid4().hex
+        try:
+            es("POST", f"/{BACKFILLS}/_update/{hit['_id']}?if_seq_no={hit['_seq_no']}&if_primary_term={hit['_primary_term']}&refresh=true",
+               {"doc": {"state": "running", "lease_token": token,
+                        "lease_until": _iso(_now() + dt.timedelta(seconds=LEASE_SECONDS))}})
+            return hit["_id"], hit["_source"], token
+        except RuntimeError as exc:
+            if "-> 409:" not in str(exc):
+                raise
+    return None
+
+
+def _run_backfill(key, doc, token):
+    owner_id, visibility = doc["owner_id"], doc["visibility"]
+    after = json.loads(doc["cursor"]) if doc.get("cursor") else None
+    queued = doc.get("queued", 0)
     while True:
-        body = {"size": batch_size, "query": {"bool": {"filter": [
+        body = {"size": 1, "query": {"bool": {"filter": [
             {"term": {"owner_id": owner_id}}, {"term": {"visibility": visibility}},
             {"term": {"passage_index": 0}}, {"term": {"active": True}}]}},
             "sort": [{"occurred_at": "asc"}, {"_id": "asc"}]}
@@ -309,19 +400,55 @@ def backfill(owner_id, visibility, batch_size=200):
             body["search_after"] = after
         hits = es("POST", f"/{idx('episodic')}/_search", body)["hits"]["hits"]
         if not hits:
-            break
-        for hit in hits:
-            job_id = enqueue(owner_id, hit["_id"])
-            es("POST", f"/{idx('episodic')}/_update/{hit['_id']}?refresh=true",
-               {"doc": {"fact_requested": True}})
-            queued += 1
-            while True:
-                job = es("GET", f"/{QUEUE}/_doc/{job_id}")["_source"]
-                if job["state"] == "completed":
-                    break
-                if job["state"] == "failed":
-                    raise RuntimeError(f"backfill job failed: {job_id}: {job.get('error')}")
-                if not run_once(owner_id):
-                    time.sleep(1)
-        after = hits[-1]["sort"]
-    return {"owner_id": owner_id, "visibility": visibility, "queued": queued}
+            _update_backfill(key, token, state="completed", finished_at=_iso(_now()))
+            return
+        hit = hits[0]
+        job_id = enqueue(owner_id, hit["_id"])
+        es("POST", f"/{idx('episodic')}/_update/{hit['_id']}?refresh=true",
+           {"doc": {"fact_requested": True}})
+        while True:
+            job = es("GET", f"/{QUEUE}/_doc/{job_id}")["_source"]
+            if job["state"] == "completed":
+                break
+            if job["state"] == "failed":
+                raise RuntimeError(f"backfill job failed: {job_id}: {job.get('error')}")
+            if job["state"] == "pending" and job["next_at"] <= _iso(_now()):
+                run_once(owner_id, job_id)
+            else:
+                time.sleep(2)
+        after = hit["sort"]
+        queued += 1
+        _update_backfill(key, token, cursor=json.dumps(after), queued=queued)
+
+
+def run_backfill_once():
+    claimed = claim_backfill()
+    if claimed is None:
+        return False
+    key, doc, token = claimed
+    stop = threading.Event()
+    heartbeat = threading.Thread(target=_heartbeat, args=(key, token, stop), daemon=True)
+    heartbeat.start()
+    try:
+        _run_backfill(key, doc, token)
+    except Exception as exc:
+        log.exception("backfill %s failed", key)
+        try:
+            _update_backfill(key, token, state="failed", error=str(exc)[:900], finished_at=_iso(_now()))
+        except Exception:
+            log.exception("could not record backfill failure %s; lease will expire", key)
+    finally:
+        stop.set()
+        heartbeat.join(timeout=5)
+    return True
+
+
+def backfill_loop():
+    while True:
+        try:
+            if not run_backfill_once():
+                time.sleep(2)
+        except Exception:
+            log.exception("backfill worker poll failed")
+            time.sleep(5)
+
