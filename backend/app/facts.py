@@ -26,10 +26,11 @@ BACKFILL_MAPPING = {"settings": {"number_of_shards": 1, "number_of_replicas": 0}
 MAX_ATTEMPTS = 4
 LEASE_SECONDS = 3600  # covers bounded extraction + 12 judgement calls at 120s each
 # Backfill leases are reclaimed promptly after holder death: the heartbeat renews
-# every HEARTBEAT_SECONDS and sets the lease HEARTBEAT_SECONDS ahead only, so a
-# dead holder is claimable after ~HEARTBEAT_SECONDS + clock skew (worst case
-# ~30s + ES refresh lag), not a full LEASE_SECONDS. Job leases keep LEASE_SECONDS
-# (they are claimed by id and short-lived).
+# every HEARTBEAT_SECONDS and sets both the backfill lease AND the current job's
+# lease BACKFILL_LEASE_SECONDS ahead, so a dead holder (backfill or job) is
+# claimable after ~BACKFILL_LEASE_SECONDS (90s) + clock skew, assuming NTP-synced
+# hosts — not a full LEASE_SECONDS. Standalone job leases keep LEASE_SECONDS
+# (claimed by id, short-lived, outside backfill scopes).
 BACKFILL_LEASE_SECONDS = 90
 HEARTBEAT_SECONDS = 30
 # inner-loop no-progress limit: run_once attempts that change nothing
@@ -466,13 +467,50 @@ def _update_backfill(key, token, **fields):
        {"doc": fields})
 
 
-def _heartbeat(key, token, stop):
+def _heartbeat(key, token, stop, abort=None, current_job=None, job_lock=None):
+    """Renew the backfill lease AND the current job's lease (H1: both use the
+    short BACKFILL_LEASE_SECONDS horizon, renewed every HEARTBEAT_SECONDS, so a
+    dead holder — backfill or job — is recoverable in worst case
+    ~BACKFILL_LEASE_SECONDS + clock skew, assuming NTP-synced hosts).
+    On renewal failure: retry up to 2 more times within the interval; on final
+    failure set `abort` so _run_backfill exits visibly instead of running on."""
+    failures = 0
     while not stop.wait(HEARTBEAT_SECONDS):
         try:
-            _update_backfill(key, token, lease_until=_iso(_now() + dt.timedelta(seconds=BACKFILL_LEASE_SECONDS)))
+            _update_backfill(key, token,
+                             lease_until=_iso(_now() + dt.timedelta(
+                                 seconds=BACKFILL_LEASE_SECONDS)))
+            if current_job is not None and job_lock is not None:
+                with job_lock:
+                    job_id = current_job.get("id")
+                    job_token = current_job.get("token")
+                if job_id and job_token:
+                    _renew_job_lease(job_id, job_token)
+            failures = 0
         except Exception:
-            log.exception("backfill lease renewal failed: %s", key)
-            return
+            failures += 1
+            log.exception("backfill lease renewal failed (%d/3): %s", failures, key)
+            if failures >= 3:
+                if abort is not None:
+                    abort.set()
+                return
+
+
+def _renew_job_lease(job_id, token):
+    """Extend a job's lease to the short horizon iff we still hold its token."""
+    current = es("GET", f"/{QUEUE}/_doc/{job_id}")
+    if current["_source"].get("lease_token") != token:
+        return False
+    try:
+        es("POST", f"/{QUEUE}/_update/{job_id}?if_seq_no={current['_seq_no']}"
+                   f"&if_primary_term={current['_primary_term']}&refresh=true",
+           {"doc": {"lease_until": _iso(_now() + dt.timedelta(
+               seconds=BACKFILL_LEASE_SECONDS))}})
+        return True
+    except RuntimeError as exc:
+        if "-> 409:" not in str(exc):
+            raise
+        return False
 
 
 def claim_backfill():
@@ -496,12 +534,27 @@ def claim_backfill():
     return None
 
 
-def _run_backfill(key, doc, token):
+def _run_backfill(key, doc, token, abort=None, current_job=None, job_lock=None):
     owner_id, visibility = doc["owner_id"], doc["visibility"]
     after = json.loads(doc["cursor"]) if doc.get("cursor") else None
     queued = doc.get("queued", 0)
     no_progress = 0
+    lease_warned = False
+
+    def _track(job_id, job_token):
+        if current_job is not None and job_lock is not None:
+            with job_lock:
+                current_job["id"] = job_id
+                current_job["token"] = job_token
+
+    def _untrack():
+        if current_job is not None and job_lock is not None:
+            with job_lock:
+                current_job.pop("id", None)
+                current_job.pop("token", None)
     while True:
+        if abort is not None and abort.is_set():
+            raise RuntimeError(f"backfill {key}: heartbeat abort (lease renewal failed)")
         body = {"size": 1, "query": {"bool": {"filter": [
             {"term": {"owner_id": owner_id}}, {"term": {"visibility": visibility}},
             {"term": {"passage_index": 0}}, {"term": {"active": True}}]}},
@@ -514,55 +567,82 @@ def _run_backfill(key, doc, token):
             return
         hit = hits[0]
         job_id = enqueue(owner_id, hit["_id"])
+        _track(job_id, None)          # tracked before claim so the heartbeat can renew
         es("POST", f"/{idx('episodic')}/_update/{hit['_id']}?refresh=true",
            {"doc": {"fact_requested": True}})
         while True:
+            if abort is not None and abort.is_set():
+                raise RuntimeError(f"backfill {key}: heartbeat abort (lease renewal failed)")
             job = es("GET", f"/{QUEUE}/_doc/{job_id}")["_source"]
+            _track(job_id, job.get("lease_token"))
             if job["state"] == "completed":
                 break
             if job["state"] == "failed":
                 raise RuntimeError(f"backfill job failed: {job_id}: {job.get('error')}")
             now_dt = _now()
             lease_dt = _parse_iso(job.get("lease_until"))
+            before = (job["state"], job.get("lease_until"), job.get("attempts"))
             if job["state"] == "running" and lease_dt is None:
                 # a running job without a parsable lease is never "expired" —
-                # stealing it could double-process; wait and let its owner finish
-                log.warning("job %s running without parsable lease_until=%r; waiting",
-                            job_id, job.get("lease_until"))
+                # stealing it could double-process. It counts toward the no-progress
+                # abort so a permanently unleased job cannot stall the scope.
+                if not lease_warned:
+                    log.warning("job %s running without parsable lease_until=%r; waiting",
+                                job_id, job.get("lease_until"))
+                    lease_warned = True
+                no_progress += 1
+            elif job["state"] == "running" and lease_dt is not None and lease_dt > now_dt:
+                # Live-looking lease (H1). THIS holder's heartbeat renews its own
+                # job leases to the short horizon, so a lease still far in the
+                # future here belongs to a foreign holder: either alive (it will
+                # complete the job) or dead (the live incident — old code slept
+                # a full LEASE_SECONDS). Bounded: a job that never advances counts
+                # toward the no-progress abort; a live foreign holder finishing
+                # the job resets the counter via the state change.
+                no_progress += 1
+                if no_progress >= NO_PROGRESS_LIMIT:
+                    raise RuntimeError(
+                        f"backfill {key}: job {job_id} stuck under a foreign lease "
+                        f"with no progress after {no_progress} polls "
+                        f"(lease_until={job.get('lease_until')})")
                 time.sleep(2)
                 continue
-            if job["state"] == "pending" and _parse_iso(job["next_at"]) is not None \
+            elif job["state"] == "pending" and _parse_iso(job["next_at"]) is not None \
                     and _parse_iso(job["next_at"]) <= now_dt:
-                before = (job["state"], job.get("lease_until"), job.get("attempts"))
                 run_once(owner_id, job_id)
                 after_doc = es("GET", f"/{QUEUE}/_doc/{job_id}")["_source"]
-                after = (after_doc["state"], after_doc.get("lease_until"), after_doc.get("attempts"))
-                if after == before:
-                    no_progress += 1
-                else:
-                    no_progress = 0
+                after_state = (after_doc["state"], after_doc.get("lease_until"),
+                               after_doc.get("attempts"))
+                no_progress = no_progress + 1 if after_state == before else 0
             elif job["state"] == "running" and lease_dt is not None and lease_dt <= now_dt:
                 # orphaned running job (worker died mid-lease, e.g. a rollout):
                 # claim() re-runs expired leases by id; without this the scope
                 # sleeps forever while generic workers skip the active scope.
-                before = (job["state"], job.get("lease_until"), job.get("attempts"))
                 run_once(owner_id, job_id)
                 after_doc = es("GET", f"/{QUEUE}/_doc/{job_id}")["_source"]
-                after = (after_doc["state"], after_doc.get("lease_until"), after_doc.get("attempts"))
-                if after == before:
-                    no_progress += 1
-                else:
-                    no_progress = 0
+                after_state = (after_doc["state"], after_doc.get("lease_until"),
+                               after_doc.get("attempts"))
+                no_progress = no_progress + 1 if after_state == before else 0
+            elif job["state"] == "pending":
+                # unparsable/missing next_at on a pending job: count toward abort
+                if not lease_warned:
+                    log.warning("job %s pending without parsable next_at=%r",
+                                job_id, job.get("next_at"))
+                    lease_warned = True
+                no_progress += 1
             else:
-                time.sleep(2)
-                continue
+                no_progress += 1
             if no_progress >= NO_PROGRESS_LIMIT:
+                state_now = (es("GET", f"/{QUEUE}/_doc/{job_id}")["_source"]["state"]
+                             if job["state"] in ("pending", "running") else job["state"])
                 raise RuntimeError(
                     f"backfill {key}: job {job_id} made no progress after "
-                    f"{no_progress} run_once attempts (state={after_doc.get('state')})")
-            time.sleep(2)
+                    f"{no_progress} attempts (state={state_now})")
+            if no_progress:
+                time.sleep(2)      # M4: only sleep when the last round made no progress
         after = hit["sort"]
         queued += 1
+        _untrack()
         _update_backfill(key, token, cursor=json.dumps(after), queued=queued)
 
 
@@ -572,10 +652,16 @@ def run_backfill_once():
         return False
     key, doc, token = claimed
     stop = threading.Event()
-    heartbeat = threading.Thread(target=_heartbeat, args=(key, token, stop), daemon=True)
+    abort = threading.Event()
+    current_job = {}                 # {"id","token"} of the job this holder runs
+    job_lock = threading.Lock()
+    heartbeat = threading.Thread(
+        target=_heartbeat, args=(key, token, stop, abort, current_job, job_lock),
+        daemon=True)
     heartbeat.start()
     try:
-        _run_backfill(key, doc, token)
+        _run_backfill(key, doc, token, abort=abort,
+                      current_job=current_job, job_lock=job_lock)
     except Exception as exc:
         log.exception("backfill %s failed", key)
         try:
