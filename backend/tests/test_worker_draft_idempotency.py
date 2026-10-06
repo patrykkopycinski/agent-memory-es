@@ -11,10 +11,11 @@ import os
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+import _safety  # noqa: F401  (script path guard; conftest imports it too)
 
-from app import memory, mental_models as mm
+from app import memory, mental_models as mm, auth
 from app.store import es, idx, PREFIX
-from app.worker import _candidate_clusters
+from app.worker import _candidate_clusters, run_once  # noqa: F401
 
 O = "draftidem"
 
@@ -33,6 +34,8 @@ def _drafts(substr=""):
 
 # --- setup: clean owner, seed a rivendell cluster ---
 _wipe(O)
+# The owner must exist in the key store for run_once() to report it at all.
+auth.create_key(O)
 # Filler facts keep rivendell below the AMES_DRAFT_MAX_ENTITY_DF (0.3)
 # cutoff: with only the cluster facts, rivendell DF=1.0 and is (correctly)
 # skipped as noise. Idempotency is what this file tests, not clustering.
@@ -44,10 +47,8 @@ for t in ["Kafka consumer lag alerts page the on-call rotation",
           "Feature flags roll out gradually by cohort",
           "The CI pipeline caches pnpm stores between builds",
           "Incident reviews are blameless and written up",
-          "Mobile releases go through a staged rollout",
-          "The style guide bans magic numbers in layouts",
-          "Service meshes route internal traffic with mTLS",
-          "Data quality dashboards track freshness SLAs"]:
+          "Data quality dashboards track freshness SLAs",
+          "Runbooks are rehearsed before game days"]:
     memory.retain(O, "semantic", t)
 memory.retain(O, "semantic", "Rivendell deploys via GitHub Actions on main merge")
 memory.retain(O, "semantic", "Rivendell uses conventional commits scope config")
@@ -77,9 +78,23 @@ assert len(ds[0]["source_ids"]) >= 4, ds[0]["source_ids"]
 print("UPDATE-IN-PLACE: PASS", ds[0]["source_ids"])
 
 # --- run_once twice end-to-end, still no new drafts ---
+# run_once only proposes drafts when AMES_MODEL_DRAFTS is enabled — set it
+# around the calls (restored even on assertion failure) so this actually
+# exercises the worker's draft path and proves run_once reports the owner.
 from app import worker as wk
-wk.run_once()
-wk.run_once()
+_saved = os.environ.pop("AMES_MODEL_DRAFTS", None)
+try:
+    os.environ["AMES_MODEL_DRAFTS"] = "1"
+    s1 = wk.run_once()
+    wk.run_once()
+finally:
+    if _saved is None:
+        os.environ.pop("AMES_MODEL_DRAFTS", None)
+    else:
+        os.environ["AMES_MODEL_DRAFTS"] = _saved
+assert O in s1, f"run_once did not report seeded owner {O!r}: {sorted(s1)}"
+assert s1[O].get("model_drafts", 0) >= 1, \
+    f"run_once reported no drafts for {O} (flag not effective?): {s1[O]}"
 ds = _drafts("rivendell")
 assert len(ds) == 1, f"run_once duplicated drafts: {len(ds)}"
 print("RUN-ONCE-IDEMPOTENT: PASS")

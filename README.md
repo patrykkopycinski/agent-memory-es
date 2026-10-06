@@ -114,3 +114,15 @@ Deployed and in daily use (self-hosted): Hermes memory provider swapped in, MCP 
 ## License
 
 MIT
+
+## Mental-model drafts
+
+Drafts are gated by two knobs: a cluster-key entity needs at least
+`min_facts` (default 3) active semantic facts, and it must stay under the
+max document frequency `AMES_DRAFT_MAX_ENTITY_DF` (default 0.3) — i.e. the
+entity may appear on at most 30% of the owner's active semantic facts.
+
+Because of the DF cutoff, 3 cluster facts need at least 7 unrelated filler
+facts to stay under the 30% bar, so **an owner needs >= 10 active semantic
+facts before any model draft can appear** (3 cluster facts + 7 fillers);
+the first draft shows up at the next consolidation pass after that.

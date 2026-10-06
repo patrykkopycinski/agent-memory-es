@@ -11,6 +11,8 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+import _safety  # noqa: F401  (script path guard; conftest imports it too)
+
 from app import memory, mental_models as mm, auth
 from app.store import es, idx, PREFIX
 from app.worker import _candidate_clusters, run_once
@@ -177,6 +179,10 @@ print("DENYLIST: PASS")
 
 # --- run_once counts only status=='draft' returns --------------------------
 _seed(O)
+# Pre-existing rivendell draft (from _seed + a candidate pass below) is
+# covered by _already_covered, so propose_draft is called only for new
+# patterns — the fake below must be reached for counting to be exercised.
+os.environ["AMES_MODEL_DRAFTS"] = "1"
 
 
 class _FakeMM:
@@ -204,4 +210,5 @@ print("PROMOTED-IN-TIER: PASS")
 
 _wipe(O)
 _wipe(O2)
+os.environ.pop("AMES_MODEL_DRAFTS", None)  # no flag leak into later modules
 print("test_worker_drafts.py: ALL PASS")

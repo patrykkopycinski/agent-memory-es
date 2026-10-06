@@ -28,16 +28,16 @@ def known_owners() -> list:
 
 
 def _already_covered(owner: str, pattern: str) -> bool:
-    """Exact normalized match against the owner's OWN active models, or an
-    existing draft for the same pattern.
+    """Exact normalized match against the owner's OWN active models.
 
-    Deliberately NOT mm.match_model (BM25): every generated pattern shares
-    the 'facts and conventions' tail, so any visible active model would
-    BM25-match any pattern and suppress all proposals."""
+    An existing DRAFT is not coverage: the pattern must stay in the run so
+    propose_draft() refreshes it in place. Deliberately NOT mm.match_model
+    (BM25): every generated pattern shares the 'facts and conventions' tail,
+    so any visible active model would BM25-match any pattern and suppress
+    all proposals. Any lookup error fails CLOSED (never propose on
+    uncertainty)."""
     try:
-        if mm.find_models(owner, pattern, status="active"):
-            return True
-        return mm._find_existing_draft(owner, pattern) is not None
+        return bool(mm.find_models(owner, pattern, status="active"))
     except Exception:
         return True  # fail closed: never propose on uncertainty
 
@@ -65,10 +65,11 @@ def _candidate_clusters(owner: str, min_facts: int = 3) -> list:
         if _DRAFT_MAX_ENTITY_DF > 0 and b["doc_count"] / total > _DRAFT_MAX_ENTITY_DF:
             continue
         pattern = f"{ent.replace('_', ' ')} facts and conventions"
-        active_covered = mm.find_models(owner, pattern, status="active")
-        if active_covered:
-            continue  # curated model exists: never propose
-        already_drafted = mm._find_existing_draft(owner, pattern) is not None
+        if _already_covered(owner, pattern):
+            continue  # active model (or lookup error): never propose.
+            # NOTE: an existing DRAFT is deliberately not terminal coverage —
+            # the entity falls through to propose_draft(), which updates the
+            # draft in place (new cluster facts refresh it, no duplicates).
         fr = es("POST", f"/{idx('semantic')}/_search", {
             "size": 10,
             "query": {"bool": {"filter": [{"term": {"owner_id": owner}},
@@ -83,10 +84,8 @@ def _candidate_clusters(owner: str, min_facts: int = 3) -> list:
             f["text"][:80] for f in facts[:3])
         r = mm.propose_draft(owner, pattern, summary,
                              [f["id"] for f in facts])
-        # An already-drafted pattern is a refresh, not a new proposal.
-        r["_is_refresh"] = already_drafted
         proposals.append(r)
-    return [p for p in proposals]
+    return proposals
 
 
 def run_once() -> dict:
@@ -104,14 +103,12 @@ def run_once() -> dict:
                 drafts = []
         else:
             drafts = []
-        # Count only genuinely-new proposals that actually became drafts
-        # (refreshes of existing drafts and active returns don't count).
+        # Count only genuinely-new proposals (existing drafts are skipped
+        # entirely by _already_covered, and non-draft returns don't count).
         stats[owner] = {"proposals": len(plan.get("proposals", [])),
                         "superseded": applied.get("superseded", 0),
                         "model_drafts": sum(
-                            1 for d in drafts
-                            if d.get("status") == "draft"
-                            and not d.get("_is_refresh"))}
+                            1 for d in drafts if d.get("status") == "draft")}
     return stats
 
 
@@ -123,3 +120,10 @@ def run_forever(interval_s: int = 0):
         except Exception as e:  # noqa: BLE001 — worker must never die
             print(time.strftime("%H:%M:%S"), "worker error:", e, flush=True)
         time.sleep(interval_s)
+
+
+if __name__ == "__main__":
+    # docker-compose.yml / docker-compose.quickstart.yml run
+    # `python -m app.worker`: without this entry the module imports, exits 0,
+    # and the container crash-loops under `restart: unless-stopped`.
+    run_forever()

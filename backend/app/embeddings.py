@@ -8,7 +8,13 @@ import json
 import os
 import urllib.request
 
-ES_URL = os.environ.get("AMES_ES_URL", "http://localhost:9268")
+_raw_es_url = os.environ.get("AMES_ES_URL")
+if not _raw_es_url:
+    raise RuntimeError(
+        "AMES_ES_URL is not set. Refusing to guess an Elasticsearch target "
+        "(the old default localhost:9268 is the PROD tunnel). Set it "
+        "explicitly — e.g. http://localhost:9200 or http://ames-es:9200.")
+ES_URL = _raw_es_url
 ES_ENDPOINT = os.environ.get("AMES_ES_INFERENCE", ".multilingual-e5-small-elasticsearch")
 OR_BASE = os.environ.get("AMES_EMBED_BASE", "http://localhost:20128/v1")
 OR_MODEL = os.environ.get("AMES_EMBED_MODEL", "openrouter/google/gemini-embedding-2")
