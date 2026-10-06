@@ -19,7 +19,7 @@ Thin HTTP wrapper over the AMES REST API; adds no ranking/dedup logic and does n
 Scope is the key identity: the key decides the private bank (`owner_id`) and which team/common
 memories are visible. `visibility` on `memory_recall` only *narrows* results to private/team/common.
 The backend recall API has no visibility parameter, so the filter is applied in this server after
-fetching the top 50 hits (backend max) when a filter is set; a narrow filter on a sparse bank can return fewer than k, and the response then carries a best-effort `note` when matches may exist below the scanned window.
+fetching the top 50 hits (backend max) when a filter is set; a narrow filter on a sparse bank can return fewer than k, and the response carries a best-effort `note` (with the hint to narrow the query or drop the filter) when matches may exist below the scanned window.
 `memory_retain` passes `visibility` through (default `private`); team/common are shared with others,
 so enable writes deliberately.
 

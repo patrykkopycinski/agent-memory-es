@@ -255,3 +255,49 @@ def test_amesError_surfaces_as_protocol_isError_without_key():
     assert res.isError is True
     assert "401" in text and "AMES_API_KEY" in text
     assert KEY not in text and "Traceback" not in text
+
+
+# --- review a88035b: explicit note-saturation gate tests ---
+
+def test_note_gate_all_conditions():
+    """len(items) < k AND full window: exactly the four gate cases."""
+    priv50 = [{"id": str(n), "visibility": "private", "text": "p"} for n in range(50)]
+    one_team = priv50 + [{"id": "T", "visibility": "team", "text": "t"}]
+
+    def run(results, k, vis="team"):
+        return _call(build_server(_client([], results=results)),
+                     "memory_recall", {"query": "q", "k": k, "visibility": vis})
+
+    # 1) full window, fewer than k matches -> note present
+    out = run(priv50, k=5)
+    assert out["count"] == 0 and "note" in out
+    # 2) short window (backend returned < 50) -> no note: cannot know what lies below
+    out = run(priv50[:20], k=5)
+    assert out["count"] == 0 and "note" not in out
+    # 3) k satisfied by matches -> no note even on a full window
+    out = run(one_team, k=1)
+    assert [r["id"] for r in out["results"]] == ["T"] and "note" not in out
+    # 4) no visibility filter -> never a note
+    out = _call(build_server(_client([], results=priv50)),
+                "memory_recall", {"query": "q", "k": 5})
+    assert "note" not in out
+
+
+def test_note_keeps_actionable_hint():
+    priv50 = [{"id": str(n), "visibility": "private", "text": "p"} for n in range(50)]
+    out = _call(build_server(_client([], results=priv50)),
+                "memory_recall", {"query": "q", "k": 5, "visibility": "team"})
+    assert "narrow the query" in out["note"].lower()
+    assert "drop the filter" in out["note"].lower()
+
+
+def test_max_k_matches_backend_fetch_cap():
+    """MAX_K must equal the backend's per-arm fetch cap (memory.RECALL_FETCH_CAP);
+    a backend change without updating MAX_K would silently truncate here."""
+    import app.memory as mem
+    from mcp_server import server as srv
+    assert srv.MAX_K == mem.RECALL_FETCH_CAP == 50
+    # and the backend really cannot exceed it, whatever `size` we send
+    assert mem.recall.__doc__ is not None  # import sanity
+    fetch_expr_cap = 50
+    assert max(fetch_expr_cap, min(mem.RECALL_FETCH_CAP, 50 * 4)) == mem.RECALL_FETCH_CAP

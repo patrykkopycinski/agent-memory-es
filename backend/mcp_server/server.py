@@ -21,7 +21,10 @@ from .client import AmesClient, AmesError
 Visibility = Literal["private", "team", "common"]
 Kind = Literal["episodic", "semantic", "procedural"]
 
-MAX_K = 50  # client-side ceiling on k and the filtered over-fetch (matches the backend size cap)
+# Client-side ceiling on k and the filtered over-fetch. Verified against the backend:
+# memory.recall caps every arm at RECALL_FETCH_CAP = 50, so asking for more than 50 can
+# never return more. If the backend cap changes, this must track it.
+MAX_K = 50
 _TRUE = {"1", "true", "yes", "on"}
 
 # fields of a recalled item worth sending to the model (drops embeddings, rrf internals)
@@ -75,7 +78,8 @@ def build_server(client: AmesClient, allow_write: bool = False,
                "abstained": bool(resp.get("abstained"))}
         if visibility is not None and len(items) < k and scanned >= MAX_K:
             out["note"] = (f"best effort: visibility filter applied to the top {scanned} "
-                           f"backend hits; more '{visibility}' matches may exist below that.")
+                           f"backend hits; more '{visibility}' matches may exist below that. "
+                           "Narrow the query, or drop the filter and filter client-side.")
         if resp.get("mental_model"):
             out["mental_model"] = resp["mental_model"]
         return out
