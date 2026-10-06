@@ -13,6 +13,9 @@ HTTP / curl ──┘   (auth · ops · worker)           └─ procedural (pla
 ```bash
 # 1. everything up (ES + API + worker, named volumes):
 cd backend && docker compose -f docker-compose.quickstart.yml up -d
+# 1b. host-side tools (importer, doctor) talk to the compose ES — NEVER to
+#     :9268, which may be an ssh tunnel to someone's PROD cluster:
+export AMES_ES_URL=http://localhost:19200
 # 2. mint a key:
 curl -X POST -H 'X-Admin-Token: dev-admin' \
   'http://localhost:8123/admin/keys?owner_id=you'
@@ -54,7 +57,7 @@ Beyond the hybrid core:
 - **Temporal arm** — time expressions in queries ("last 3 months", "in 2024") parse into a window, filled spread across equal buckets so results aren't all from one end.
 - **Reranker** — ES-native `_inference` rerank endpoint; honest fallback (`reranked: false`) when model/license unavailable — never faked.
 - **Reflect multi-round** — bounded LLM query rewrites extend evidence before synthesis; mental-model tier consulted first.
-- **Mental models** — curated summaries for frequent questions, matched by BM25 on question pattern, surfaced as a priority tier in recall and reflect. `POST /memory/models`.
+- **Mental models** — curated summaries for frequent questions, matched by BM25 on question pattern, surfaced as a priority tier in recall and reflect. `POST /memory/models`. Worker draft proposals are off by default; set `AMES_MODEL_DRAFTS=1` (or `true`) to enable. Drafts are idempotent per (owner, pattern) — one draft, refreshed in place, never auto-promoted. `AMES_DRAFT_MAX_ENTITY_DF` (default `0.3`) caps cluster entities at that fraction of the owner’s active facts — entities appearing on more facts (extraction artifacts like `memory`/`facts`/`conventions`) are skipped as cluster keys.
 
 ## Landing page
 
@@ -107,6 +110,18 @@ docs/       architecture, decision records, diagrams
 scripts/    doctor, importers, MCP bridge, seed, isolation tests
 ```
 
+## Mental-model drafts
+
+Drafts are gated by two knobs: a cluster-key entity needs at least
+`min_facts` (default 3) active semantic facts, and it must stay under the
+max document frequency `AMES_DRAFT_MAX_ENTITY_DF` (default 0.3) — i.e. the
+entity may appear on at most 30% of the owner's active semantic facts.
+
+Because of the DF cutoff, 3 cluster facts need at least 7 unrelated filler
+facts to stay under the 30% bar, so **an owner needs >= 10 active semantic
+facts before any model draft can appear** (3 cluster facts + 7 fillers);
+the first draft shows up at the next consolidation pass after that.
+
 ## Status
 
 Deployed and in daily use (self-hosted): Hermes memory provider swapped in, MCP farm workers onboarded, consolidation worker running. API surface is small and stable; consolidation and reflect are evolving. History: docs/PHASE0_PLAN.md, docs/AUDIT.md.
@@ -114,3 +129,4 @@ Deployed and in daily use (self-hosted): Hermes memory provider swapped in, MCP 
 ## License
 
 MIT
+

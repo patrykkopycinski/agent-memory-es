@@ -5,7 +5,23 @@ import urllib.error
 import urllib.request
 from typing import Any, Optional
 
-ES_URL = os.environ.get("AMES_ES_URL", "http://localhost:9268")
+_NO_ES_URL_MSG = (
+    "AMES_ES_URL is not set. Refusing to guess an Elasticsearch target "
+    "(the old default localhost:9268 is the PROD tunnel). Set it "
+    "explicitly — e.g. http://localhost:9200 or http://ames-es:9200.")
+
+
+def _es_url() -> str:
+    """Lazily resolved AMES_ES_URL.
+
+    Checked per request, NOT at import time: an import-time check breaks
+    mocked tests (mcp_server) that never touch ES. Any actual request
+    without the env var still fails before a connection is attempted.
+    """
+    url = os.environ.get("AMES_ES_URL")
+    if not url:
+        raise RuntimeError(_NO_ES_URL_MSG)
+    return url
 API_KEYS_FILE = os.environ.get("AMES_API_KEYS_FILE", os.path.join(os.path.dirname(__file__), "..", "data", "api_keys.json"))
 # Test isolation: prefix all indices (e.g. amtest_) so suites never read/write
 # the live cluster's shared data. Empty in production.
@@ -44,10 +60,53 @@ MAPPINGS = {
 }
 
 
+# Cluster-level APIs the suite actually uses; everything else under /_ is
+# refused (bulk APIs like _bulk/_reindex/_aliases/_mget/_delete_by_query can
+# hit any index and are not needed under the guard).
+_ALLOWED_CLUSTER_APIS = (
+    "_cat", "_cluster", "_inference",
+    # read-only cross-index ops used by tools/diagnostics:
+    "_stats", "_nodes",
+)
+
+
+def _guard_path(path: str, method: str) -> None:
+    """Under tests (AMES_TEST_GUARD=1, set by tests/conftest.py and
+    tests/_safety.py): refuse any request that could touch non-test data.
+    Every comma-separated index name is checked; wildcards and _all are
+    refused; cluster-level APIs pass only if allowlisted AND read-only."""
+    p = path.split("?", 1)[0].lstrip("/")
+    if p == "":
+        return
+    if p.startswith("_"):
+        first = p.split("/", 1)[0]
+        if method not in ("GET", "HEAD"):
+            raise RuntimeError(
+                f"ES test guard: refusing {method} {path} — cluster-level "
+                "writes are not allowed under the test guard")
+        if not first.startswith(_ALLOWED_CLUSTER_APIS):
+            raise RuntimeError(
+                f"ES test guard: refusing {method} {path} — cluster API "
+                f"{first!r} is not in the test allowlist {_ALLOWED_CLUSTER_APIS}")
+        return
+    for index in p.split("/", 1)[0].split(","):
+        if index == "_all" or "*" in index:
+            raise RuntimeError(
+                f"ES test guard: refusing {method} {path} — wildcard or "
+                f"_all index {index!r} not allowed under the test guard")
+        if not index.startswith(PREFIX):
+            raise RuntimeError(
+                f"ES test guard: refusing {method} {path} — index {index!r} "
+                f"does not start with required test prefix {PREFIX!r}. This "
+                "would hit non-test data; check AMES_INDEX_PREFIX.")
+
+
 def es(method: str, path: str, body: Optional[dict] = None) -> dict:
+    if os.environ.get("AMES_TEST_GUARD") == "1":
+        _guard_path(path, method)
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(
-        ES_URL + path, data=data, method=method,
+        _es_url() + path, data=data, method=method,
         headers={"Content-Type": "application/json"},
     )
     try:

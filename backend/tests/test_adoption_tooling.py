@@ -9,6 +9,7 @@ import pytest
 
 REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 SCRIPTS = os.path.join(REPO, "scripts")
+import _safety  # noqa: F401  (script-path guard: conftest bypass)
 
 
 def _load(name):

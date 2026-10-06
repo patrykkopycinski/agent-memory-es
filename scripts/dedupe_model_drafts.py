@@ -21,7 +21,7 @@ import urllib.error
 import urllib.request
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "backend"))
-from app.store import ES_URL, es, PREFIX  # noqa: E402
+from app.store import es, PREFIX, _es_url  # noqa: E402
 
 INDEX = f"{PREFIX}am_models"
 
@@ -76,7 +76,7 @@ def main() -> int:
         hits = [h for h in hits if h["_source"]["owner_id"] == args.owner]
     p = plan_dedupe(hits)
 
-    print(f"ES: {ES_URL}  index: {INDEX}")
+    print(f"ES: {_es_url()}  index: {INDEX}")
     print(f"drafts scanned: {p['total_drafts']}  distinct (owner, pattern): {p['keep']}  "
           f"duplicates: {len(p['delete'])}")
     for (owner, pattern), n in sorted(p["groups"].items()):
