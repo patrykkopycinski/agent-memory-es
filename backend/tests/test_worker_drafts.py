@@ -148,7 +148,11 @@ print("COVER-OWN-MODELS-ONLY: PASS")
 
 # --- DF cutoff: entity on 100% of facts → no draft -------------------------
 _wipe(O)
-_filler(O, n=5)  # only 'filler/topic' entities, DF = 1.0
+for t in ["Omnipresent tool runs everywhere in depot one",
+          "Omnipresent tool runs everywhere in depot two",
+          "Omnipresent tool runs everywhere in depot three",
+          "Omnipresent tool runs everywhere in depot four"]:
+    memory.retain(O, "semantic", t)  # 'omnipresent'/'tool' on 100% of facts
 d = _candidate_clusters(O, min_facts=3)
 assert not d, d
 print("DF-100PCT-NO-DRAFT: PASS")
