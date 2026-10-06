@@ -66,7 +66,7 @@ def chat_json(system: str, user: str, timeout: int = 120) -> dict:
         "model": MODEL, "temperature": 0,
         "response_format": {"type": "json_object"},
         "messages": [{"role": "system", "content": system},
-                     {"role": "user", "content": user}],
+                     {"role": "user", "content": "Return a json object.\n\n" + user}],
     }).encode()
     req = urllib.request.Request(BASE + "/chat/completions", data=body, method="POST",
                                  headers={"Content-Type": "application/json",

@@ -84,6 +84,25 @@ def test_endpoint_auth_and_owner_forwarding():
         retry.assert_called_once_with('alice', 'private')
 
 
+def test_chat_json_puts_json_instruction_in_user_message():
+    class Response:
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            pass
+
+    payload = {'choices': [{'finish_reason': 'stop', 'message': {'content': '{"ok":true}'}}]}
+    with patch.object(llm.urllib.request, 'urlopen', return_value=Response()) as send, \
+         patch.object(llm.json, 'load', return_value=payload):
+        assert llm.chat_json('system', 'original user text') == {'ok': True}
+    request = send.call_args.args[0]
+    messages = json.loads(request.data)['messages']
+    assert messages[0] == {'role': 'system', 'content': 'system'}
+    assert 'json' in messages[1]['content'].lower()
+    assert messages[1]['content'].endswith('original user text')
+    assert messages[1]['role'] == 'user'
+
+
 def test_malformed_json_metadata_never_contains_content_or_parser_doc():
     class Response:
         def __enter__(self):
