@@ -25,6 +25,28 @@ BACKFILL_MAPPING = {"settings": {"number_of_shards": 1, "number_of_replicas": 0}
         "created_at": {"type": "date"}, "finished_at": {"type": "date"}}}}
 MAX_ATTEMPTS = 4
 LEASE_SECONDS = 3600  # covers bounded extraction + 12 judgement calls at 120s each
+# Backfill leases are reclaimed promptly after holder death: the heartbeat renews
+# every HEARTBEAT_SECONDS and sets the lease HEARTBEAT_SECONDS ahead only, so a
+# dead holder is claimable after ~HEARTBEAT_SECONDS + clock skew (worst case
+# ~30s + ES refresh lag), not a full LEASE_SECONDS. Job leases keep LEASE_SECONDS
+# (they are claimed by id and short-lived).
+BACKFILL_LEASE_SECONDS = 90
+HEARTBEAT_SECONDS = 30
+# inner-loop no-progress limit: run_once attempts that change nothing
+NO_PROGRESS_LIMIT = 30
+
+
+def _parse_iso(value):
+    """Parse a stored ISO timestamp to an aware UTC datetime, or None."""
+    if not value:
+        return None
+    try:
+        stamp = dt.datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=dt.timezone.utc)
+    return stamp.astimezone(dt.timezone.utc)
 MAX_FACTS = 12
 MAX_FACT_CHARS = 320
 PROMPT_VERSION = "document-v2"
@@ -268,8 +290,8 @@ def _replacement_ids(owner, visibility, vector, text, date):
                 "future" if isinstance(i, str) and any(
                     h["_id"] == i and h["_source"].get("valid_from", "") > date
                     for h in candidates) else "unknown")
-            log.warning("supersession dropped id: fact=%r id=%r reason=%s",
-                        text[:80], i, reason)
+            log.warning("supersession dropped id: fact_sha=%s id=%r reason=%s",
+                        hashlib.sha256(text.encode()).hexdigest()[:12], i, reason)
     return list(dict.fromkeys(kept))
 
 
@@ -445,9 +467,9 @@ def _update_backfill(key, token, **fields):
 
 
 def _heartbeat(key, token, stop):
-    while not stop.wait(30):
+    while not stop.wait(HEARTBEAT_SECONDS):
         try:
-            _update_backfill(key, token, lease_until=_iso(_now() + dt.timedelta(seconds=LEASE_SECONDS)))
+            _update_backfill(key, token, lease_until=_iso(_now() + dt.timedelta(seconds=BACKFILL_LEASE_SECONDS)))
         except Exception:
             log.exception("backfill lease renewal failed: %s", key)
             return
@@ -466,7 +488,7 @@ def claim_backfill():
         try:
             es("POST", f"/{BACKFILLS}/_update/{hit['_id']}?if_seq_no={hit['_seq_no']}&if_primary_term={hit['_primary_term']}&refresh=true",
                {"doc": {"state": "running", "lease_token": token,
-                        "lease_until": _iso(_now() + dt.timedelta(seconds=LEASE_SECONDS))}})
+                        "lease_until": _iso(_now() + dt.timedelta(seconds=BACKFILL_LEASE_SECONDS))}})
             return hit["_id"], hit["_source"], token
         except RuntimeError as exc:
             if "-> 409:" not in str(exc):
@@ -478,6 +500,7 @@ def _run_backfill(key, doc, token):
     owner_id, visibility = doc["owner_id"], doc["visibility"]
     after = json.loads(doc["cursor"]) if doc.get("cursor") else None
     queued = doc.get("queued", 0)
+    no_progress = 0
     while True:
         body = {"size": 1, "query": {"bool": {"filter": [
             {"term": {"owner_id": owner_id}}, {"term": {"visibility": visibility}},
@@ -499,16 +522,45 @@ def _run_backfill(key, doc, token):
                 break
             if job["state"] == "failed":
                 raise RuntimeError(f"backfill job failed: {job_id}: {job.get('error')}")
-            now = _iso(_now())
-            if job["state"] == "pending" and job["next_at"] <= now:
+            now_dt = _now()
+            lease_dt = _parse_iso(job.get("lease_until"))
+            if job["state"] == "running" and lease_dt is None:
+                # a running job without a parsable lease is never "expired" —
+                # stealing it could double-process; wait and let its owner finish
+                log.warning("job %s running without parsable lease_until=%r; waiting",
+                            job_id, job.get("lease_until"))
+                time.sleep(2)
+                continue
+            if job["state"] == "pending" and _parse_iso(job["next_at"]) is not None \
+                    and _parse_iso(job["next_at"]) <= now_dt:
+                before = (job["state"], job.get("lease_until"), job.get("attempts"))
                 run_once(owner_id, job_id)
-            elif job["state"] == "running" and job.get("lease_until", "") <= now:
+                after_doc = es("GET", f"/{QUEUE}/_doc/{job_id}")["_source"]
+                after = (after_doc["state"], after_doc.get("lease_until"), after_doc.get("attempts"))
+                if after == before:
+                    no_progress += 1
+                else:
+                    no_progress = 0
+            elif job["state"] == "running" and lease_dt is not None and lease_dt <= now_dt:
                 # orphaned running job (worker died mid-lease, e.g. a rollout):
                 # claim() re-runs expired leases by id; without this the scope
                 # sleeps forever while generic workers skip the active scope.
+                before = (job["state"], job.get("lease_until"), job.get("attempts"))
                 run_once(owner_id, job_id)
+                after_doc = es("GET", f"/{QUEUE}/_doc/{job_id}")["_source"]
+                after = (after_doc["state"], after_doc.get("lease_until"), after_doc.get("attempts"))
+                if after == before:
+                    no_progress += 1
+                else:
+                    no_progress = 0
             else:
                 time.sleep(2)
+                continue
+            if no_progress >= NO_PROGRESS_LIMIT:
+                raise RuntimeError(
+                    f"backfill {key}: job {job_id} made no progress after "
+                    f"{no_progress} run_once attempts (state={after_doc.get('state')})")
+            time.sleep(2)
         after = hit["sort"]
         queued += 1
         _update_backfill(key, token, cursor=json.dumps(after), queued=queued)

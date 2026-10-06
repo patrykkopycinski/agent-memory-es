@@ -45,19 +45,6 @@ def test_A3_non_list_still_raises(monkeypatch):
 
 
 # ---------------------------------------------------------------- B: backfill lease recovery
-class FakeJobs:
-    """One expired-running job then completion; records run_once calls by id."""
-    def __init__(self, state, lease_until, next_at, attempts=0):
-        self.state = state
-        self.lease_until = lease_until
-        self.next_at = next_at
-        self.calls = []
-
-    def job(self, job_id):
-        return {"state": self.state, "lease_until": self.lease_until,
-                "next_at": self.next_at, "attempts": self.attempts}
-
-
 def _backfill_with_job(monkeypatch, job_state, lease_until):
     ran = []
     seq = {"step": 0}
