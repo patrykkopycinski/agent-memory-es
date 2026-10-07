@@ -13,7 +13,7 @@ set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/../../.." && pwd)"
 COMPOSE="$ROOT/backend/docker-compose.yml"
-VM_OVERRIDE="${AMES_VM_OVERRIDE:-/opt/orca-base/work/ames-vm/docker-compose.vm.yml}"
+VM_OVERRIDE="${AMES_VM_OVERRIDE:?set AMES_VM_OVERRIDE to the compose override file (e.g. docker-compose.vm.yml)}"
 
 if [ -z "${MUT_SUITE_CMD:-}" ]; then
   MUT_SUITE_CMD="sg docker -c \"docker compose -f $COMPOSE -f $VM_OVERRIDE run --rm --no-deps -v $ROOT:/srv -w /srv/backend ames-backend python -m pytest tests/test_tagfilter_pure.py tests/test_tag_filtering.py -q\""

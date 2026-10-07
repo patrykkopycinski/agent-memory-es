@@ -1,6 +1,6 @@
 """Tag filtering for recall: normalisation, label-group extraction, filter compilation, fuzzy resolution.
 
-Decision record: /opt/orca-base/tasks/ames-filtering-decision.md (written before this code).
+Decision record written before this code (design notes live in docs/).
 
 Everything here is GENERIC. There are no default label groups, no label wording and no domain
 vocabulary in this module: callers declare the label groups they want extracted (`labels` on

@@ -29,7 +29,7 @@ SHOULD_BLOCK = [
     "Elastic credentials: user elastic pwd changeme-secret",
 ]
 SHOULD_ALLOW = [
-    "Team convention: evals run on Azure VMs via suite_sweep.py",
+    "Team convention: evals run on Azure VMs via suite_runner.py",
     "Kibana dev boots with --no-base-path always",
     "Never force-push PR branches",
     "The deslop gate runs before every push",

@@ -24,11 +24,11 @@ auth.create_key("w1")
 auth.create_key("w2")
 memory.retain("w1", "semantic", "Python toolchain for repo gates is python3.12 venv")
 _seed("w1", "Python toolchain for repo gates is python3.12 venv")
-memory.retain("w2", "semantic", "Worker two note: git identity uses committer contact@patrykkopycinski.com")
+memory.retain("w2", "semantic", "Worker two note: git identity uses committer dev@example.com")
 
 stats = run_once()  # now proposes + applies
 assert "w1" in stats and "w2" in stats, stats
 assert stats["w1"]["superseded"] >= 1, stats  # duplicate w1 fact superseded
 hits = memory.recall("w2", "git identity committer email")["fused"]
-assert any("contact@patrykkopycinski.com" in h["text"] for h in hits), hits
+assert any("dev@example.com" in h["text"] for h in hits), hits
 print("WORKER: PASS", stats)

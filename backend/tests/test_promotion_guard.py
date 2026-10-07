@@ -12,8 +12,8 @@ try:
     raise AssertionError("promotion should have been blocked")
 except ValueError as e:
     assert "sensitive marker" in str(e), e
-ok = memory.retain("g1", "semantic", "Team convention: evals run via suite_sweep.py on Azure")
-doc2 = memory.retain("g1", "semantic", "Team convention: evals run via suite_sweep.py on Azure VMs always")
+ok = memory.retain("g1", "semantic", "Team convention: evals run via suite_runner.py on Azure")
+doc2 = memory.retain("g1", "semantic", "Team convention: evals run via suite_runner.py on Azure VMs always")
 p = memory.promote("g1", "semantic", doc2["_id"], "common")
 assert "promoted_id" in p, p
 print("PROMOTION-GUARD: PASS")

@@ -97,7 +97,7 @@ LLM down → silent single-pass degrade.
 ### Mental models
 
 ```sh
-curl -X POST $AMES/memory/models -H "$AUTH" -d '{"question_pattern":"where do we run evals","summary":"Azure VMs via suite_sweep.py, never local Mac"}'
+curl -X POST $AMES/memory/models -H "$AUTH" -d '{"question_pattern":"where do we run evals","summary":"Azure VMs via suite_runner.py, never local workstation"}'
 ```
 
 Write the canonical answer once for questions you answer weekly; recall and

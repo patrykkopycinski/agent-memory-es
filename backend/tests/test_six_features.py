@@ -57,7 +57,7 @@ def test_pages():
 
 
 def test_mental_models():
-    mm.upsert_model(O, "evals always run where", "Evals always run on Azure VMs via suite_sweep.py, never local Mac.")
+    mm.upsert_model(O, "evals always run where", "Evals always run on Azure VMs via suite_runner.py, never the local workstation.")
     m = mm.match_model(O, "where do we run evals?")
     assert m and "Azure" in m["summary"], m
     res = memory.recall(O, "where do we run evals")

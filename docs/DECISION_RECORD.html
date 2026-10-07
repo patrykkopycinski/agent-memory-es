@@ -64,7 +64,7 @@ a{color:var(--accent)}
 <h2>4. Phased plan (shape)</h2>
 <table>
 <tr><th>Phase</th><th>Delivers</th><th>Exit gate</th></tr>
-<tr><td>0 — Spike</td><td>atlas-memory-demo on m1max docker ES; Hermes hindsight-provider contract extracted</td><td>retain→recall round-trip from a script; DLS leak test: user B key cannot recall user A doc</td></tr>
+<tr><td>0 — Spike</td><td>atlas-memory-demo on a self-hosted docker ES; Hermes hindsight-provider contract extracted</td><td>retain→recall round-trip from a script; DLS leak test: user B key cannot recall user A doc</td></tr>
 <tr><td>1 — Port</td><td>Hermes memory provider → atlas (retain/recall/reflect); config: bank per Hermes profile</td><td>Hindsight parity harness: 50 known Q/A from current bank recalled via new stack, ≥0.85 hit rate; Hindsight daemon idled on one profile for a week, zero regressions</td></tr>
 <tr><td>2 — Farm + share</td><td>MCP endpoint; per-agent API keys (coding farm workers); visibility field + promotion flow + team bank</td><td>coding-farm worker retains and recalls through MCP; cross-user leak test suite green; common bank answers a question none of the individuals stored whole</td></tr>
 <tr><td>3 — Intelligence gaps</td><td>reflect agentic loop; knowledge pages + markdown sync; graph-arm mitigation; OpenAPPA guard spike</td><td>per-gap eval: reflect answers ≥ Hindsight reflect on frozen question set (gemini-3-1-pro judge, per standing eval doctrine); OpenAPPA gate per D3</td></tr>
@@ -72,7 +72,7 @@ a{color:var(--accent)}
 
 <h2>5. Open questions</h2>
 <div class="card q"><b>OQ-1 Base strategy (D1) &amp; contract (D4).</b> Unblocker: user answers the two flagged decisions (or "accept recommendations"). Nothing in Phase 0 depends on them.</div>
-<div class="card q"><b>OQ-2 ES license.</b> DLS is Platinum. Self-hosted basic license lacks DLS → isolation falls back to app-level API-key→filter middleware (weaker, tested by same leak suite). Unblocker: confirm whether the m1max/self-hosted ES runs Platinum (or Elastic-licensed) or we accept the middleware fallback.</div>
+<div class="card q"><b>OQ-2 ES license.</b> DLS is Platinum. Self-hosted basic license lacks DLS → isolation falls back to app-level API-key→filter middleware (weaker, tested by same leak suite). Unblocker: confirm whether the self-hosted ES runs Platinum (or Elastic-licensed) or we accept the middleware fallback.</div>
 <div class="card q"><b>OQ-3 Graph arm.</b> Is 2-hop entity recall ever load-bearing for a coding farm? If yes: Neo4j sidecar vs entity-expansion approximation — decide on measured delta, not vibes. Unblocker: replay 100 real recall queries from the current Hindsight bank, count how many were answered only via the graph arm.</div>
 <div class="card q"><b>OQ-4 ES 9.6.</b> No public 9.6 yet (verified). Re-check release notes at Phase-1 start for anything that deletes app-layer work (workflows/inference changes). Unblocker: time; also query Elastic-internal roadmap via work channels (you are Elastic).</div>
 

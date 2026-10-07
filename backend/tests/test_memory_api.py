@@ -46,14 +46,14 @@ def test_own_private_recall():
 
 
 def test_common_shared():
-    _retain(ALICE, text="Team eval convention: suite_sweep.py on Azure VMs always", visibility="common")
-    r = client.post("/memory/recall", headers=H(BOB), json={"query": "eval convention suite_sweep Azure"})
-    assert any("suite_sweep" in h["text"] for h in r.json()["fused"])
+    _retain(ALICE, text="Team eval convention: suite_runner.py on Azure VMs always", visibility="common")
+    r = client.post("/memory/recall", headers=H(BOB), json={"query": "eval convention suite_runner Azure"})
+    assert any("suite_runner" in h["text"] for h in r.json()["fused"])
 
 
 def test_team_shared():
-    _retain(ALICE, text="m1max RAM ledger threshold warn at 9450MB", visibility="team")
-    r = client.post("/memory/recall", headers=H(BOB), json={"query": "m1max RAM ledger threshold"})
+    _retain(ALICE, text="build-host RAM ledger threshold warn at 9450MB", visibility="team")
+    r = client.post("/memory/recall", headers=H(BOB), json={"query": "build-host RAM ledger threshold"})
     assert any("9450" in h["text"] for h in r.json()["fused"])
 
 
@@ -83,7 +83,7 @@ def test_consolidate_supersession():
 
 
 def test_reflect_no_llm():
-    _retain(ALICE, text="Hermes runs on the local Mac plus remote m1max host")
+    _retain(ALICE, text="Hermes runs on the local workstation plus remote build-host")
     r = client.post("/memory/reflect", headers=H(ALICE), json={"question": "Where does Hermes run?"})
     j = r.json()
     assert j["sources"] and j["answer"]

@@ -6,10 +6,10 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from app import memory
 
-memory.retain("r1", "semantic", "The m1max host runs the VP dogfood stack on port 5621 and Hindsight on 8888")
-memory.retain("r1", "semantic", "Local Mac executes interactive sessions; all builds run remotely on m1max")
+memory.retain("r1", "semantic", "The build-host runs the dogfood stack on port 5621 and Hindsight on 8888")
+memory.retain("r1", "semantic", "The local workstation executes interactive sessions; all builds run remotely on build-host")
 
-r = memory.reflect("r1", "Which services run on m1max and on which ports?")
+r = memory.reflect("r1", "Which services run on build-host and on which ports?")
 assert "5621" in r["answer"] and "8888" in r["answer"], r
 assert r["synthesized"] and r["sources"], r
 
