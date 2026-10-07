@@ -24,6 +24,12 @@ BACKFILL_MAPPING = {"settings": {"number_of_shards": 1, "number_of_replicas": 0}
         "lease_token": {"type": "keyword"}, "lease_until": {"type": "date"},
         "created_at": {"type": "date"}, "finished_at": {"type": "date"}}}}
 MAX_ATTEMPTS = 4
+
+
+class BackfillHeartbeatAbort(RuntimeError):
+    """Scope lease renewal failed; do not charge the source's retry budget."""
+
+
 LEASE_SECONDS = 3600  # covers bounded extraction + 12 judgement calls at 120s each
 # Backfill claims use short leases for both scope and job; the heartbeat renews
 # only this holder's minted job token. Dead holders become claimable after at most
@@ -194,17 +200,17 @@ def claim(owner_id=None, job_id=None, lease_seconds=LEASE_SECONDS):
 
 
 def _finish(job_id, token, state, **fields):
-    current = es("GET", f"/{QUEUE}/_doc/{job_id}")
-    if current["_source"].get("lease_token") != token:
-        return False
-    try:
-        es("POST", f"/{QUEUE}/_update/{job_id}?if_seq_no={current['_seq_no']}&if_primary_term={current['_primary_term']}&refresh=true",
-           {"doc": {"state": state, **fields}})
-        return True
-    except RuntimeError as exc:
-        if "-> 409:" in str(exc):
+    for attempt in range(5):
+        current = es("GET", f"/{QUEUE}/_doc/{job_id}")
+        if current["_source"].get("lease_token") != token:
             return False
-        raise
+        try:
+            es("POST", f"/{QUEUE}/_update/{job_id}?if_seq_no={current['_seq_no']}&if_primary_term={current['_primary_term']}&refresh=true",
+               {"doc": {"state": state, **fields}})
+            return True
+        except RuntimeError as exc:
+            if "-> 409:" not in str(exc) or attempt == 4:
+                raise
 
 
 def _date(value):
@@ -339,7 +345,7 @@ def _passages(source_id, source):
 def process(source_id, owner_id, abort=None):
     def check_abort():
         if abort is not None and abort.is_set():
-            raise RuntimeError("backfill heartbeat abort (lease renewal failed)")
+            raise BackfillHeartbeatAbort("backfill heartbeat abort (lease renewal failed)")
 
     check_abort()
     source = es("GET", f"/{idx('episodic')}/_doc/{source_id}")["_source"]
@@ -373,6 +379,7 @@ def process(source_id, owner_id, abort=None):
                    "entities": [], "occurred_at": source["occurred_at"], "active": True,
                    "valid_from": date, "doc_group": source.get("doc_group", source_id),
                    "supersedes": replacements}
+            check_abort()
             try:
                 es("PUT", f"/{idx('semantic')}/_create/{fact_id}?refresh=true", doc)
             except RuntimeError as exc:
@@ -395,15 +402,20 @@ def run_once(owner_id=None, job_id=None, on_claim=None, on_finish=None, abort=No
         if on_claim:
             on_claim(job_id, token)
         if abort is not None and abort.is_set():
-            raise RuntimeError("backfill heartbeat abort (lease renewal failed)")
+            raise BackfillHeartbeatAbort("backfill heartbeat abort (lease renewal failed)")
         if abort is None:
             process(job["source_id"], job["owner_id"])
         else:
             process(job["source_id"], job["owner_id"], abort=abort)
         if abort is not None and abort.is_set():
-            raise RuntimeError("backfill heartbeat abort (lease renewal failed)")
+            raise BackfillHeartbeatAbort("backfill heartbeat abort (lease renewal failed)")
         _finish(job_id, token, "completed", finished_at=_iso(_now()), error="")
+    except BackfillHeartbeatAbort:
+        _finish(job_id, token, "pending", next_at=_iso(_now()))
     except Exception as exc:
+        if abort is not None and abort.is_set():
+            _finish(job_id, token, "pending", next_at=_iso(_now()))
+            return True
         if http_retry.is_transient(exc):
             # Transient upstream failure: requeue WITHOUT consuming an attempt.
             transient = job.get("transient_retries", 0) + 1
