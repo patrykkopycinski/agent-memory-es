@@ -55,6 +55,21 @@ Beyond the hybrid core:
 - **Reranker** — ES-native `_inference` rerank endpoint; honest fallback (`reranked: false`) when model/license unavailable — never faked.
 - **Reflect multi-round** — bounded LLM query rewrites extend evidence before synthesis; mental-model tier consulted first.
 - **Mental models** — curated summaries for frequent questions, matched by BM25 on question pattern, surfaced as a priority tier in recall and reflect. `POST /memory/models`.
+- **Write-time fact extraction** — every episodic `retain` queues an async job; a worker (`python -m app.worker --facts`) extracts up to 12 dated, source-linked facts into `semantic`. Contradicted facts get `valid_to`/`superseded_by` (kept for audit, excluded from recall after expiry). Durable lease-based queue with retries; `GET /memory/facts/drain`, `POST /memory/facts/backfill` (+ `--backfill` worker) for existing memory; `"extract_facts": false` opts out on bulk imports.
+- **Label filters** — caller tags + optional LLM label extraction on retain; recall `filter` (`all`/`any`/`none`/`narrow_any`) abstains instead of returning off-topic memories.
+
+## Benchmarks
+
+Measured against [Hindsight](https://github.com/vectorize-io/hindsight) with the same harness, answer model and judge for both. Full method, per-type tables, development history and follow-ups: **[docs/BENCHMARKS.md](docs/BENCHMARKS.md)**.
+
+| Benchmark | AMES | Hindsight | Verdict |
+|---|---|---|---|
+| **LongMemEval-S holdout 100** (current release) | **84/100** | **84/100** | **Parity** (McNemar p=1.00) |
+| LongMemEval-S anchor 100 (current release) | 83/100 | 76/100 | Parity, AMES ahead (p=0.21) |
+| PersonaMem 32k, 589 Qs (previous release) | 352 (59.8%) | 372 (63.2%) | Parity, Hindsight ahead (p=0.10) |
+| PrecisionMemBench, 77 cases (previous release) | 58/77 | 66/77 | Hindsight ahead (precision) |
+
+AMES sends less context than Hindsight on every holdout question (median 17.3k vs 20.0k chars; recall p95 53 ms). Wins come from questions about what the *assistant* said (1.00 vs 0.40); Hindsight leads on knowledge-update and multi-session. Next: latest-value-only recall for knowledge-update, date arithmetic in code for temporal questions — see [follow-ups](docs/BENCHMARKS.md#follow-ups).
 
 ## Landing page
 
@@ -101,7 +116,7 @@ Hermes users: install the [standalone plugin](https://github.com/patrykkopycinsk
 ## Layout
 
 ```
-backend/    FastAPI app: memory ops, consolidation worker, MCP endpoint
+backend/    FastAPI app: memory ops, consolidation + fact-extraction workers, MCP endpoint
 backend/hermes_plugin/    reference copy of the Hermes provider plugin
 docs/       architecture, decision records, diagrams
 scripts/    doctor, importers, MCP bridge, seed, isolation tests
@@ -109,7 +124,7 @@ scripts/    doctor, importers, MCP bridge, seed, isolation tests
 
 ## Status
 
-Deployed and in daily use (self-hosted): Hermes memory provider swapped in, MCP farm workers onboarded, consolidation worker running. API surface is small and stable; consolidation and reflect are evolving. History: docs/PHASE0_PLAN.md, docs/AUDIT.md.
+Deployed and in daily use (self-hosted) as the Hermes memory provider, replacing Hindsight: MCP farm workers onboarded, consolidation and fact-extraction workers running. Benchmark parity with Hindsight on the LongMemEval-S holdout ([docs/BENCHMARKS.md](docs/BENCHMARKS.md)). API surface is small and stable; consolidation and reflect are evolving. History: docs/PHASE0_PLAN.md, docs/AUDIT.md.
 
 ## License
 
