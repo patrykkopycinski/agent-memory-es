@@ -77,7 +77,7 @@ def _backfill_with_job(monkeypatch, job_state, lease_until):
     monkeypatch.setattr(facts, "es", fake_es)
     monkeypatch.setattr(facts, "enqueue", lambda owner, sid: "job1")
 
-    def fake_run_once(owner_id, job_id):
+    def fake_run_once(owner_id, job_id, **kw):
         ran.append(job_id)
 
     monkeypatch.setattr(facts, "run_once", fake_run_once)
