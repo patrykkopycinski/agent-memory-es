@@ -117,7 +117,7 @@ def test_H2a_orphaned_backfill_plus_expired_job_completes(monkeypatch, isolated)
     real_es = facts.es
     monkeypatch.setattr(facts, "es", _episodic_facade(real_es))
 
-    def fake_process(source_id, owner_id):
+    def fake_process(source_id, owner_id, abort=None):
         doc = real_es("GET", f"/{QUEUE}/_doc/{job_id}")
         _raw_es("POST", f"/{QUEUE}/_update/{job_id}"
                         f"?if_seq_no={doc['_seq_no']}&if_primary_term={doc['_primary_term']}&refresh=true",
@@ -143,6 +143,7 @@ def test_H2b_stale_fresh_1h_job_lease_becomes_visible_failure(monkeypatch, isola
     visibly (bounded by NO_PROGRESS_LIMIT), never silently waits 1h."""
     owner = "fix2-owner"
     job_id = "jobB"
+    _seed_backfill(owner, "running", token="tok")
     _seed_job(job_id, owner, "running",
               lease_until=facts._iso(facts._now() + dt.timedelta(hours=1)))
     monkeypatch.setattr(facts, "enqueue", lambda o, s: job_id)
@@ -159,7 +160,7 @@ def test_H2b_stale_fresh_1h_job_lease_becomes_visible_failure(monkeypatch, isola
 def test_H2c_no_progress_marks_backfill_failed(monkeypatch, isolated):
     owner = "fix2-owner"
     _seed_backfill(owner, "running",
-                   lease_until=facts._iso(facts._now() - dt.timedelta(hours=1)))
+                   lease_until=facts._iso(facts._now() - dt.timedelta(hours=1)), token="tok")
     job_id = "jobC"
     _seed_job(job_id, owner, "running",
               lease_until=facts._iso(facts._now() - dt.timedelta(hours=2)))
@@ -169,7 +170,7 @@ def test_H2c_no_progress_marks_backfill_failed(monkeypatch, isolated):
     monkeypatch.setattr(facts, "idx", lambda kind: f"{PREFIX}episodic")
     real_es = facts.es
     monkeypatch.setattr(facts, "es", _episodic_facade(real_es))
-    monkeypatch.setattr(facts, "run_once", lambda *a: True)   # changes nothing
+    monkeypatch.setattr(facts, "run_once", lambda *a, **kw: True)   # changes nothing
     with pytest.raises(RuntimeError, match="no progress"):
         facts._run_backfill("bf", {"owner_id": owner, "visibility": "private"}, "tok")
 
@@ -178,11 +179,12 @@ def test_H2c_no_progress_marks_backfill_failed(monkeypatch, isolated):
 def test_H2d_running_job_without_lease_not_stolen_counts_to_abort(monkeypatch, isolated):
     owner = "fix2-owner"
     job_id = "jobD"
+    _seed_backfill(owner, "running", token="tok")
     _seed_job(job_id, owner, "running", lease_until=None)
     monkeypatch.setattr(facts, "NO_PROGRESS_LIMIT", 3)
     monkeypatch.setattr(facts.time, "sleep", lambda s: None)
     stolen = []
-    monkeypatch.setattr(facts, "run_once", lambda o, j: stolen.append(j) or True)
+    monkeypatch.setattr(facts, "run_once", lambda o, j, **kw: stolen.append(j) or True)
     monkeypatch.setattr(facts, "enqueue", lambda o, s: job_id)
     monkeypatch.setattr(facts, "idx", lambda kind: f"{PREFIX}episodic")
     real_es = facts.es
