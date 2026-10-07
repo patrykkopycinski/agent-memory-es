@@ -67,6 +67,7 @@ def test_fail_open_write_and_opt_out():
 def test_drain_endpoint_uses_authenticated_owner(monkeypatch):
     from app import main
     monkeypatch.setattr(main.facts, "status", lambda owner: {"owner_id": owner, "drained": True})
+    monkeypatch.setattr(main.facts, "backfill_status", lambda owner, vis: None)
     assert main.fact_drain({"owner_id": "alice"}) == {"owner_id": "alice", "drained": True,
                                                       "facts_dropped_invalid": 0,
                                                       "facts_dropped_overflow": 0}
