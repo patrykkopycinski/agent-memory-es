@@ -1,0 +1,32 @@
+{
+  "mutants": [
+    {
+      "name": "drop-503-from-transient-set",
+      "file": "backend/app/http_retry.py",
+      "find": "TRANSIENT_STATUSES = {429, 502, 503, 504}",
+      "replace": "TRANSIENT_STATUSES = {429, 502, 504}",
+      "expect": "kill"
+    },
+    {
+      "name": "transient-consumes-attempt",
+      "file": "backend/app/facts.py",
+      "find": "            return True\n        attempts = job[\"attempts\"] + 1",
+      "replace": "        attempts = job[\"attempts\"] + 1",
+      "expect": "kill"
+    },
+    {
+      "name": "ignore-retry-after",
+      "file": "backend/app/http_retry.py",
+      "find": "    if value:",
+      "replace": "    if False and value:",
+      "expect": "kill"
+    },
+    {
+      "name": "always-send-temperature",
+      "file": "backend/app/llm.py",
+      "find": "    if value is None:\n        return {\"temperature\": default}",
+      "replace": "    if True:\n        return {\"temperature\": default}",
+      "expect": "kill"
+    }
+  ]
+}

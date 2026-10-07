@@ -15,7 +15,8 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 from app import store, tombstone as _tb
 from app import mental_models as _mm, pages as _pg
 
-store.ensure_indices()
-_mm.ensure_models_index()
-_pg.ensure_pages_index()
-_tb._ensure_index()
+if os.environ.get("AMES_TEST_OFFLINE") != "1":
+    store.ensure_indices()
+    _mm.ensure_models_index()
+    _pg.ensure_pages_index()
+    _tb._ensure_index()
