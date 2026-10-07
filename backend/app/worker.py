@@ -84,4 +84,13 @@ def run_forever(interval_s: int = 0):
 
 
 if __name__ == "__main__":
-    run_forever()
+    import sys
+    if "--backfill" in sys.argv:
+        from .facts import backfill_loop
+        backfill_loop()
+    elif "--facts" in sys.argv:
+        from .facts import loop
+        scope_owner = os.environ.get("AMES_FACT_OWNER")
+        loop(scope_owner)
+    else:
+        run_forever()

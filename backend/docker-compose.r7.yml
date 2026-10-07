@@ -1,0 +1,35 @@
+services:
+  ames-backend-r7:
+    image: ames-r7:7a
+    container_name: ames-backend-r7
+    restart: unless-stopped
+    extra_hosts: ["host.docker.internal:host-gateway"]
+    environment:
+      AMES_ES_URL: http://ames-es:9200
+      AMES_INDEX_PREFIX: r7_
+      AMES_LLM_BASE: https://9router.widzimysie.pl/v1
+      AMES_LLM_KEY: ${OMNIROUTE_API_KEY:?set}
+      AMES_LLM_MODEL: auto/best-chat
+      AMES_ADMIN_TOKEN: ${AMES_ADMIN_TOKEN:?set}
+      AMES_API_KEYS_FILE: /data/ames_keys.json
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8123"]
+    volumes:
+      - /home/azureuser/ames-data:/data:ro
+    ports:
+      - "8124:8123"
+    networks: [backend_default]
+  ames-fact-worker-r7:
+    image: ames-r7:7a
+    restart: unless-stopped
+    extra_hosts: ["host.docker.internal:host-gateway"]
+    environment:
+      AMES_ES_URL: http://ames-es:9200
+      AMES_INDEX_PREFIX: r7_
+      AMES_LLM_BASE: https://9router.widzimysie.pl/v1
+      AMES_LLM_KEY: ${OMNIROUTE_API_KEY:?set}
+      AMES_LLM_MODEL: auto/best-chat
+    command: ["python", "-m", "app.worker", "--backfill"]
+    networks: [backend_default]
+networks:
+  backend_default:
+    external: true
