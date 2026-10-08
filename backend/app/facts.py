@@ -38,6 +38,7 @@ LEASE_SECONDS = 3600  # generic-worker lease; upstream calls have bounded retry 
 BACKFILL_LEASE_SECONDS = 90
 HEARTBEAT_SECONDS = 15
 # inner-loop no-progress limit: run_once attempts that change nothing
+MAX_SCHEDULED_WAIT = 2 * 900  # 2x the largest backoff we ever schedule
 NO_PROGRESS_LIMIT = 30
 
 
@@ -593,6 +594,21 @@ def _run_backfill(key, doc, token, abort=None, current_job=None, job_lock=None):
             with job_lock:
                 current_job.pop("id", None)
                 current_job.pop("token", None)
+    def _run_and_count_failures():
+        """Review6 F3: a non-abort exception out of run_once (e.g. a finalize
+        5x409 or transport error) must not fail the whole scope. Log it and
+        count no progress; the job keeps its running lease and is reclaimed
+        by lease expiry."""
+        try:
+            return run_once(owner_id, job_id, on_claim=_track, on_finish=_untrack, abort=abort)
+        except Exception as exc:
+            if abort is not None and abort.is_set():
+                raise
+            log.warning("backfill %s: job %s run_once failed after processing "
+                        "(%s: %s); leaving for lease reclaim, counting no progress",
+                        key, job_id, type(exc).__name__, str(exc)[:200])
+            return False
+
     while True:
         if abort is not None and abort.is_set():
             raise RuntimeError(f"backfill {key}: heartbeat abort (lease renewal failed)")
@@ -648,7 +664,7 @@ def _run_backfill(key, doc, token, abort=None, current_job=None, job_lock=None):
                 time.sleep(2)
                 continue
             elif job["state"] == "pending" and next_dt is not None and next_dt <= now_dt:
-                run_once(owner_id, job_id, on_claim=_track, on_finish=_untrack, abort=abort)
+                _run_and_count_failures()
                 after_doc = es("GET", f"/{QUEUE}/_doc/{job_id}")["_source"]
                 after_state = (after_doc["state"], after_doc.get("lease_until"),
                                after_doc.get("attempts"))
@@ -657,14 +673,28 @@ def _run_backfill(key, doc, token, abort=None, current_job=None, job_lock=None):
                 # orphaned running job (worker died mid-lease, e.g. a rollout):
                 # claim() re-runs expired leases by id; without this the scope
                 # sleeps forever while generic workers skip the active scope.
-                run_once(owner_id, job_id, on_claim=_track, on_finish=_untrack, abort=abort)
+                _run_and_count_failures()
                 after_doc = es("GET", f"/{QUEUE}/_doc/{job_id}")["_source"]
                 after_state = (after_doc["state"], after_doc.get("lease_until"),
                                after_doc.get("attempts"))
                 no_progress = no_progress + 1 if after_state == before else 0
             elif job["state"] == "pending" and next_dt is not None:
-                time.sleep(min(15, max(0.5, (next_dt - now_dt).total_seconds())))
-                continue
+                wait_s = (next_dt - now_dt).total_seconds()
+                if wait_s > MAX_SCHEDULED_WAIT:
+                    # Review6 F1: clock skew or a bad next_at must not stall the
+                    # owner forever (claim() skips jobs under an active backfill).
+                    # Warn once, count no progress, let the existing abort path
+                    # fail the scope so retry_failed_backfill can requeue it.
+                    if not lease_warned:
+                        log.warning(
+                            "job %s pending with next_at %s beyond %ss "
+                            "(clock skew or bad value); counting no progress",
+                            job_id, job.get("next_at"), MAX_SCHEDULED_WAIT)
+                        lease_warned = True
+                    no_progress += 1
+                else:
+                    time.sleep(min(15, max(0.5, wait_s)))
+                    continue
             elif job["state"] == "pending":
                 # Missing or invalid next_at cannot make scheduled progress.
                 if not lease_warned:
