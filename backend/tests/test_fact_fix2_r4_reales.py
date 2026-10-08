@@ -1,4 +1,5 @@
 """Round 4 regression tests; use FIX2_ES on an isolated ES instance."""
+import datetime as dt
 import threading
 
 import pytest
@@ -13,14 +14,21 @@ from test_fact_fix2_r3_reales import (
 def test_finish_retries_heartbeat_conflict(monkeypatch, setup, fails):
     seed()
     renewals = []
+    calls = []
+    now = [facts._now()]
+    monkeypatch.setattr(facts, "_now", lambda: now[0])
 
     def process(*args, **kwargs):
-        if fails:
+        calls.append(True)
+        if fails and len(calls) == 1:
             raise ValueError("extraction failed")
 
     runner(monkeypatch, process)
     monkeypatch.setattr(facts, "NO_PROGRESS_LIMIT", 2)
-    monkeypatch.setattr(facts.time, "sleep", lambda _: None)
+    def sleep(seconds):
+        now[0] += dt.timedelta(seconds=seconds)
+
+    monkeypatch.setattr(facts.time, "sleep", sleep)
     transport = facts.es
 
     def conflicting_es(method, path, body=None):
@@ -34,13 +42,10 @@ def test_finish_retries_heartbeat_conflict(monkeypatch, setup, fails):
     assert facts.run_backfill_once()
     job = doc(QUEUE, "job")
     assert renewals == [True]
-    if fails:
-        assert job["state"] == "pending" and job["attempts"] == 1
-        assert doc(BACKFILLS, "bf")["state"] == "failed"
-        # The retrying job is delayed; the backfill reports no progress promptly.
-    else:
-        assert job["state"] == "completed"
-        assert doc(BACKFILLS, "bf")["state"] == "completed"
+    assert job["state"] == "completed"
+    assert job["attempts"] == int(fails)
+    assert len(calls) == 1 + int(fails)
+    assert doc(BACKFILLS, "bf")["state"] == "completed"
 
 
 def test_abort_requeues_without_charging_attempt(monkeypatch, setup):
