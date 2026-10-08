@@ -1,6 +1,8 @@
 """fix-2 round 2 real-ES recovery tests (H2 a-e, M3, H1). Per-run UUID index
-prefix; SKIP (not error) when ES is unreachable. Requires live ES at :9268.
-  PYTHONPATH=backend python3 -m pytest backend/tests/test_fact_fix2_reales.py
+prefix; SKIP (not error) when FIX2_ES is unset or ES is unreachable.
+Requires a DEDICATED live ES: set FIX2_ES (no default; never point it at a
+shared/production cluster — these tests create, write and delete indices).
+  FIX2_ES=http://127.0.0.1:9279 PYTHONPATH=backend python3 -m pytest backend/tests/test_fact_fix2_reales.py
 """
 import datetime as dt
 import json
@@ -14,7 +16,7 @@ import pytest
 
 from app import facts
 
-ES = os.environ.get("FIX2_ES", "http://localhost:9268")
+ES = os.environ.get("FIX2_ES")  # dedicated ES only — no default; unset => skip
 PREFIX = f"fix2r2_{uuid.uuid4().hex[:8]}_"
 QUEUE = PREFIX + "am_fact_jobs"
 BACKFILLS = PREFIX + "am_fact_backfills"
@@ -39,6 +41,8 @@ def _raw_es(method, path, body=None):
 
 
 def es_reachable():
+    if not ES:
+        return False
     try:
         with urllib.request.urlopen(ES, timeout=3) as r:
             return r.status == 200
@@ -46,7 +50,8 @@ def es_reachable():
         return False
 
 
-pytestmark = pytest.mark.skipif(not es_reachable(), reason="live ES unreachable")
+pytestmark = pytest.mark.skipif(not ES or not es_reachable(),
+                                reason="FIX2_ES not set or live ES unreachable")
 
 
 @pytest.fixture()
