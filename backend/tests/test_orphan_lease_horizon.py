@@ -121,3 +121,25 @@ def test_incomplete_read_is_transient():
     import http.client
     from app import http_retry
     assert http_retry.is_transient(http.client.IncompleteRead(b"par"))
+
+
+def test_deterministic_run_once_failure_aborts_instead_of_looping(monkeypatch, harness):
+    """Every run re-arms a 90s lease and raises: the changed lease_until used to
+    look like progress and reset the counter, looping (and re-running the LLM)
+    forever. Now fails visibly after MAX_CONSECUTIVE_RUN_FAILURES runs."""
+    now, sleeps, fake = harness
+    fake.job.update(state="pending", lease_until=None, next_at=facts._iso(now[0]))
+    runs = []
+
+    def run_once(owner, job_id, on_claim=None, on_finish=None, abort=None):
+        runs.append(now[0])
+        if len(runs) > 50:
+            raise KeyboardInterrupt("still looping")
+        fake.job.update(state="running", lease_until=facts._iso(
+            now[0] + dt.timedelta(seconds=facts.BACKFILL_LEASE_SECONDS)))
+        raise OSError("extraction boom")
+
+    monkeypatch.setattr(facts, "run_once", run_once)
+    with pytest.raises(RuntimeError, match="extraction boom"):
+        facts._run_backfill("k", DOC, "tok")
+    assert len(runs) == facts.MAX_CONSECUTIVE_RUN_FAILURES

@@ -40,6 +40,7 @@ HEARTBEAT_SECONDS = 15
 # inner-loop no-progress limit: run_once attempts that change nothing
 MAX_SCHEDULED_WAIT = 2 * 900  # 2x the largest backoff we ever schedule
 NO_PROGRESS_LIMIT = 30
+MAX_CONSECUTIVE_RUN_FAILURES = 3
 
 
 def _parse_iso(value):
@@ -584,6 +585,7 @@ def _run_backfill(key, doc, token, abort=None, current_job=None, job_lock=None):
     no_progress = 0
     lease_warned = False
     last_run_error = None
+    consecutive_run_failures = 0
 
     def _track(job_id, job_token):
         if current_job is not None and job_lock is not None:
@@ -601,13 +603,24 @@ def _run_backfill(key, doc, token, abort=None, current_job=None, job_lock=None):
         5x409 or transport error) must not fail the whole scope. Log it and
         count no progress; the job keeps its running lease and is reclaimed
         by lease expiry."""
-        nonlocal last_run_error
+        nonlocal last_run_error, consecutive_run_failures
         try:
-            return run_once(owner_id, job_id, on_claim=_track, on_finish=_untrack, abort=abort)
+            result = run_once(owner_id, job_id, on_claim=_track, on_finish=_untrack, abort=abort)
+            consecutive_run_failures = 0
+            return result
         except Exception as exc:
             if abort is not None and abort.is_set():
                 raise
             last_run_error = f"{type(exc).__name__}: {str(exc)[:200]}"
+            consecutive_run_failures += 1
+            if consecutive_run_failures >= MAX_CONSECUTIVE_RUN_FAILURES:
+                # Each failed run re-arms the job lease, which looks like progress
+                # to the poll loop; without this cap a deterministic failure
+                # re-runs extraction every lease forever.
+                raise RuntimeError(
+                    f"backfill {key}: job {job_id} failed after processing "
+                    f"{consecutive_run_failures} times in a row; last run_once error: "
+                    f"{last_run_error}") from exc
             log.warning("backfill %s: job %s run_once failed after processing "
                         "(%s: %s); leaving for lease reclaim, counting no progress",
                         key, job_id, type(exc).__name__, str(exc)[:200])
