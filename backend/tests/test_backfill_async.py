@@ -67,7 +67,7 @@ def test_runner_orders_sources_and_completes_only_after_processing(monkeypatch):
                     for t, x in [(3, "c"), (1, "a"), (2, "b")]]
     monkeypatch.setattr(facts, "es", fake)
     monkeypatch.setattr(facts, "enqueue", lambda owner, source: source)
-    monkeypatch.setattr(facts, "run_once", lambda owner, job_id: fake.processed.append(job_id))
+    monkeypatch.setattr(facts, "run_once", lambda owner, job_id, **kw: fake.processed.append(job_id))
     # Simulate the fact job state moving from pending to completed after run_once.
     original = fake.__call__
     def transport(method, path, body=None):
@@ -87,7 +87,7 @@ def test_failure_not_marked_done(monkeypatch):
     fake.sources = [{"id": "a", "sort": [1, "a"], "owner": "alice", "visibility": "private"}]
     monkeypatch.setattr(facts, "es", fake)
     monkeypatch.setattr(facts, "enqueue", lambda *_: "a")
-    def fail(*_):
+    def fail(*_, **kw):
         raise RuntimeError("LLM unavailable")
     monkeypatch.setattr(facts, "run_once", fail)
     facts.backfill("alice", "private")
