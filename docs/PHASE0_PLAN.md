@@ -4,7 +4,7 @@ Goal: prove the core mechanics on ES 9.6.0-SNAPSHOT before writing the full back
 
 ## Steps
 
-1. Boot ES 9.6.0-SNAPSHOT (docker, m1max or local) — snapshot image from docker.elastic.co
+1. Boot ES 9.6.0-SNAPSHOT (docker, self-hosted host or local) — snapshot image from docker.elastic.co
 2. Index templates: `am_episodic`, `am_semantic`, `am_procedural` — semantic_text field, owner_id, visibility, timestamps, superseded_by
 3. Recall: hybrid BM25+dense RRF + visibility filter; token-budget cut app-side
 4. Leak test: owner A retains private doc; owner B recall must not return it (both DLS and middleware paths)

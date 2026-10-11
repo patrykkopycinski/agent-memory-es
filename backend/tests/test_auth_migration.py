@@ -1,6 +1,6 @@
 """Legacy/hand-written key files must self-heal: plaintext token under an
 owner-name key becomes a sha256-digest entry on first _load, so owner_of()
-resolves instead of 401ing every token (m1max deploy incident 2026-10-01)."""
+resolves instead of 401ing every token (self-hosted deploy incident 2026-10-01)."""
 import json
 import os
 import sys

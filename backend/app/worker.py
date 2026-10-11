@@ -128,4 +128,13 @@ if __name__ == "__main__":
     # docker-compose.yml / docker-compose.quickstart.yml run
     # `python -m app.worker`: without this entry the module imports, exits 0,
     # and the container crash-loops under `restart: unless-stopped`.
-    run_forever()
+    import sys
+    if "--backfill" in sys.argv:
+        from .facts import backfill_loop
+        backfill_loop()
+    elif "--facts" in sys.argv:
+        from .facts import loop
+        scope_owner = os.environ.get("AMES_FACT_OWNER")
+        loop(scope_owner)
+    else:
+        run_forever()
