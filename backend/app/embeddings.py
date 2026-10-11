@@ -8,7 +8,8 @@ import json
 import os
 import urllib.request
 
-ES_URL = os.environ.get("AMES_ES_URL", "http://localhost:9268")
+from .store import _es_url
+
 ES_ENDPOINT = os.environ.get("AMES_ES_INFERENCE", ".multilingual-e5-small-elasticsearch")
 OR_BASE = os.environ.get("AMES_EMBED_BASE", "http://localhost:20128/v1")
 OR_MODEL = os.environ.get("AMES_EMBED_MODEL", "openrouter/google/gemini-embedding-2")
@@ -25,7 +26,7 @@ def _post(url, body, headers=None, timeout=60):
 
 
 def _es_embed(texts):
-    out = _post(f"{ES_URL}/_inference/text_embedding/{ES_ENDPOINT}", {"input": texts})
+    out = _post(f"{_es_url()}/_inference/text_embedding/{ES_ENDPOINT}", {"input": texts})
     return [d["embedding"] for d in out["text_embedding"]]
 
 

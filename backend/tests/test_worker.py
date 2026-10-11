@@ -6,6 +6,7 @@ import os
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+import _safety  # noqa: F401  (script-path guard: conftest bypass)
 
 from app import auth, embeddings, memory  # noqa: E402
 from app.memory import extract_entities  # noqa: E402

@@ -6,7 +6,7 @@ import os
 import urllib.error
 import urllib.request
 
-from .store import ES_URL
+from .store import _es_url
 
 # Cross-encoder call timeout (seconds). Configurable: a cold, CPU-only ES node needs several
 # seconds per 50-passage batch, so this is where a deployment trades latency for recall quality.
@@ -39,7 +39,7 @@ def rerank(query: str, hits: list, top_n: int = 5,
         "input": [h["text"] for h in hits[:50]],  # plain strings; response keyed by index
     }).encode()
     req = urllib.request.Request(
-        ES_URL + f"/_inference/rerank/{model}", data=body, method="POST",
+        _es_url() + f"/_inference/rerank/{model}", data=body, method="POST",
         headers={"Content-Type": "application/json"})
     try:
         with urllib.request.urlopen(req, timeout=RERANK_TIMEOUT) as r:
