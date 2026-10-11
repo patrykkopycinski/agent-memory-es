@@ -641,6 +641,7 @@ def _run_backfill(key, doc, token, abort=None, current_job=None, job_lock=None):
             return
         hit = hits[0]
         job_id = enqueue(owner_id, hit["_id"])
+        consecutive_run_failures = 0   # the cap is per job, not per scope
         es("POST", f"/{idx('episodic')}/_update/{hit['_id']}?refresh=true",
            {"doc": {"fact_requested": True}})
         while True:

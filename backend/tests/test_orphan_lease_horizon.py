@@ -134,7 +134,7 @@ def test_deterministic_run_once_failure_aborts_instead_of_looping(monkeypatch, h
     def run_once(owner, job_id, on_claim=None, on_finish=None, abort=None):
         runs.append(now[0])
         if len(runs) > 50:
-            raise KeyboardInterrupt("still looping")
+            raise _StillLooping("still looping")
         fake.job.update(state="running", lease_until=facts._iso(
             now[0] + dt.timedelta(seconds=facts.BACKFILL_LEASE_SECONDS)))
         raise OSError("extraction boom")
@@ -143,3 +143,37 @@ def test_deterministic_run_once_failure_aborts_instead_of_looping(monkeypatch, h
     with pytest.raises(RuntimeError, match="extraction boom"):
         facts._run_backfill("k", DOC, "tok")
     assert len(runs) == facts.MAX_CONSECUTIVE_RUN_FAILURES
+
+
+class _StillLooping(BaseException):
+    """Escapes `except Exception` but is a normal test failure, not a session abort."""
+
+
+def test_failure_count_is_per_job_not_per_scope(monkeypatch, harness):
+    """A job that reaches `completed` although run_once raised (finalize write
+    committed, response lost) must not count toward the next job's cap."""
+    now, sleeps, fake = harness
+    jobs = iter(range(5))
+    monkeypatch.setattr(facts, "enqueue", lambda owner, source: f"j{next(jobs)}")
+    searches = []
+    states = {}
+
+    def es(method, path, body=None):
+        if path.endswith("/_search"):
+            searches.append(1)
+            return {"hits": {"hits": [{"_id": f"s{len(searches)}", "sort": [len(searches), "g"]}]
+                             if len(searches) <= 5 else []}}
+        if path.startswith(f"/{facts.QUEUE}/_doc/"):
+            job_id = path.rsplit("/", 1)[1]
+            return {"_source": {"state": states.get(job_id, "pending"), "attempts": 0,
+                                "next_at": facts._iso(now[0]), "lease_until": None}}
+        return {}
+
+    monkeypatch.setattr(facts, "es", es)
+
+    def run_once(owner, job_id, on_claim=None, on_finish=None, abort=None):
+        states[job_id] = "completed"     # write committed, response lost
+        raise OSError("finalize read timeout (write committed)")
+
+    monkeypatch.setattr(facts, "run_once", run_once)
+    facts._run_backfill("k", DOC, "tok")          # must not raise
