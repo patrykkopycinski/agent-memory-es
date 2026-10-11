@@ -582,6 +582,7 @@ def _run_backfill(key, doc, token, abort=None, current_job=None, job_lock=None):
     queued = doc.get("queued", 0)
     no_progress = 0
     lease_warned = False
+    last_run_error = None
 
     def _track(job_id, job_token):
         if current_job is not None and job_lock is not None:
@@ -599,11 +600,13 @@ def _run_backfill(key, doc, token, abort=None, current_job=None, job_lock=None):
         5x409 or transport error) must not fail the whole scope. Log it and
         count no progress; the job keeps its running lease and is reclaimed
         by lease expiry."""
+        nonlocal last_run_error
         try:
             return run_once(owner_id, job_id, on_claim=_track, on_finish=_untrack, abort=abort)
         except Exception as exc:
             if abort is not None and abort.is_set():
                 raise
+            last_run_error = f"{type(exc).__name__}: {str(exc)[:200]}"
             log.warning("backfill %s: job %s run_once failed after processing "
                         "(%s: %s); leaving for lease reclaim, counting no progress",
                         key, job_id, type(exc).__name__, str(exc)[:200])
@@ -707,9 +710,10 @@ def _run_backfill(key, doc, token, abort=None, current_job=None, job_lock=None):
             if no_progress >= NO_PROGRESS_LIMIT:
                 state_now = (es("GET", f"/{QUEUE}/_doc/{job_id}")["_source"]["state"]
                              if job["state"] in ("pending", "running") else job["state"])
+                cause = f"; last run_once error: {last_run_error}" if last_run_error else ""
                 raise RuntimeError(
                     f"backfill {key}: job {job_id} made no progress after "
-                    f"{no_progress} attempts (state={state_now})")
+                    f"{no_progress} attempts (state={state_now}){cause}")
             if no_progress:
                 time.sleep(2)      # M4: only sleep when the last round made no progress
         after = hit["sort"]
