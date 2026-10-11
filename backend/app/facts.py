@@ -147,7 +147,8 @@ def retry_failed_job(owner_id, job_id):
         raise ValueError("only failed jobs can be retried")
     es("POST", f"/{QUEUE}/_update/{job_id}?if_seq_no={current['_seq_no']}&if_primary_term={current['_primary_term']}&refresh=true",
        {"doc": {"state": "pending", "attempts": 0, "next_at": _iso(_now()),
-                "error": "", "finished_at": None, "lease_token": None, "lease_until": None}})
+                "error": "", "finished_at": None, "lease_token": None, "lease_until": None,
+                "transient_retries": 0}})
     return {"state": "pending", "job_id": job_id}
 
 
@@ -663,8 +664,11 @@ def _run_backfill(key, doc, token, abort=None, current_job=None, job_lock=None):
                     raise RuntimeError(
                         f"backfill {key}: job {job_id} stuck under a foreign lease "
                         f"with no progress after {no_progress} polls "
-                        f"(lease_until={job.get('lease_until')})")
-                time.sleep(2)
+                        f"(lease_until={job.get('lease_until')})"
+                        + (f"; last run_once error: {last_run_error}" if last_run_error else ""))
+                # Poll no faster than the lease can plausibly expire, so the poll
+                # budget spans a full short lease (incl. our own orphaned job).
+                time.sleep(min(15, max(2, (lease_dt - now_dt).total_seconds())))
                 continue
             elif job["state"] == "pending" and next_dt is not None and next_dt <= now_dt:
                 _run_and_count_failures()
