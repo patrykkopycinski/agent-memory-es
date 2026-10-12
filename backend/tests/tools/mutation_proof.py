@@ -130,6 +130,10 @@ class Prover:
         if timed_out:
             return "TIMEOUT", "suite exceeded %ss" % self.timeout, log                       # #2
         red = code != 0                                                                      # #6
+        if red and not self.suite_ran_anything(open(log).read()):
+            # A collection error / missing test path exits non-zero with ZERO tests run:
+            # that is a broken harness, not a killed mutant.
+            return "NO-TESTS", "suite reported red without running any tests (%s)" % log, log
         want_kill = m.get("expect", "kill") == "kill"
         if red == want_kill:
             return ("KILLED" if want_kill else "KILLED(expected-survive)"), "", log
@@ -137,7 +141,33 @@ class Prover:
                "suite %s (want %s)" % ("passed" if not red else "failed",
                                        "red" if want_kill else "green"), log
 
+    _NO_TESTS = re.compile(
+        r"no tests ran"
+        r"|file or directory not found"
+        r"|errors? (while|during) collecting"
+        # pytest's collection errors, NOT captured app logging ("ERROR app.x:y ...")
+        r"|^ERROR (collecting |tests?/)", re.MULTILINE)
+
+    @classmethod
+    def suite_ran_anything(cls, out):
+        """A red exit code only means a mutant died if the suite actually ran tests.
+        `no tests ran`, a missing test path, or a collection ERROR all exit non-zero
+        with ZERO tests executed - the exact vacuous-kill shape this guard rejects."""
+        return not cls._NO_TESTS.search(out or "")
+
     def run(self, only=None):
+        # Baseline gate: the UNMUTATED suite must be green AND must actually run tests,
+        # otherwise every later "red" is suspect (wrong cwd, missing path, collection error).
+        code, timed_out, log = self.run_suite("baseline")
+        if timed_out:
+            print("BASELINE TIMEOUT: unmutated suite exceeded %ss (%s) - aborting" % (self.timeout, log))
+            return 1
+        if not self.suite_ran_anything(open(log).read()):
+            print("BASELINE NO-TESTS: command ran no tests (%s) - aborting" % log)
+            return 1
+        if code != 0:
+            print("BASELINE RED: unmutated suite exits %s (%s) - aborting" % (code, log))
+            return 1
         rows, bad = [], 0
         for m in self.mutants:
             if only and m["name"] not in only:

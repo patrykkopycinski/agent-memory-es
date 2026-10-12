@@ -25,6 +25,11 @@ if os.path.exists(os.environ["AMES_API_KEYS_FILE"]):
     os.remove(os.environ["AMES_API_KEYS_FILE"])
 # Test isolation: never read/write the live cluster's shared data.
 os.environ["AMES_INDEX_PREFIX"] = "amtest_"
+# Bound the retry budget: an absent LLM/embedding endpoint must fail fast
+# instead of blocking for the 300 s production default (a caller-set value
+# wins via setdefault, so live-endpoint runs can still ask for more).
+os.environ.setdefault("AMES_HTTP_RETRY_BUDGET_S", "2")
+
 
 # Create prefixed indices at import time: test modules clean them at module
 # import (collection), before any fixture can run.

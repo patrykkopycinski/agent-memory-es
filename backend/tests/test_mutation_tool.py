@@ -28,7 +28,8 @@ def _sha(p):
     return hashlib.sha256(open(p, "rb").read()).hexdigest()
 
 
-def _repo(tmp_path, body="VALUE = 1\n", check="import sys; sys.exit(0 if VALUE == 1 else 1)\n"):
+def _repo(tmp_path, body="VALUE = 1\n",
+          check="import sys; exec(open('target.py').read()); sys.exit(0 if VALUE == 1 else 1)\n"):
     (tmp_path / TARGET).write_text(body)
     (tmp_path / "check.py").write_text(check)
     return str(tmp_path)
@@ -83,9 +84,57 @@ def test_a_no_op_mutation_is_invalid(tmp_path):
 
 
 def test_suite_that_errors_during_collection_counts_as_red(tmp_path):
+    # a suite that explodes before running any test must be NO-TESTS, not a kill
     root = _repo(tmp_path, check="raise ImportError('boom')\n")
     table = _table(tmp_path, [_mut()])
-    assert _prover(root, table).run() == 0                               # #6 exit code, not grep
+    assert _prover(root, table).run() == 1                               # #6 + no-vacuous-kill
+
+
+def test_missing_test_path_is_not_a_kill(tmp_path):
+    # The card's reproduction: a command that runs zero tests (e.g. pytest on a missing
+    # path: "file or directory not found", exit 2) used to be scored KILLED. It must be
+    # NO-TESTS and fail the run.
+    root = _repo(tmp_path)
+    table = _table(tmp_path, [_mut()])
+    p = _prover(root, table,
+                command="python3 -c \"print('no tests ran in 0.00s'); import sys; sys.exit(2)\"")
+    import io, contextlib
+    with contextlib.redirect_stdout(io.StringIO()) as buf:
+        rc = p.run()
+    assert rc == 1
+    # caught by the baseline gate (the unmutated command also runs no tests)
+    assert "BASELINE NO-TESTS" in buf.getvalue()
+
+
+def test_mutant_level_no_tests_is_not_a_kill(tmp_path):
+    # baseline green, but the mutated suite explodes with zero tests run:
+    # the per-mutant guard must reject the vacuous red, not score it KILLED.
+    root = _repo(tmp_path, check=(
+        "import sys\n"
+        "exec(open('target.py').read())\n"
+        "if VALUE != 1:\n"
+        "    print('no tests ran in 0.00s'); sys.exit(2)\n"
+        "sys.exit(0)\n"))
+    table = _table(tmp_path, [_mut()])
+    import io, contextlib
+    with contextlib.redirect_stdout(io.StringIO()) as buf:
+        rc = _prover(root, table).run()
+    assert rc == 1
+    out = buf.getvalue()
+    assert "NO-TESTS" in out and "BASELINE" not in out
+    assert open(os.path.join(root, TARGET)).read() == "VALUE = 1\n"
+
+
+def test_red_baseline_aborts_before_any_mutant(tmp_path):
+    # If the unmutated suite is red, every "kill" is suspect: abort, do not score.
+    root = _repo(tmp_path, body="VALUE = 2\n")
+    table = _table(tmp_path, [_mut()])
+    import io, contextlib
+    with contextlib.redirect_stdout(io.StringIO()) as buf:
+        rc = _prover(root, table).run()
+    assert rc == 1
+    assert "BASELINE RED" in buf.getvalue()
+    assert open(os.path.join(root, TARGET)).read() == "VALUE = 2\n"
 
 
 def test_timeout_is_reported_and_tree_restored(tmp_path):
@@ -141,7 +190,7 @@ def test_mutant_name_with_path_characters_still_logs(tmp_path):
     p = _prover(root, table)
     assert p.run() == 0
     logs = os.listdir(os.path.join(root, "logs"))
-    assert logs == ["mutant-M15_duplicate_odd_indices.log"], logs
+    assert logs == ["mutant-baseline.log", "mutant-M15_duplicate_odd_indices.log"], logs
 
 
 def test_restore_recreates_a_file_removed_by_someone_else(tmp_path):
