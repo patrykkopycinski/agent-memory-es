@@ -1,35 +1,55 @@
+# Benchmark stack for write-time fact extraction (round 7), run beside an existing
+# ES container on the `backend_default` network (see docker-compose.quickstart.yml).
+# Uses its own index prefix, so it never touches the main deployment's data.
+#
+#   export OMNIROUTE_API_KEY=... AMES_ADMIN_TOKEN=... AMES_LLM_BASE=https://<your-gateway>/v1
+#   docker compose -f docker-compose.r7.yml up -d
+#
+# AMES_LLM_BASE must be an OpenAI-compatible endpoint; the extraction model must
+# support JSON output (response_format=json_object).
+x-ames-r7-env: &ames-r7-env
+  AMES_ES_URL: ${AMES_ES_URL:-http://ames-es:9200}
+  AMES_INDEX_PREFIX: ${AMES_INDEX_PREFIX:-r7_}
+  AMES_LLM_BASE: ${AMES_LLM_BASE:?set AMES_LLM_BASE to an OpenAI-compatible endpoint}
+  AMES_LLM_KEY: ${OMNIROUTE_API_KEY:?set}
+  AMES_LLM_MODEL: ${AMES_LLM_MODEL:-auto/best-chat}
+
 services:
   ames-backend-r7:
-    image: ames-r7:7a
+    build: ..
+    image: ames-r7:local
     container_name: ames-backend-r7
     restart: unless-stopped
     extra_hosts: ["host.docker.internal:host-gateway"]
     environment:
-      AMES_ES_URL: http://ames-es:9200
-      AMES_INDEX_PREFIX: r7_
-      AMES_LLM_BASE: https://9router.widzimysie.pl/v1
-      AMES_LLM_KEY: ${OMNIROUTE_API_KEY:?set}
-      AMES_LLM_MODEL: auto/best-chat
+      <<: *ames-r7-env
       AMES_ADMIN_TOKEN: ${AMES_ADMIN_TOKEN:?set}
       AMES_API_KEYS_FILE: /data/ames_keys.json
     command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8123"]
     volumes:
-      - /home/azureuser/ames-data:/data:ro
+      - ${AMES_DATA_DIR:-./data}:/data:ro
     ports:
-      - "8124:8123"
+      - "127.0.0.1:${AMES_R7_PORT:-8124}:8123"
     networks: [backend_default]
+
   ames-fact-worker-r7:
-    image: ames-r7:7a
+    image: ames-r7:local
     restart: unless-stopped
+    depends_on: [ames-backend-r7]
     extra_hosts: ["host.docker.internal:host-gateway"]
-    environment:
-      AMES_ES_URL: http://ames-es:9200
-      AMES_INDEX_PREFIX: r7_
-      AMES_LLM_BASE: https://9router.widzimysie.pl/v1
-      AMES_LLM_KEY: ${OMNIROUTE_API_KEY:?set}
-      AMES_LLM_MODEL: auto/best-chat
+    environment: *ames-r7-env
+    command: ["python", "-m", "app.worker", "--facts"]
+    networks: [backend_default]
+
+  ames-backfill-worker-r7:
+    image: ames-r7:local
+    restart: unless-stopped
+    depends_on: [ames-backend-r7]
+    extra_hosts: ["host.docker.internal:host-gateway"]
+    environment: *ames-r7-env
     command: ["python", "-m", "app.worker", "--backfill"]
     networks: [backend_default]
+
 networks:
   backend_default:
     external: true

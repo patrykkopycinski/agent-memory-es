@@ -1,4 +1,5 @@
 """FastAPI app: REST surface + MCP-style tools endpoint + auth middleware."""
+import logging
 import os
 from typing import Optional
 
@@ -9,6 +10,17 @@ from . import auth, memory, pages as pages_mod, mental_models as mm_mod, reranke
 from .store import KINDS, ensure_indices
 
 app = FastAPI(title="agent-memory-es", version="0.2.0")
+
+# uvicorn only configures its own loggers, so without this the per-recall `ames.recall` line is
+# dropped at the root WARNING level. Attached here (not in memory.py) so library/test use of
+# memory.recall() stays silent; AMES_RECALL_LOG=0 turns the line off.
+if os.environ.get("AMES_RECALL_LOG", "1") != "0":
+    _rl = logging.getLogger("ames.recall")
+    if not _rl.handlers:
+        _h = logging.StreamHandler()
+        _h.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
+        _rl.addHandler(_h)
+    _rl.setLevel(logging.INFO)
 
 
 @app.on_event("startup")
@@ -47,6 +59,7 @@ class RecallIn(BaseModel):
     as_of: Optional[str] = None     # ISO-8601 instant the query is asked (cause 3)
     per_doc: Optional[int] = None   # max passages per source doc_group (default 3)
     rerank: Optional[bool] = None   # ES cross-encoder rerank of the fused top-50 (opt-in: AMES_RERANK, default off)
+    rerank_depth: Optional[int] = None  # candidates sent to the reranker (clamped 2..50; default AMES_RERANK_DEPTH)
     filter: Optional[dict] = None   # {all, any, none, narrow_any}: tag filter applied inside ES;
                                     # a filter that matches nothing abstains (results [])
 
@@ -133,7 +146,7 @@ def retain(body: RetainIn, who: dict = Depends(caller)):
 def recall(body: RecallIn, who: dict = Depends(caller)):
     try:
         return memory.recall(who["owner_id"], body.query, body.kinds, body.size,
-                             body.min_score, body.as_of, body.per_doc, body.rerank, body.filter)
+                             body.min_score, body.as_of, body.per_doc, body.rerank, body.filter, body.rerank_depth)
     except tagfilter.FilterError as e:
         raise HTTPException(422, str(e))
 
@@ -260,7 +273,8 @@ def mcp_tool(tool: str, body: dict, who: dict = Depends(caller)):
                                           b.get("occurred_at"), b.get("doc_group")),
         "recall": lambda b: memory.recall(who["owner_id"], b["query"], b.get("kinds"),
                                           b.get("size", 8), b.get("min_score"),
-                                          b.get("as_of"), b.get("per_doc"), b.get("rerank")),
+                                          b.get("as_of"), b.get("per_doc"), b.get("rerank"),
+                                          None, b.get("rerank_depth")),
         "reflect": lambda b: memory.reflect(who["owner_id"], b["question"]),
         "promote": lambda b: memory.promote(who["owner_id"], b["kind"], b["doc_id"], b["to_visibility"]),
     }

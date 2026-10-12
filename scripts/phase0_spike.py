@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Phase 0 spike: index templates, retain/recall, leak test, supersession.
-Run on m1max against am-es-spike (ES 9.6.0-SNAPSHOT, :9268)."""
+Run on a self-hosted host against am-es-spike (ES 9.6.0-SNAPSHOT, :9268)."""
 import json
 import urllib.error
 import urllib.request
@@ -64,7 +64,7 @@ def main():
         "occurred_at": "2026-10-01T09:00:00Z", "active": True})
     # common doc
     retain("semantic", {"kind": "semantic", "owner_id": "bob", "visibility": "common",
-        "text": "Team convention: evals always run on Azure VMs via suite_sweep.py",
+        "text": "Team convention: evals always run on Azure VMs via suite_runner.py",
         "occurred_at": "2026-10-01T09:01:00Z", "active": True})
     import time; time.sleep(1)
 
@@ -79,9 +79,9 @@ def main():
     alice = recall("semantic", "OmniRoute admin token", "alice")
     print("alice own-recall hits:", alice["hits"]["total"]["value"])
 
-    # SHARED TEST: bob recalls "evals Azure suite_sweep"
-    shared = recall("semantic", "evals Azure suite_sweep", "bob")
-    ok = any("suite_sweep" in h["_source"]["text"] for h in shared["hits"]["hits"])
+    # SHARED TEST: bob recalls "evals Azure suite_runner"
+    shared = recall("semantic", "evals Azure suite_runner", "bob")
+    ok = any("suite_runner" in h["_source"]["text"] for h in shared["hits"]["hits"])
     print("SHARED TEST:", "PASS — bob recalls common doc" if ok else "FAIL")
 
     # SUPERSESSION: old fact superseded, history kept
