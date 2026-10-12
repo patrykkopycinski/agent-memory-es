@@ -59,6 +59,7 @@ class RecallIn(BaseModel):
     as_of: Optional[str] = None     # ISO-8601 instant the query is asked (cause 3)
     per_doc: Optional[int] = None   # max passages per source doc_group (default 3)
     rerank: Optional[bool] = None   # ES cross-encoder rerank of the fused top-50 (opt-in: AMES_RERANK, default off)
+    rerank_depth: Optional[int] = None  # candidates sent to the reranker (clamped 2..50; default AMES_RERANK_DEPTH)
     filter: Optional[dict] = None   # {all, any, none, narrow_any}: tag filter applied inside ES;
                                     # a filter that matches nothing abstains (results [])
 
@@ -145,7 +146,7 @@ def retain(body: RetainIn, who: dict = Depends(caller)):
 def recall(body: RecallIn, who: dict = Depends(caller)):
     try:
         return memory.recall(who["owner_id"], body.query, body.kinds, body.size,
-                             body.min_score, body.as_of, body.per_doc, body.rerank, body.filter)
+                             body.min_score, body.as_of, body.per_doc, body.rerank, body.filter, body.rerank_depth)
     except tagfilter.FilterError as e:
         raise HTTPException(422, str(e))
 
@@ -272,7 +273,8 @@ def mcp_tool(tool: str, body: dict, who: dict = Depends(caller)):
                                           b.get("occurred_at"), b.get("doc_group")),
         "recall": lambda b: memory.recall(who["owner_id"], b["query"], b.get("kinds"),
                                           b.get("size", 8), b.get("min_score"),
-                                          b.get("as_of"), b.get("per_doc"), b.get("rerank")),
+                                          b.get("as_of"), b.get("per_doc"), b.get("rerank"),
+                                          None, b.get("rerank_depth")),
         "reflect": lambda b: memory.reflect(who["owner_id"], b["question"]),
         "promote": lambda b: memory.promote(who["owner_id"], b["kind"], b["doc_id"], b["to_visibility"]),
     }

@@ -84,6 +84,8 @@ def run_cell(args, queries, rerank, use_filter):
             "context_chars": payload.get("context_chars"),
             "abstained": bool(payload.get("abstained")),
             "reranked": bool(payload.get("reranked")),
+            "rerank_ms": t.get("rerank"),
+            "fallback_reason": (payload.get("rerank") or {}).get("fallback_reason"),
             "has_timings": "total" in t,
         })
     return summarize(samples, errors, rerank)
@@ -111,6 +113,13 @@ def summarize(samples, errors, rerank):
         fb = sum(1 for s in samples if not s["reranked"])
         cell["rerank_fallbacks"] = fb
         cell["rerank_fallback_rate"] = (fb / n) if n else None
+        cell["rerank_ms"] = stats([s.get("rerank_ms") for s in samples])
+        reasons = {}
+        for s in samples:
+            if not s["reranked"]:
+                k = s.get("fallback_reason") or "unreported"      # "unreported" = old backend
+                reasons[k] = reasons.get(k, 0) + 1
+        cell["rerank_fallback_reasons"] = reasons
     if any(not s["has_timings"] for s in samples):
         cell["warning"] = "server returned no timings_ms for some responses (old backend?)"
     return cell

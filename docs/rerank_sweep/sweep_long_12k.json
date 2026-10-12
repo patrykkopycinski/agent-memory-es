@@ -1,0 +1,587 @@
+{
+ "es": "dedicated ES 9.5.4, 8 vCPU single node",
+ "profile": "long",
+ "docs": 12000,
+ "queries_per_cell": 8,
+ "timeout_s": 120.0,
+ "rows": [
+  {
+   "depth": null,
+   "rerank": false,
+   "conc": 1,
+   "n": 8,
+   "latency_ms": {
+    "p50": 13,
+    "p95": 14,
+    "max": 14,
+    "mean": 13
+   },
+   "applied": 0,
+   "fallbacks": {},
+   "hit@1": 0.875,
+   "hit@8": 0.875,
+   "mrr@8": 0.875,
+   "config": "rerank-off"
+  },
+  {
+   "depth": 10,
+   "rerank": true,
+   "conc": 1,
+   "n": 8,
+   "latency_ms": {
+    "p50": 6343,
+    "p95": 6421,
+    "max": 6421,
+    "mean": 6307
+   },
+   "applied": 8,
+   "fallbacks": {},
+   "hit@1": 1.0,
+   "hit@8": 1.0,
+   "mrr@8": 1.0,
+   "top8_overlap_vs_off": 0.797,
+   "config": "bench-t1a1",
+   "threads": 1,
+   "allocs": 1,
+   "first_call_ms": 30022
+  },
+  {
+   "depth": 20,
+   "rerank": true,
+   "conc": 1,
+   "n": 8,
+   "latency_ms": {
+    "p50": 12456,
+    "p95": 12824,
+    "max": 12824,
+    "mean": 12441
+   },
+   "applied": 8,
+   "fallbacks": {},
+   "hit@1": 1.0,
+   "hit@8": 1.0,
+   "mrr@8": 1.0,
+   "top8_overlap_vs_off": 0.516,
+   "config": "bench-t1a1",
+   "threads": 1,
+   "allocs": 1,
+   "first_call_ms": 30022
+  },
+  {
+   "depth": 30,
+   "rerank": true,
+   "conc": 1,
+   "n": 8,
+   "latency_ms": {
+    "p50": 18926,
+    "p95": 19717,
+    "max": 19717,
+    "mean": 19045
+   },
+   "applied": 8,
+   "fallbacks": {},
+   "hit@1": 1.0,
+   "hit@8": 1.0,
+   "mrr@8": 1.0,
+   "top8_overlap_vs_off": 0.469,
+   "config": "bench-t1a1",
+   "threads": 1,
+   "allocs": 1,
+   "first_call_ms": 30022
+  },
+  {
+   "depth": 50,
+   "rerank": true,
+   "conc": 1,
+   "n": 8,
+   "latency_ms": {
+    "p50": 25414,
+    "p95": 26398,
+    "max": 26398,
+    "mean": 25596
+   },
+   "applied": 8,
+   "fallbacks": {},
+   "hit@1": 1.0,
+   "hit@8": 1.0,
+   "mrr@8": 1.0,
+   "top8_overlap_vs_off": 0.469,
+   "config": "bench-t1a1",
+   "threads": 1,
+   "allocs": 1,
+   "first_call_ms": 30022
+  },
+  {
+   "depth": 30,
+   "rerank": true,
+   "conc": 4,
+   "n": 8,
+   "latency_ms": {
+    "p50": 30024,
+    "p95": 30025,
+    "max": 30025,
+    "mean": 28703
+   },
+   "applied": 1,
+   "fallbacks": {
+    "error": 7
+   },
+   "hit@1": 0.75,
+   "hit@8": 1.0,
+   "mrr@8": 0.838,
+   "top8_overlap_vs_off": 0.969,
+   "config": "bench-t1a1",
+   "threads": 1,
+   "allocs": 1,
+   "first_call_ms": 30022
+  },
+  {
+   "depth": 10,
+   "rerank": true,
+   "conc": 1,
+   "n": 8,
+   "latency_ms": {
+    "p50": 3556,
+    "p95": 3582,
+    "max": 3582,
+    "mean": 3531
+   },
+   "applied": 8,
+   "fallbacks": {},
+   "hit@1": 1.0,
+   "hit@8": 1.0,
+   "mrr@8": 1.0,
+   "top8_overlap_vs_off": 0.875,
+   "config": "bench-t1a2",
+   "threads": 1,
+   "allocs": 2,
+   "first_call_ms": 21121
+  },
+  {
+   "depth": 20,
+   "rerank": true,
+   "conc": 1,
+   "n": 8,
+   "latency_ms": {
+    "p50": 6923,
+    "p95": 7106,
+    "max": 7106,
+    "mean": 6936
+   },
+   "applied": 8,
+   "fallbacks": {},
+   "hit@1": 0.875,
+   "hit@8": 0.875,
+   "mrr@8": 0.875,
+   "top8_overlap_vs_off": 0.484,
+   "config": "bench-t1a2",
+   "threads": 1,
+   "allocs": 2,
+   "first_call_ms": 21121
+  },
+  {
+   "depth": 30,
+   "rerank": true,
+   "conc": 1,
+   "n": 8,
+   "latency_ms": {
+    "p50": 10226,
+    "p95": 10509,
+    "max": 10509,
+    "mean": 10252
+   },
+   "applied": 8,
+   "fallbacks": {},
+   "hit@1": 1.0,
+   "hit@8": 1.0,
+   "mrr@8": 1.0,
+   "top8_overlap_vs_off": 0.484,
+   "config": "bench-t1a2",
+   "threads": 1,
+   "allocs": 2,
+   "first_call_ms": 21121
+  },
+  {
+   "depth": 50,
+   "rerank": true,
+   "conc": 1,
+   "n": 8,
+   "latency_ms": {
+    "p50": 13530,
+    "p95": 13716,
+    "max": 13716,
+    "mean": 13447
+   },
+   "applied": 8,
+   "fallbacks": {},
+   "hit@1": 1.0,
+   "hit@8": 1.0,
+   "mrr@8": 1.0,
+   "top8_overlap_vs_off": 0.562,
+   "config": "bench-t1a2",
+   "threads": 1,
+   "allocs": 2,
+   "first_call_ms": 21121
+  },
+  {
+   "depth": 30,
+   "rerank": true,
+   "conc": 4,
+   "n": 8,
+   "latency_ms": {
+    "p50": 30018,
+    "p95": 30022,
+    "max": 30022,
+    "mean": 26285
+   },
+   "applied": 3,
+   "fallbacks": {
+    "error": 5
+   },
+   "hit@1": 0.875,
+   "hit@8": 0.875,
+   "mrr@8": 0.875,
+   "top8_overlap_vs_off": 0.859,
+   "config": "bench-t1a2",
+   "threads": 1,
+   "allocs": 2,
+   "first_call_ms": 21121
+  },
+  {
+   "depth": 10,
+   "rerank": true,
+   "conc": 1,
+   "n": 8,
+   "latency_ms": {
+    "p50": 4517,
+    "p95": 4602,
+    "max": 4602,
+    "mean": 4496
+   },
+   "applied": 8,
+   "fallbacks": {},
+   "hit@1": 0.875,
+   "hit@8": 0.875,
+   "mrr@8": 0.875,
+   "top8_overlap_vs_off": 0.797,
+   "config": "bench-t2a1",
+   "threads": 2,
+   "allocs": 1,
+   "first_call_ms": 22546
+  },
+  {
+   "depth": 20,
+   "rerank": true,
+   "conc": 1,
+   "n": 8,
+   "latency_ms": {
+    "p50": 9292,
+    "p95": 9554,
+    "max": 9554,
+    "mean": 9257
+   },
+   "applied": 8,
+   "fallbacks": {},
+   "hit@1": 1.0,
+   "hit@8": 1.0,
+   "mrr@8": 1.0,
+   "top8_overlap_vs_off": 0.562,
+   "config": "bench-t2a1",
+   "threads": 2,
+   "allocs": 1,
+   "first_call_ms": 22546
+  },
+  {
+   "depth": 30,
+   "rerank": true,
+   "conc": 1,
+   "n": 8,
+   "latency_ms": {
+    "p50": 14136,
+    "p95": 14313,
+    "max": 14313,
+    "mean": 14069
+   },
+   "applied": 8,
+   "fallbacks": {},
+   "hit@1": 1.0,
+   "hit@8": 1.0,
+   "mrr@8": 1.0,
+   "top8_overlap_vs_off": 0.422,
+   "config": "bench-t2a1",
+   "threads": 2,
+   "allocs": 1,
+   "first_call_ms": 22546
+  },
+  {
+   "depth": 50,
+   "rerank": true,
+   "conc": 1,
+   "n": 8,
+   "latency_ms": {
+    "p50": 18588,
+    "p95": 19331,
+    "max": 19331,
+    "mean": 18635
+   },
+   "applied": 8,
+   "fallbacks": {},
+   "hit@1": 1.0,
+   "hit@8": 1.0,
+   "mrr@8": 1.0,
+   "top8_overlap_vs_off": 0.531,
+   "config": "bench-t2a1",
+   "threads": 2,
+   "allocs": 1,
+   "first_call_ms": 22546
+  },
+  {
+   "depth": 30,
+   "rerank": true,
+   "conc": 4,
+   "n": 8,
+   "latency_ms": {
+    "p50": 30019,
+    "p95": 30023,
+    "max": 30023,
+    "mean": 28928
+   },
+   "applied": 3,
+   "fallbacks": {
+    "error": 5
+   },
+   "hit@1": 0.875,
+   "hit@8": 1.0,
+   "mrr@8": 0.938,
+   "top8_overlap_vs_off": 0.797,
+   "config": "bench-t2a1",
+   "threads": 2,
+   "allocs": 1,
+   "first_call_ms": 22546
+  },
+  {
+   "depth": 10,
+   "rerank": true,
+   "conc": 1,
+   "n": 8,
+   "latency_ms": {
+    "p50": 1814,
+    "p95": 1874,
+    "max": 1874,
+    "mean": 1809
+   },
+   "applied": 8,
+   "fallbacks": {},
+   "hit@1": 0.625,
+   "hit@8": 0.625,
+   "mrr@8": 0.625,
+   "top8_overlap_vs_off": 0.828,
+   "config": "bench-t2a2",
+   "threads": 2,
+   "allocs": 2,
+   "first_call_ms": 13586
+  },
+  {
+   "depth": 20,
+   "rerank": true,
+   "conc": 1,
+   "n": 8,
+   "latency_ms": {
+    "p50": 3584,
+    "p95": 3706,
+    "max": 3706,
+    "mean": 3595
+   },
+   "applied": 8,
+   "fallbacks": {},
+   "hit@1": 0.875,
+   "hit@8": 0.875,
+   "mrr@8": 0.875,
+   "top8_overlap_vs_off": 0.578,
+   "config": "bench-t2a2",
+   "threads": 2,
+   "allocs": 2,
+   "first_call_ms": 13586
+  },
+  {
+   "depth": 30,
+   "rerank": true,
+   "conc": 1,
+   "n": 8,
+   "latency_ms": {
+    "p50": 5324,
+    "p95": 5465,
+    "max": 5465,
+    "mean": 5342
+   },
+   "applied": 8,
+   "fallbacks": {},
+   "hit@1": 1.0,
+   "hit@8": 1.0,
+   "mrr@8": 1.0,
+   "top8_overlap_vs_off": 0.359,
+   "config": "bench-t2a2",
+   "threads": 2,
+   "allocs": 2,
+   "first_call_ms": 13586
+  },
+  {
+   "depth": 50,
+   "rerank": true,
+   "conc": 1,
+   "n": 8,
+   "latency_ms": {
+    "p50": 7185,
+    "p95": 7359,
+    "max": 7359,
+    "mean": 7145
+   },
+   "applied": 8,
+   "fallbacks": {},
+   "hit@1": 1.0,
+   "hit@8": 1.0,
+   "mrr@8": 1.0,
+   "top8_overlap_vs_off": 0.422,
+   "config": "bench-t2a2",
+   "threads": 2,
+   "allocs": 2,
+   "first_call_ms": 13586
+  },
+  {
+   "depth": 30,
+   "rerank": true,
+   "conc": 4,
+   "n": 8,
+   "latency_ms": {
+    "p50": 21291,
+    "p95": 21439,
+    "max": 21439,
+    "mean": 17296
+   },
+   "applied": 8,
+   "fallbacks": {},
+   "hit@1": 1.0,
+   "hit@8": 1.0,
+   "mrr@8": 1.0,
+   "top8_overlap_vs_off": 0.484,
+   "config": "bench-t2a2",
+   "threads": 2,
+   "allocs": 2,
+   "first_call_ms": 13586
+  },
+  {
+   "depth": 10,
+   "rerank": true,
+   "conc": 1,
+   "n": 8,
+   "latency_ms": {
+    "p50": 1832,
+    "p95": 1866,
+    "max": 1866,
+    "mean": 1829
+   },
+   "applied": 8,
+   "fallbacks": {},
+   "hit@1": 1.0,
+   "hit@8": 1.0,
+   "mrr@8": 1.0,
+   "top8_overlap_vs_off": 0.797,
+   "config": "bench-t4a1",
+   "threads": 4,
+   "allocs": 1,
+   "first_call_ms": 13502
+  },
+  {
+   "depth": 20,
+   "rerank": true,
+   "conc": 1,
+   "n": 8,
+   "latency_ms": {
+    "p50": 3623,
+    "p95": 3681,
+    "max": 3681,
+    "mean": 3622
+   },
+   "applied": 8,
+   "fallbacks": {},
+   "hit@1": 1.0,
+   "hit@8": 1.0,
+   "mrr@8": 1.0,
+   "top8_overlap_vs_off": 0.578,
+   "config": "bench-t4a1",
+   "threads": 4,
+   "allocs": 1,
+   "first_call_ms": 13502
+  },
+  {
+   "depth": 30,
+   "rerank": true,
+   "conc": 1,
+   "n": 8,
+   "latency_ms": {
+    "p50": 5538,
+    "p95": 5714,
+    "max": 5714,
+    "mean": 5529
+   },
+   "applied": 8,
+   "fallbacks": {},
+   "hit@1": 1.0,
+   "hit@8": 1.0,
+   "mrr@8": 1.0,
+   "top8_overlap_vs_off": 0.5,
+   "config": "bench-t4a1",
+   "threads": 4,
+   "allocs": 1,
+   "first_call_ms": 13502
+  },
+  {
+   "depth": 50,
+   "rerank": true,
+   "conc": 1,
+   "n": 8,
+   "latency_ms": {
+    "p50": 7183,
+    "p95": 7366,
+    "max": 7366,
+    "mean": 7188
+   },
+   "applied": 8,
+   "fallbacks": {},
+   "hit@1": 1.0,
+   "hit@8": 1.0,
+   "mrr@8": 1.0,
+   "top8_overlap_vs_off": 0.5,
+   "config": "bench-t4a1",
+   "threads": 4,
+   "allocs": 1,
+   "first_call_ms": 13502
+  },
+  {
+   "depth": 30,
+   "rerank": true,
+   "conc": 4,
+   "n": 8,
+   "latency_ms": {
+    "p50": 21908,
+    "p95": 22407,
+    "max": 22407,
+    "mean": 17889
+   },
+   "applied": 8,
+   "fallbacks": {},
+   "hit@1": 1.0,
+   "hit@8": 1.0,
+   "mrr@8": 1.0,
+   "top8_overlap_vs_off": 0.391,
+   "config": "bench-t4a1",
+   "threads": 4,
+   "allocs": 1,
+   "first_call_ms": 13502
+  },
+  {
+   "config": "bench-t4a2",
+   "error": "HTTP Error 429: Too Many Requests"
+  }
+ ]
+}

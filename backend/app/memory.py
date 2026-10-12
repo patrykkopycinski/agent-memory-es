@@ -35,26 +35,52 @@ RECALL_FETCH_CAP = 50
 # Round 5: ES-native cross-encoder rerank (_inference/rerank) over the fused top-RERANK_DEPTH,
 # applied BEFORE the per-doc budget and the size cut (the output budget is unchanged: still
 # `size` passages). Default on; AMES_RERANK=0 or per-request rerank=false disables it. If the
-# endpoint is unavailable the fused order is kept and the response says reranked=false.
-RERANK_DEPTH = int(os.environ.get("AMES_RERANK_DEPTH", "50"))
+# endpoint is unavailable (or slower than AMES_RERANK_TIMEOUT) the fused order is kept and the
+# response carries rerank={requested, applied:false, fallback_reason, depth, ms}.
+RERANK_DEPTH_CAP = 50           # hard ceiling: the cross-encoder cost is linear in depth
+RERANK_DEPTH = min(int(os.environ.get("AMES_RERANK_DEPTH", "50")), RERANK_DEPTH_CAP)
 RERANK_DEFAULT = os.environ.get("AMES_RERANK", "0").strip().lower() in ("1", "true", "yes", "on")
 
 
+def _clamp_depth(depth) -> int:
+    """Per-request depth override -> [2, RERANK_DEPTH_CAP]; absent/garbage -> the configured default."""
+    try:
+        d = int(depth)
+    except (TypeError, ValueError):
+        return RERANK_DEPTH
+    return max(2, min(d, RERANK_DEPTH_CAP))
+
+
 def _rerank_fused(query: str, ordered: list, depth: int = None) -> tuple:
+    """Back-compat wrapper over _rerank_fused_meta: (new_ordered, reranked: bool)."""
+    new, info = _rerank_fused_meta(query, ordered, depth)
+    return new, info["applied"]
+
+
+def _rerank_fused_meta(query: str, ordered: list, depth: int = None) -> tuple:
     """Re-order the top `depth` of the fused list by cross-encoder relevance. Returns
     (new_ordered, reranked: bool). `score` is NOT touched (it stays rrf + recency, so the
     documented invariant and `min_score` semantics hold); the cross-encoder verdict is exposed as
     `rerank_score` and the final position as `rerank_rank`, which _apply_budgets sorts by.
     Candidates the endpoint did not return, and everything beyond `depth`, keep their relative
-    fused order strictly below the reranked ones."""
+    fused order strictly below the reranked ones.
+
+    Returns (new_ordered, info) with info = {requested, applied, fallback_reason, depth, ms}:
+    a rerank that did not happen says so and why (timeout | unavailable | error |
+    too_few_candidates) instead of silently serving the fused order."""
     from . import reranker as _rr
-    depth = RERANK_DEPTH if depth is None else depth
+    depth = RERANK_DEPTH if depth is None else _clamp_depth(depth)
     head, tail = ordered[:depth], ordered[depth:]
+    info = {"requested": True, "applied": False, "fallback_reason": None,
+            "depth": len(head), "ms": 0}
     if len(head) < 2:
-        return ordered, False
+        info["fallback_reason"] = "too_few_candidates"
+        return ordered, info
     out = _rr.rerank(query, head, top_n=len(head))
+    info["ms"] = int(out.get("ms") or 0)
     if not out.get("reranked"):
-        return ordered, False
+        info["fallback_reason"] = out.get("fallback_reason") or "error"
+        return ordered, info
     scored = {h.get("id") for h in out["hits"] if h.get("id") is not None}
     ranked = list(out["hits"])
     ranked += [h for h in head if h.get("id") not in scored]    # never lose a candidate
@@ -67,7 +93,8 @@ def _rerank_fused(query: str, ordered: list, depth: int = None) -> tuple:
             # (covers both an omitted head item and every item beyond `depth`)
             h.pop("rerank_score", None)
         new.append(h)
-    return new, True
+    info["applied"] = True
+    return new, info
 DEDUP_SIM_THRESHOLD = 0.92      # cosine >= this in the same visibility scope => near-dup
 # NOTE (cause 1): dedup is exact-normalized-text-hash ONLY. The spec allowed the
 # alternative "cosine >= 0.99 over the full text", but e5-small embeds only the head,
@@ -461,13 +488,16 @@ def _owner_hash(owner_id: str) -> str:
 
 
 def _log_recall(owner_id: str, size: int, rerank_requested: bool, filtered: bool,
-                abstained: bool, timings: dict) -> None:
+                abstained: bool, timings: dict, rerank_info: Optional[dict] = None) -> None:
     """One structured line per recall. Carries a truncated owner hash and timings only: never
     the query text and never the owner id in clear."""
-    _recall_log.info("ames.recall %s", json.dumps({
-        "owner": _owner_hash(owner_id), "k": size, "rerank": rerank_requested,
-        "filtered": filtered, "abstained": abstained, "timings_ms": timings,
-    }, separators=(",", ":"), sort_keys=True))
+    line = {"owner": _owner_hash(owner_id), "k": size, "rerank": rerank_requested,
+            "filtered": filtered, "abstained": abstained, "timings_ms": timings}
+    if rerank_info is not None:
+        line["rerank_applied"] = rerank_info["applied"]
+        if rerank_info["fallback_reason"]:
+            line["rerank_fallback"] = rerank_info["fallback_reason"]
+    _recall_log.info("ames.recall %s", json.dumps(line, separators=(",", ":"), sort_keys=True))
 
 
 def recall(owner_id: str, query: str, kinds=None, size: int = 8,
@@ -475,7 +505,8 @@ def recall(owner_id: str, query: str, kinds=None, size: int = 8,
            as_of: Optional[str] = None,
            per_doc: Optional[int] = None,
            rerank: Optional[bool] = None,
-           filter: Optional[dict] = None) -> dict:
+           filter: Optional[dict] = None,
+           rerank_depth: Optional[int] = None) -> dict:
     """Hybrid recall: BM25 + kNN fused per-kind, visibility isolation, RRF across kinds.
 
     Returns a single flat `results` list (RRF + recency fused, score-ordered) with
@@ -651,11 +682,12 @@ def recall(owner_id: str, query: str, kinds=None, size: int = 8,
     ordered = sorted(fused.values(), key=lambda x: -x["score"])
     if min_score is not None:
         ordered = [h for h in ordered if h["score"] >= min_score]
-    reranked = False
+    reranked, rerank_info = False, None
     rerank_ms = 0.0
     if rerank_requested:
         t_rerank = time.perf_counter()
-        ordered, reranked = _rerank_fused(query, ordered)
+        ordered, rerank_info = _rerank_fused_meta(query, ordered, rerank_depth)
+        reranked = rerank_info["applied"]
         timings["rerank"] = rerank_ms = _ms(t_rerank)
     window = _apply_budgets(ordered, size, per_doc_budget=per_doc or PER_DOC_BUDGET)
     # Extracted facts have a separate evidence lane and do not displace chunks.
@@ -678,6 +710,8 @@ def recall(owner_id: str, query: str, kinds=None, size: int = 8,
         "doc_groups": len({it.get("doc_group") or it.get("id") for it in window}),
         "reranked": reranked,
     }
+    if rerank_info is not None:
+        out["rerank"] = rerank_info     # additive: only present when a rerank was requested
     if parsed is not None:
         out["filter"] = {"applied": True, "resolved": resolved}
         if vocab_truncated:
@@ -697,7 +731,7 @@ def recall(owner_id: str, query: str, kinds=None, size: int = 8,
         out["temporal"] = temporal_meta
     timings["total"] = _ms(t_start)
     out["timings_ms"] = timings
-    _log_recall(owner_id, size, rerank_requested, parsed is not None, out["abstained"], timings)
+    _log_recall(owner_id, size, rerank_requested, parsed is not None, out["abstained"], timings, rerank_info)
     return out
 
 

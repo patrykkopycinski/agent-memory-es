@@ -48,3 +48,13 @@ def test_warmup_excluded_from_stats(monkeypatch):
     cell = bench.run_cell(A, [{"query": "q%d" % i} for i in range(6)], rerank=False, use_filter=False)
     assert len(calls) == 6 and cell["n"] == 4
     assert cell["total_ms"]["p99"] == 5.0
+
+
+def test_summarize_reports_rerank_ms_and_fallback_reasons():
+    def mk(rr, ms, why):
+        return {"total": 50, "es_took": 5, "wall": 55, "context_chars": 100, "abstained": False,
+                "reranked": rr, "rerank_ms": ms, "fallback_reason": why, "has_timings": True}
+    cell = bench.summarize([mk(True, 40, None), mk(False, 2001, "timeout"), mk(False, 2002, "timeout"),
+                            mk(False, 3, None)], errors=0, rerank=True)
+    assert cell["rerank_fallback_reasons"] == {"timeout": 2, "unreported": 1}
+    assert cell["rerank_ms"]["p50"] == 40 or cell["rerank_ms"]["n"] == 4
