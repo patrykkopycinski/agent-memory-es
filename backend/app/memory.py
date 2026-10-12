@@ -2,6 +2,8 @@
 import datetime as _dt
 import hashlib
 import math
+import json
+import logging
 import os
 import re
 import time
@@ -12,6 +14,8 @@ from .store import KINDS, es, idx, ensure_indices
 from . import embeddings
 from . import tagfilter as _tf
 from . import tombstone
+
+_recall_log = logging.getLogger("ames.recall")
 
 VISIBILITIES = ("private", "team", "common")
 
@@ -448,6 +452,24 @@ def _tag_vocabulary(owner_id: str, kinds: list, keys: list) -> tuple:
     return out, truncated
 
 
+def _ms(t0: float) -> float:
+    return round((time.perf_counter() - t0) * 1000.0, 3)
+
+
+def _owner_hash(owner_id: str) -> str:
+    return hashlib.sha256(owner_id.encode()).hexdigest()[:12]
+
+
+def _log_recall(owner_id: str, size: int, rerank_requested: bool, filtered: bool,
+                abstained: bool, timings: dict) -> None:
+    """One structured line per recall. Carries a truncated owner hash and timings only: never
+    the query text and never the owner id in clear."""
+    _recall_log.info("ames.recall %s", json.dumps({
+        "owner": _owner_hash(owner_id), "k": size, "rerank": rerank_requested,
+        "filtered": filtered, "abstained": abstained, "timings_ms": timings,
+    }, separators=(",", ":"), sort_keys=True))
+
+
 def recall(owner_id: str, query: str, kinds=None, size: int = 8,
            min_score: Optional[float] = None,
            as_of: Optional[str] = None,
@@ -476,9 +498,13 @@ def recall(owner_id: str, query: str, kinds=None, size: int = 8,
     that matches nothing returns `results: []` with `abstained: true` and never an unfiltered
     top-k. With no filter this function is unchanged.
     """
+    t_start = time.perf_counter()
     parsed = _tf.parse_filter(filter)             # FilterError (a ValueError) -> HTTP 422
     flt_extra, flt_not, narrow_tags, resolved, vocab_truncated = [], [], None, {}, False
+    timings = {}
+    rerank_requested = bool(RERANK_DEFAULT if rerank is None else rerank)
     if parsed is not None:
+        t_filter = time.perf_counter()
         if parsed["narrow_any"] is not None:
             def _vocab(keys):
                 nonlocal vocab_truncated
@@ -487,18 +513,28 @@ def recall(owner_id: str, query: str, kinds=None, size: int = 8,
                 return vocab
             narrow_tags, resolved = _tf.resolve_narrow(parsed["narrow_any"], _vocab)
             if not narrow_tags:
-                return _abstained(query, parsed, resolved, vocab_truncated)
+                timings["filter_resolve"] = _ms(t_filter)
+                timings["total"] = _ms(t_start)
+                out = _abstained(query, parsed, resolved, vocab_truncated)
+                out["timings_ms"] = timings
+                out["context_chars"] = 0
+                _log_recall(owner_id, size, rerank_requested, True, True, timings)
+                return out
         flt_extra, flt_not = _tf.es_clauses(parsed, narrow_tags)
+        timings["filter_resolve"] = _ms(t_filter)
     now = None
     if as_of:
         now = _parse_as_of(as_of)
     kinds = kinds or list(KINDS)
     qvec = None
+    t_embed = time.perf_counter()
     try:
         qvec = embeddings.embed([query])[0]
     except Exception:
         pass
+    timings["embed"] = _ms(t_embed)
     results = {}
+    search_by_kind, es_took = {}, 0
     # Over-fetch: the per-doc collapse runs AFTER ranking and can only shrink the list,
     # so each arm must return more than `size` candidates or a size-8 window would come
     # back under-filled whenever a group hits its cap.
@@ -541,14 +577,21 @@ def recall(owner_id: str, query: str, kinds=None, size: int = 8,
                 }},
                 "sort": [{"_score": {"order": "desc"}}, {"occurred_at": {"order": "desc"}}],
             }
+        t_search = time.perf_counter()
         r = es("POST", f"/{idx(kind)}/_search", body)
+        search_by_kind[kind] = _ms(t_search)
+        es_took += r.get("took") or 0
         results[kind] = [
             {"id": h["_id"], "kind": kind, "score": h["_score"],
              **{k: v for k, v in h["_source"].items()
                 if k not in ("kind", "embedding")}}
             for h in r["hits"]["hits"]
         ]
+    timings["search"] = round(sum(search_by_kind.values()), 3)
+    timings["by_kind"] = search_by_kind
+    timings["es_took"] = es_took
     # rank-fusion across kinds (simple RRF, k=RANK_CONSTANT)
+    t_fuse = time.perf_counter()
     fused = {}
     for kind, hits in results.items():
         for rank, h in enumerate(hits):
@@ -609,13 +652,19 @@ def recall(owner_id: str, query: str, kinds=None, size: int = 8,
     if min_score is not None:
         ordered = [h for h in ordered if h["score"] >= min_score]
     reranked = False
-    if (RERANK_DEFAULT if rerank is None else rerank):
+    rerank_ms = 0.0
+    if rerank_requested:
+        t_rerank = time.perf_counter()
         ordered, reranked = _rerank_fused(query, ordered)
+        timings["rerank"] = rerank_ms = _ms(t_rerank)
     window = _apply_budgets(ordered, size, per_doc_budget=per_doc or PER_DOC_BUDGET)
     # Extracted facts have a separate evidence lane and do not displace chunks.
     fact_hits = [h for h in results.get("semantic", []) if h.get("source_id")][:24] if "semantic" in kinds else []
     chunks = [h for h in ordered if not h.get("source_id")][:8]
     evidence = fact_hits + chunks
+    # `fuse` = everything after the per-kind searches, rerank excluded: RRF, the graph and
+    # temporal arms (they issue their own ES calls), recency, budgets.
+    timings["fuse"] = round(max(0.0, _ms(t_fuse) - rerank_ms), 3)
     out = {
         "query": query,
         "results": window,
@@ -646,6 +695,9 @@ def recall(owner_id: str, query: str, kinds=None, size: int = 8,
         pass
     if temporal_meta:
         out["temporal"] = temporal_meta
+    timings["total"] = _ms(t_start)
+    out["timings_ms"] = timings
+    _log_recall(owner_id, size, rerank_requested, parsed is not None, out["abstained"], timings)
     return out
 
 
