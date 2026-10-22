@@ -7,6 +7,8 @@ import urllib.error
 import urllib.request
 from typing import Any, Optional
 
+from . import telemetry as _otel
+
 _NO_ES_URL_MSG = (
     "AMES_ES_URL is not set. Refusing to guess an Elasticsearch target "
     "(the old default localhost:9268 is the PROD tunnel). Set it "
@@ -157,11 +159,16 @@ def es(method: str, path: str, body: Optional[dict] = None, timeout: float = 30)
         _es_url() + path, data=data, method=method,
         headers=_es_headers(),
     )
-    try:
-        return json.load(urllib.request.urlopen(req, timeout=timeout))
-    except urllib.error.HTTPError as e:
-        detail = e.read().decode()[:400]
-        raise RuntimeError(f"ES {method} {path} -> {e.code}: {detail}") from e
+    with _otel.span("es.request", _otel.es_attrs(method, path, None)):
+        try:
+            result = json.load(urllib.request.urlopen(req, timeout=timeout))
+        except urllib.error.HTTPError as e:
+            detail = e.read().decode()[:400]
+            _otel.set_attrs({"es.status_code": e.code,
+                             "error.type": type(e).__name__})
+            raise RuntimeError(f"ES {method} {path} -> {e.code}: {detail}") from e
+        _otel.set_attrs(_otel.es_attrs(method, path, result))
+        return result
 
 
 _indices_ready = False

@@ -9,3 +9,11 @@ httpx>=0.27
 onnxruntime==1.31.1
 tokenizers==0.23.3
 numpy==2.5.4
+# OpenTelemetry: OTLP http/protobuf export to the telemetry-stack collector.
+# app/telemetry.py degrades to a no-op when these are absent, so the backend
+# still boots in a minimal image.
+opentelemetry-api>=1.27
+opentelemetry-sdk>=1.27
+opentelemetry-exporter-otlp>=1.27
+opentelemetry-instrumentation-fastapi>=0.48b0
+opentelemetry-instrumentation-elasticsearch>=0.48b0

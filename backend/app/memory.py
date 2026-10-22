@@ -15,6 +15,7 @@ from .store import KINDS, es, idx, is_doc_miss, ensure_indices, ensure_indices_o
 from . import embeddings
 from . import secrets_guard
 from . import tagfilter as _tf
+from . import telemetry as _otel
 from . import tombstone
 from . import governance
 
@@ -398,6 +399,21 @@ def retain(owner_id: str, kind: str, text: str, visibility: str = "private",
            tags: Optional[list] = None, labels: Optional[list] = None,
            extract_facts: bool = True, supersedes_decision: Optional[str] = None,
            person: Optional[str] = None) -> dict:
+    """OTEL-wrapped retain (`memory.retain` span: kind, visibility, passage and
+    dedup counts; never the memory text). Behaviour is `_retain_guarded`."""
+    with _otel.span("memory.retain", {"memory.kind": kind,
+                                      "memory.visibility": visibility}):
+        out = _retain_guarded(owner_id, kind, text, visibility, occurred_at, doc_group,
+                              tags, labels, extract_facts, supersedes_decision, person=person)
+        _otel.set_attrs(_otel.retain_attrs(owner_id, kind, text, visibility, out))
+        return out
+
+
+def _retain_guarded(owner_id: str, kind: str, text: str, visibility: str = "private",
+                    occurred_at: Optional[str] = None, doc_group: Optional[str] = None,
+                    tags: Optional[list] = None, labels: Optional[list] = None,
+                    extract_facts: bool = True, supersedes_decision: Optional[str] = None,
+                    person: Optional[str] = None) -> dict:
     """Write a memory, refusing text that looks like a credential (ValueError -> HTTP 422) and
     flagging over-long text with a `too_long` hint on the result (the write still happens)."""
     _reject_secret(text, tags)
@@ -1144,6 +1160,31 @@ def recall(owner_id: str, query: str, kinds=None, size: int = 8,
            rerank_depth: Optional[int] = None,
            min_similarity: Optional[float] = None,
            include_inactive_decisions: bool = False) -> dict:
+    """OTEL-wrapped recall: one `memory.recall` span carrying kinds, visibility
+    mix, hit counts and timings (never the query text). Behaviour is
+    `_recall_inner`, unchanged."""
+    with _otel.span("memory.recall", _otel._kind_attrs(kinds)):
+        out = _recall_inner(owner_id, query, kinds, size, min_score, as_of, per_doc,
+                            rerank, filter, rerank_depth, min_similarity,
+                            include_inactive_decisions)
+        attrs = _otel.recall_attrs(owner_id, query, kinds, size, out)
+        timings = out.get("timings_ms") or {}
+        for key in ("embed", "search", "rerank", "fuse", "total"):
+            if isinstance(timings.get(key), (int, float)):
+                attrs[f"memory.ms.{key}"] = timings[key]
+        _otel.set_attrs(attrs)
+        return out
+
+
+def _recall_inner(owner_id: str, query: str, kinds=None, size: int = 8,
+           min_score: Optional[float] = None,
+           as_of: Optional[str] = None,
+           per_doc: Optional[int] = None,
+           rerank: Optional[bool] = None,
+           filter: Optional[dict] = None,
+           rerank_depth: Optional[int] = None,
+           min_similarity: Optional[float] = None,
+           include_inactive_decisions: bool = False) -> dict:
     """Hybrid recall: BM25 + kNN fused per-kind, visibility isolation, RRF across kinds.
 
     Returns a single flat `results` list (RRF + recency fused, score-ordered) with
@@ -1412,6 +1453,14 @@ def recall(owner_id: str, query: str, kinds=None, size: int = 8,
 
 def promote(owner_id: str, kind: str, doc_id: str, to_visibility: str,
             person: Optional[str] = None) -> dict:
+    """OTEL-wrapped promote (`memory.promote` span: kind + target visibility; the
+    guarded text is never an attribute). Behaviour is `_promote_inner`."""
+    with _otel.span("memory.promote", _otel.promote_attrs(owner_id, kind, to_visibility)):
+        return _promote_inner(owner_id, kind, doc_id, to_visibility, person)
+
+
+def _promote_inner(owner_id: str, kind: str, doc_id: str, to_visibility: str,
+            person: Optional[str] = None) -> dict:
     """Copy-on-promote: private -> team/common creates a promoted copy; original stays private."""
     if to_visibility not in ("team", "common"):
         raise ValueError("promotion target must be team or common")
@@ -1505,6 +1554,16 @@ def consolidate(owner_id: str, kind: str = "semantic", similarity_threshold: flo
 
 
 def reflect(owner_id: str, question: str, llm_answer_fn=None, rounds: int = 3) -> dict:
+    """OTEL-wrapped reflect (`memory.reflect` span: query length, rounds run,
+    evidence/source counts, abstain flag; never the question or the answer).
+    Behaviour is `_reflect_inner`."""
+    with _otel.span("memory.reflect"):
+        out = _reflect_inner(owner_id, question, llm_answer_fn, rounds)
+        _otel.set_attrs(_otel.reflect_attrs(owner_id, question, out))
+        return out
+
+
+def _reflect_inner(owner_id: str, question: str, llm_answer_fn=None, rounds: int = 3) -> dict:
     """Answer from memory via a bounded agentic loop: recall (with mental-model
     priority tier), optionally rewrite the query and recall again when evidence is
     thin, synthesize if an LLM fn is provided. Cites only retrieved ids.

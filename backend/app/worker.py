@@ -188,6 +188,8 @@ if __name__ == "__main__":
     # `python -m app.worker`: without this entry the module imports, exits 0,
     # and the container crash-loops under `restart: unless-stopped`.
     import sys
+    from . import telemetry
+    telemetry.configure()   # no-op when AMES_OTEL_ENABLED=0 or opentelemetry is absent
     if "--backfill" in sys.argv:
         from .facts import backfill_loop
         backfill_loop()
