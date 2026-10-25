@@ -773,3 +773,30 @@ def reflect(owner_id: str, question: str, llm_answer_fn=None, rounds: int = 3) -
     return {"question": question, "answer": answer,
             "sources": cited or [s["id"] for s in sources],
             "synthesized": True, "queries": queries_run}
+
+
+def delete(owner_id: str, kind: str, doc_id: str) -> dict:
+    """Hard-delete one memory doc, owner-checked. Multi-passage writes share a
+    doc_group: deleting the head doc also deletes its sibling passages, so a
+    long-retained document cannot linger as orphan passages. The text is
+    tombstoned so the same content cannot be re-retained (retain() consults
+    is_rejected for semantic kind). Cross-owner delete is PermissionError."""
+    if kind not in KINDS:
+        raise ValueError(f"kind must be one of {KINDS}")
+    src = es("GET", f"/{idx(kind)}/_doc/{doc_id}")
+    s = src["_source"]
+    if s["owner_id"] != owner_id:
+        raise PermissionError("only the creator can delete their memory")
+    deleted_ids = [doc_id]
+    group = s.get("doc_group")
+    if group:
+        r = es("POST", f"/{idx(kind)}/_delete_by_query?refresh=true", {
+            "query": {"term": {"doc_group": group}},
+        })
+        deleted_ids = None  # query-scoped; ids not enumerated
+    else:
+        es("DELETE", f"/{idx(kind)}/_doc/{doc_id}?refresh=true")
+    tombstone.reject(owner_id, s.get("text", ""), reason="deleted by owner",
+                     source_id=doc_id)
+    return {"deleted": True, "kind": kind, "doc_id": doc_id,
+            "doc_group": group, "group_deleted": bool(group), "deleted_ids": deleted_ids}
