@@ -142,6 +142,20 @@ def retain(body: RetainIn, who: dict = Depends(caller)):
         raise HTTPException(502, str(e))
 
 
+@app.delete("/memory/{kind}/{doc_id}")
+def delete_memory(kind: str, doc_id: str, who: dict = Depends(caller)):
+    try:
+        return memory.delete(who["owner_id"], kind, doc_id)
+    except ValueError as e:
+        raise HTTPException(422, str(e))
+    except PermissionError:
+        raise HTTPException(403, "only the creator can delete their memory")
+    except RuntimeError as e:
+        if "-> 404:" in str(e):
+            raise HTTPException(404, "memory not found") from None
+        raise
+
+
 @app.post("/memory/recall")
 def recall(body: RecallIn, who: dict = Depends(caller)):
     try:
