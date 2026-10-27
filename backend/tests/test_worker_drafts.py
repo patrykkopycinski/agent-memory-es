@@ -290,8 +290,51 @@ res = memory.recall(O3, "rivendell facts and conventions")
 assert res["mental_model"].get("stale") is False, res["mental_model"]
 print("STALENESS: PASS")
 
+# --- upsert_model is idempotent: refresh updates in place, promotion flips
+# the draft doc itself (no duplicate active models, source_ids preserved).
+O4 = "upsertprobe"
+_wipe(O4)
+r1 = mm.upsert_model(O4, "rivendell facts and conventions", "summary v1")
+assert r1["created"] is True, r1
+r2 = mm.upsert_model(O4, "rivendell facts and conventions", "summary v2")
+assert r2["created"] is False and r2["id"] == r1["id"], (r1, r2)
+assert len(mm.find_models(O4, "rivendell facts and conventions")) == 1
+r3 = mm.upsert_model(O4, "  Rivendell   Facts AND Conventions ", "summary v3")
+assert r3["created"] is False and r3["id"] == r1["id"], r3
+res = memory.recall(O4, "rivendell facts and conventions")
+assert res["mental_model"]["summary"] == "summary v3", res["mental_model"]
+print("UPSERT-IN-PLACE: PASS")
+
+# promotion: the draft doc becomes the active model, keeping source_ids
+os.environ["AMES_MODEL_DRAFTS"] = "1"
+for t in ["Vellum indexes memory into elasticsearch shards",
+          "Vellum compaction runs nightly on the primary node",
+          "Vellum access control is enforced at the gateway"]:
+    memory.retain(O4, "semantic", t)
+_filler(O4, 9)  # keep vellum under the DF cutoff (3/12 = 0.25)
+drafts = _candidate_clusters(O4, min_facts=3)
+assert any("vellum" in x["question_pattern"] for x in drafts), \
+    [x["question_pattern"] for x in drafts]
+draft_id = mm._find_existing_draft(O4, "vellum facts and conventions")["id"]
+os.environ.pop("AMES_MODEL_DRAFTS", None)
+pr = mm.upsert_model(O4, "vellum facts and conventions", "promoted vellum summary")
+assert pr["created"] is False and pr["id"] == draft_id, (pr, draft_id)
+promoted = [m for m in mm.list_models(O4)
+            if m["question_pattern"] == "vellum facts and conventions"]
+assert len(promoted) == 1 and promoted[0]["status"] == "active", promoted
+assert promoted[0].get("source_ids"), "promotion lost draft source_ids"
+assert not [x for x in mm.list_drafts(O4)
+            if "vellum" in x["question_pattern"]], "draft survived promotion"
+# refreshing the promoted model updates the SAME doc
+pr2 = mm.upsert_model(O4, "vellum facts and conventions", "refreshed again")
+assert pr2["created"] is False and pr2["id"] == draft_id, pr2
+assert len([m for m in mm.list_models(O4)
+            if m["question_pattern"] == "vellum facts and conventions"]) == 1
+print("PROMOTION-FLIPS-DRAFT: PASS")
+
 _wipe(O)
 _wipe(O2)
 _wipe(O3)
+_wipe(O4)
 os.environ.pop("AMES_MODEL_DRAFTS", None)  # no flag leak into later modules
 print("test_worker_drafts.py: ALL PASS")
