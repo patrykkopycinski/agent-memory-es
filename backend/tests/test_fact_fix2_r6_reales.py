@@ -8,8 +8,10 @@ import urllib.error
 import pytest
 
 from app import facts
-from test_fact_fix2_reales import _raw_es
+from test_fact_fix2_reales import _raw_es, es_reachable
 from test_fact_fix2_r3_reales import BACKFILLS, QUEUE, doc, runner, seed, setup
+
+pytestmark = pytest.mark.skipif(not es_reachable(), reason="FIX2_ES not set or unreachable")
 from test_fact_fix2_r5_reales import fake_clock
 
 
