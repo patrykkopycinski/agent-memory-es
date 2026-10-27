@@ -255,7 +255,43 @@ res = memory.recall(O, "rivendell facts and conventions")
 assert "mental_model" in res, res.get("mental_model")
 print("PROMOTED-IN-TIER: PASS")
 
+# --- staleness: newer topical fact flags the model, order-independently -----
+# Entity-keyword match, not BM25 min_score: BM25 scores scale with index-wide
+# IDF, so on an empty index the same newer fact scored below the cutoff and
+# this PASSed only when earlier modules had seeded the index (order-dependent).
+O3 = "staleprobe"
+_wipe(O3)
+for t in RIVENDELL_FACTS:
+    memory.retain(O3, "semantic", t)
+mm.upsert_model(O3, "rivendell facts and conventions", "Rivendell summary.")
+res = memory.recall(O3, "rivendell facts and conventions")
+assert res["mental_model"].get("stale") is False, res["mental_model"]
+import time as _t
+_t.sleep(1.1)  # model.updated_at has second granularity
+memory.retain(O3, "semantic", "Rivendell now ships release artifacts through a Railway-hosted runner fleet")
+res = memory.recall(O3, "rivendell facts and conventions")
+assert res["mental_model"].get("stale") is True, res["mental_model"]
+# corpus-size invariance: unrelated owners' docs must not flip the flag
+for o in ("fillerc", "fillerd"):
+    auth.create_key(o)
+    _wipe(o)
+    for t in FILLER_FACTS[:5]:
+        memory.retain(o, "semantic", t)
+res = memory.recall(O3, "rivendell facts and conventions")
+assert res["mental_model"].get("stale") is True, res["mental_model"]
+# an unrelated NEW fact must not stale the model either
+_wipe(O3)
+for t in RIVENDELL_FACTS:
+    memory.retain(O3, "semantic", t)
+mm.upsert_model(O3, "rivendell facts and conventions", "Rivendell summary, again.")
+_t.sleep(1.1)
+memory.retain(O3, "semantic", "The parking garage validator only accepts coins")
+res = memory.recall(O3, "rivendell facts and conventions")
+assert res["mental_model"].get("stale") is False, res["mental_model"]
+print("STALENESS: PASS")
+
 _wipe(O)
 _wipe(O2)
+_wipe(O3)
 os.environ.pop("AMES_MODEL_DRAFTS", None)  # no flag leak into later modules
 print("test_worker_drafts.py: ALL PASS")
