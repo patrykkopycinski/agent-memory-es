@@ -130,18 +130,25 @@ def list_drafts(owner_id: str) -> list:
 
 
 def staleness(owner_id: str, model: dict) -> bool:
-    """True when the owner has ACTIVE semantic facts newer than the model whose
-    text matches the model's question_pattern (BM25 min_score 1.0)."""
+    """True when the owner has ACTIVE semantic facts newer than the model that
+    share an entity with its question_pattern. Keyword match, not BM25
+    min_score: BM25 scores scale with index-wide IDF, so the same fact would
+    flip stale/not-stale as unrelated owners grow the index."""
+    from .memory import extract_entities
     from .store import idx
+    from .worker import _DRAFT_ENTITY_DENYLIST
+    ents = [e for e in extract_entities(model["question_pattern"])
+            if e not in _DRAFT_ENTITY_DENYLIST]
+    if not ents:
+        return False
     r = es("POST", f"/{idx('semantic')}/_search", {
         "size": 1,
         "query": {"bool": {
-            "must": [{"match": {"text": {"query": model["question_pattern"]}}}],
             "filter": [{"term": {"owner_id": owner_id}},
                        {"term": {"active": True}},
+                       {"terms": {"entities": ents}},
                        {"range": {"occurred_at": {"gt": model["updated_at"]}}}],
         }},
-        "min_score": 1.0,
     })
     return r["hits"]["total"]["value"] > 0
 
