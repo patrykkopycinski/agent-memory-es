@@ -32,12 +32,10 @@ PER_DOC_BUDGET = int(os.environ.get("AMES_PER_DOC_BUDGET", "3"))
 RECALL_FETCH_FACTOR = 4         # candidates fetched per arm = size * factor (capped)
 RECALL_FETCH_CAP = 50
 
-# Issue #1: the kNN arm always returns `k` hits, so a nonsense query still gets a rank-1 hit
-# in every kind and the cross-kind RRF hands each kind's #1 the same 1/(RANK_CONSTANT+1). An
-# optional absolute cosine floor on the kNN arm drops hits below it. Default OFF (unset):
-# E5-family cosines are compressed into a narrow band, so a floor must be calibrated against
-# an eval run before it is enabled. Override per request with recall(min_similarity=...) /
-# the API `min_similarity` field, or AMES_KNN_MIN_SIMILARITY.
+# The kNN arm always returns `k` hits, so a nonsense query still gets a rank-1 hit in every
+# kind and the cross-kind RRF hands each kind's #1 the same 1/(RANK_CONSTANT+1). An optional
+# absolute cosine floor drops hits below it. Default OFF: E5-family cosines are compressed into
+# a narrow band, so a floor must be calibrated against an eval run before it is enabled.
 def _parse_similarity(raw):
     if raw in (None, ""):
         return None
