@@ -34,6 +34,15 @@ No Docker? Any ES 8.x works — set `AMES_ES_URL`. Importers & MCP bridge:
 **[docs/RECIPES.md](docs/RECIPES.md)** (recall-before-read, session-end
 retention hooks, what deserves the bank).
 
+## Upgrading fact backfill workers
+
+When upgrading from `abe292d`, some scopes may have been marked `failed` during
+lease recovery or the transition to heartbeated jobs. After deploying the new
+worker, inspect each affected scope and call `retry_failed_backfill(owner_id,
+visibility)` (or `POST /memory/facts/backfill/retry?visibility=private` with the
+owner's key) for every failed scope. A retry resumes from its stored cursor;
+it does not reset the source job's attempts. Do not retry a running scope.
+
 ## Why
 
 Agents forget everything between sessions. This service gives every agent (or human teammate) a memory bank: raw experience, distilled facts, and procedural playbooks — retrievable with hybrid search, isolated per owner, and shareable only on explicit promotion.
