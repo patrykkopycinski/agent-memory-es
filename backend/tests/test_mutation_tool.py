@@ -18,6 +18,7 @@ import pytest
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "..", ".."))     # backend/
 sys.path.insert(0, os.path.join(HERE, "tools"))
+import _safety  # noqa: F401  (script-path guard: conftest bypass)
 
 import mutation_proof  # noqa: E402
 

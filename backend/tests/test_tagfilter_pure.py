@@ -12,6 +12,7 @@ import sys
 import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+import _safety  # noqa: F401  (script-path guard: conftest bypass)
 
 from app import tagfilter as tf  # noqa: E402
 

@@ -3,6 +3,7 @@ import os
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+import _safety  # noqa: F401  (script-path guard: conftest bypass)
 
 import pytest
 from fastapi.testclient import TestClient
