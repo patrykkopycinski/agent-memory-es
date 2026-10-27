@@ -5,9 +5,12 @@ import threading
 import pytest
 
 from app import facts
+from test_fact_fix2_reales import es_reachable
 from test_fact_fix2_r3_reales import (
     BACKFILLS, QUEUE, doc, runner, seed, setup,
 )
+
+pytestmark = pytest.mark.skipif(not es_reachable(), reason="FIX2_ES not set or unreachable")
 
 
 @pytest.mark.parametrize("fails", [False, True], ids=["completed", "error-pending"])
