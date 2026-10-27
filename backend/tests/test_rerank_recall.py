@@ -17,6 +17,14 @@ OWNER = "qrerank"
 Q = "quarterly warehouse relocation budget plan"
 
 
+@pytest.fixture(autouse=True)
+def _generous_rerank_budget(monkeypatch):
+    """The product default (2 s) is an interactive budget. Tests that hit the real _inference
+    endpoint assert rerank semantics, not latency, so a cold or scaling ES must not flip them to a
+    fallback. Timeout behaviour has its own tests in test_rerank_fallback_visibility.py."""
+    monkeypatch.setattr(reranker, "RERANK_TIMEOUT", 60.0)
+
+
 def _items(n=12, groups=4):
     return sorted([{"id": "p%d" % i, "doc_group": "g%d" % (i % groups), "kind": "episodic",
                     "score": 1.0 - i * 0.01, "text": "t%d" % i} for i in range(n)],

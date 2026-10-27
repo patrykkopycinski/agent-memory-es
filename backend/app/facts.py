@@ -10,6 +10,7 @@ import uuid
 import threading
 
 from . import embeddings, llm
+from . import http_retry
 from .store import es, idx, PREFIX
 
 log = logging.getLogger(__name__)
@@ -38,7 +39,8 @@ JOB_MAPPING = {"settings": {"number_of_shards": 1, "number_of_replicas": 0},
                    "state": {"type": "keyword"}, "attempts": {"type": "integer"},
                    "next_at": {"type": "date"}, "lease_until": {"type": "date"},
                    "lease_token": {"type": "keyword"}, "error": {"type": "keyword", "ignore_above": 1024},
-                   "created_at": {"type": "date"}, "finished_at": {"type": "date"}}}}
+                   "created_at": {"type": "date"}, "finished_at": {"type": "date"},
+                   "transient_retries": {"type": "integer"}}}}
 
 
 def _now():
@@ -61,6 +63,8 @@ def ensure_queue():
             except RuntimeError as race:
                 if "-> 400:" not in str(race):
                     raise
+    es("PUT", f"/{QUEUE}/_mapping",
+       {"properties": {"transient_retries": {"type": "integer"}}})
     try:
         es("GET", f"/{CACHE}")
     except RuntimeError as exc:
@@ -363,6 +367,23 @@ def run_once(owner_id=None, job_id=None):
         process(job["source_id"], job["owner_id"])
         _finish(job_id, token, "completed", finished_at=_iso(_now()), error="")
     except Exception as exc:
+        if http_retry.is_transient(exc):
+            # Transient upstream failure: requeue WITHOUT consuming an attempt.
+            transient = job.get("transient_retries", 0) + 1
+            if job.get("transient_retries", 0) >= http_retry.MAX_TRANSIENT_RETRIES:
+                log.exception("fact extraction job %s transient retry %d failed",
+                              job_id, transient)
+                _finish(job_id, token, "failed", error=str(exc)[:900],
+                        transient_retries=transient, finished_at=_iso(_now()))
+            else:
+                log.warning("fact extraction job %s transient failure (%s), "
+                            "requeue %d/%d without consuming an attempt",
+                            job_id, type(exc).__name__, transient, http_retry.MAX_TRANSIENT_RETRIES)
+                _finish(job_id, token, "pending", error=str(exc)[:900],
+                        transient_retries=transient,
+                        next_at=_iso(_now() + dt.timedelta(
+                            seconds=min(900, 60 * 2 ** transient))))
+            return True
         attempts = job["attempts"] + 1
         state = "failed" if attempts >= MAX_ATTEMPTS else "pending"
         log.exception("fact extraction job %s attempt %d %s", job_id, attempts, state)

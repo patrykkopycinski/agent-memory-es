@@ -8,8 +8,8 @@ import json
 import os
 import urllib.request
 
+from . import http_retry
 from .store import _es_url
-
 ES_ENDPOINT = os.environ.get("AMES_ES_INFERENCE", ".multilingual-e5-small-elasticsearch")
 OR_BASE = os.environ.get("AMES_EMBED_BASE", "http://localhost:20128/v1")
 OR_MODEL = os.environ.get("AMES_EMBED_MODEL", "openrouter/google/gemini-embedding-2")
@@ -21,8 +21,7 @@ _backend = None
 def _post(url, body, headers=None, timeout=60):
     req = urllib.request.Request(url, data=json.dumps(body).encode(), method="POST",
                                  headers={"Content-Type": "application/json", **(headers or {})})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return json.load(r)
+    return http_retry.request_json(req, timeout=timeout)
 
 
 def _es_embed(texts):
