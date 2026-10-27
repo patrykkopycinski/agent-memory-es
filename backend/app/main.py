@@ -55,6 +55,20 @@ class PromoteIn(BaseModel):
     to_visibility: str
 
 
+class UpdateIn(BaseModel):
+    kind: str
+    doc_id: str
+    text: Optional[str] = None          # replace the doc text (re-chunked, re-embedded)
+    tags: Optional[list] = None         # replace tags; None = leave untouched
+    visibility: Optional[str] = None    # change visibility in place (no promote guard)
+    occurred_at: Optional[str] = None   # retime in place
+
+
+class DeleteIn(BaseModel):
+    kind: str
+    doc_id: str
+
+
 class ReflectIn(BaseModel):
     question: str
 
@@ -92,6 +106,30 @@ def recall(body: RecallIn, who: dict = Depends(caller)):
 def promote(body: PromoteIn, who: dict = Depends(caller)):
     try:
         return memory.promote(who["owner_id"], body.kind, body.doc_id, body.to_visibility)
+    except (ValueError, PermissionError) as e:
+        raise HTTPException(422 if isinstance(e, ValueError) else 403, str(e))
+
+
+@app.post("/memory/update")
+def update(body: UpdateIn, who: dict = Depends(caller)):
+    if body.text is None and body.tags is None and body.visibility is None \
+            and body.occurred_at is None:
+        raise HTTPException(422, "nothing to update: pass at least one of text/tags/visibility/occurred_at")
+    try:
+        return memory.update(who["owner_id"], body.kind, body.doc_id, body.text,
+                             body.tags, body.visibility, body.occurred_at)
+    except LookupError as e:
+        raise HTTPException(404, str(e))
+    except (ValueError, PermissionError) as e:
+        raise HTTPException(422 if isinstance(e, ValueError) else 403, str(e))
+
+
+@app.post("/memory/delete")
+def delete(body: DeleteIn, who: dict = Depends(caller)):
+    try:
+        return memory.delete(who["owner_id"], body.kind, body.doc_id)
+    except LookupError as e:
+        raise HTTPException(404, str(e))
     except (ValueError, PermissionError) as e:
         raise HTTPException(422 if isinstance(e, ValueError) else 403, str(e))
 
@@ -213,6 +251,10 @@ def mcp_tool(tool: str, body: dict, who: dict = Depends(caller)):
                                           b.get("as_of"), b.get("per_doc"), b.get("rerank")),
         "reflect": lambda b: memory.reflect(who["owner_id"], b["question"]),
         "promote": lambda b: memory.promote(who["owner_id"], b["kind"], b["doc_id"], b["to_visibility"]),
+        "update": lambda b: memory.update(who["owner_id"], b["kind"], b["doc_id"],
+                                          b.get("text"), b.get("tags"),
+                                          b.get("visibility"), b.get("occurred_at")),
+        "delete": lambda b: memory.delete(who["owner_id"], b["kind"], b["doc_id"]),
     }
     if tool not in handlers:
         raise HTTPException(404, f"unknown tool {tool}; available: {sorted(handlers)}")

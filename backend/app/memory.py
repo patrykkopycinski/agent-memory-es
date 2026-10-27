@@ -389,6 +389,143 @@ def retain(owner_id: str, kind: str, text: str, visibility: str = "private",
     return out
 
 
+def _get_source(kind: str, doc_id: str) -> dict:
+    """Fetch _source or raise LookupError (HTTP 404 at the edge), instead of the
+    generic RuntimeError store.es raises on any non-2xx."""
+    try:
+        return es("GET", f"/{idx(kind)}/_doc/{doc_id}")["_source"]
+    except RuntimeError as e:
+        if "-> 404" in str(e):
+            raise LookupError(f"no such {kind} doc: {doc_id}") from e
+        raise
+
+
+def _group_docs(owner_id: str, kind: str, doc_id: str) -> list:
+    """The doc itself + every passage sharing its doc_group, in passage order.
+    doc_id may be any passage of the group (retain returns the first).
+    PermissionError when it belongs to another owner."""
+    s = _get_source(kind, doc_id)
+    if s["owner_id"] != owner_id:
+        raise PermissionError("only the creator can modify their memory")
+    group = s.get("doc_group")
+    if not group:
+        return [doc_id]
+    r = es("POST", f"/{idx(kind)}/_search", {
+        "size": 100,
+        "query": {"bool": {"filter": [{"term": {"doc_group": group}}]}},
+        "sort": [{"passage_index": {"order": "asc"}}],
+    })
+    ids = [h["_id"] for h in r["hits"]["hits"]]
+    return ids or [doc_id]
+
+
+def _log_mutation(intent: str, owner_id: str, kind: str, doc_id: str, detail: dict) -> None:
+    """Best-effort intent log (who/what/when) written BEFORE the mutation runs.
+    A logging failure never blocks the mutation."""
+    from .store import PREFIX
+    doc = {"intent": intent, "owner_id": owner_id, "kind": kind, "doc_id": doc_id,
+           "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "detail": detail}
+    try:
+        es("PUT", f"/{PREFIX}am_mutations", {
+            "settings": {"number_of_shards": 1, "number_of_replicas": 0},
+            "mappings": {"properties": {
+                "intent": {"type": "keyword"}, "owner_id": {"type": "keyword"},
+                "kind": {"type": "keyword"}, "doc_id": {"type": "keyword"},
+                "at": {"type": "date"},
+            }},
+        })
+    except RuntimeError:
+        pass  # already exists
+    # Additive mapping migration (same pattern as store.ensure_indices): indices
+    # created before doc_id was pinned as keyword would otherwise text-map it.
+    try:
+        es("PUT", f"/{PREFIX}am_mutations/_mapping", {"properties": {
+            "intent": {"type": "keyword"}, "owner_id": {"type": "keyword"},
+            "kind": {"type": "keyword"}, "doc_id": {"type": "keyword"},
+            "at": {"type": "date"},
+        }})
+    except RuntimeError:
+        pass
+    try:
+        es("POST", f"/{PREFIX}am_mutations/_doc?refresh=true", doc)
+    except RuntimeError:
+        pass
+
+
+def update(owner_id: str, kind: str, doc_id: str, text=None, tags=None,
+           visibility=None, occurred_at=None) -> dict:
+    """Fix a memory in place: replace text (re-chunked, re-embedded) and/or
+    tags/visibility/occurred_at across the whole doc_group. The group id is
+    stable. Owner-scoped (same check as promote). The new text goes through
+    retain's full path — chunking, per-passage embeddings, tombstone check —
+    pinned to the SAME doc_group and occurred_at, so the edit is a true
+    in-place fix, not a near-duplicate."""
+    if kind not in KINDS:
+        raise ValueError(f"kind must be one of {KINDS}")
+    s = _get_source(kind, doc_id)
+    if s["owner_id"] != owner_id:
+        raise PermissionError("only the creator can modify their memory")
+    if visibility is not None and visibility not in VISIBILITIES:
+        raise ValueError(f"visibility must be one of {VISIBILITIES}")
+    group = s.get("doc_group")
+    occurred = s.get("occurred_at")
+    old_tags = s.get(_tf.TAG_FIELD)
+    old_text = s["text"] if text is not None else None
+    old_ids = _group_docs(owner_id, kind, doc_id) if text is not None else []
+    new_tags = _tf.norm_tags(tags) if tags is not None else None
+    if text is not None and text_hash(text) == text_hash(old_text) and new_tags is None \
+            and visibility in (None, s["visibility"]):
+        return {"_id": doc_id, "doc_group": group or doc_id, "updated": False,
+                "note": "no-op: identical normalized text, tags and visibility"}
+    _log_mutation("update", owner_id, kind, doc_id,
+                  {"old_text": old_text, "new_text": text, "old_ids": old_ids,
+                   "old_tags": old_tags, "tags": tags, "visibility": visibility})
+    if text is not None:
+        if len(old_ids) == 1:
+            es("DELETE", f"/{idx(kind)}/_doc/{old_ids[0]}?refresh=true")
+        else:
+            es("POST", f"/{idx(kind)}/_delete_by_query?refresh=true",
+               {"query": {"term": {"doc_group": group}}})
+        r = retain(owner_id, kind, text, visibility or s["visibility"],
+                   occurred_at=occurred, doc_group=group, tags=new_tags)
+        return {"_id": r["_id"], "doc_group": r.get("doc_group", group),
+                "passages": r.get("passages"), "updated": True}
+    patch = {}
+    if new_tags is not None:
+        patch[_tf.TAG_FIELD] = list(new_tags)
+    if visibility is not None:
+        patch["visibility"] = visibility
+    if occurred_at is not None:
+        patch["occurred_at"] = occurred_at
+    if patch:
+        for i in old_ids or _group_docs(owner_id, kind, doc_id):
+            es("POST", f"/{idx(kind)}/_update/{i}?refresh=true", {"doc": patch})
+    return {"_id": doc_id, "doc_group": group or doc_id,
+            "passages": len(old_ids), "updated": bool(patch)}
+
+
+def delete(owner_id: str, kind: str, doc_id: str) -> dict:
+    """Delete a memory (the whole doc_group) by id. Owner-scoped: another owner's
+    doc is a PermissionError (HTTP 403), matching promote. Intent (who/when/what)
+    is logged to am_mutations BEFORE the delete runs."""
+    if kind not in KINDS:
+        raise ValueError(f"kind must be one of {KINDS}")
+    s = _get_source(kind, doc_id)
+    if s["owner_id"] != owner_id:
+        raise PermissionError("only the creator can delete their memory")
+    group = s.get("doc_group")
+    _log_mutation("delete", owner_id, kind, doc_id,
+                  {"text": s["text"], "doc_group": group,
+                   "visibility": s.get("visibility")})
+    ids = _group_docs(owner_id, kind, doc_id)
+    if len(ids) == 1:
+        es("DELETE", f"/{idx(kind)}/_doc/{ids[0]}?refresh=true")
+    else:
+        es("POST", f"/{idx(kind)}/_delete_by_query?refresh=true",
+           {"query": {"term": {"doc_group": group}}})
+    return {"deleted": ids, "doc_group": group or doc_id}
+
+
 def _visibility_filter(owner_id: str) -> dict:
     # private docs: only creator. team/common docs shared.
     return {"bool": {"should": [
