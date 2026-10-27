@@ -15,6 +15,22 @@ ALICE = auth.create_key("alice")
 BOB = auth.create_key("bob")
 H = lambda k: {"X-API-Key": k}  # noqa: E731
 
+from app.store import es, PREFIX, idx  # noqa: E402
+
+# Rerunnability on a persistent ES: deletes tombstone the exact test texts, so
+# a second run's retain of the same text would 422. Wipe our owners' docs and
+# tombstones at import (both suites share the alice/bob owners).
+for kind in ("semantic", "episodic", "procedural"):
+    es("POST", f"/{idx(kind)}/_delete_by_query?refresh=true",
+       {"query": {"bool": {"should": [
+           {"term": {"owner_id": "alice"}}, {"term": {"owner_id": "bob"}}]}}})
+try:
+    es("POST", f"/{PREFIX}am_rejected/_delete_by_query?refresh=true",
+       {"query": {"bool": {"should": [
+           {"term": {"owner_id": "alice"}}, {"term": {"owner_id": "bob"}}]}}})
+except RuntimeError:
+    pass
+
 
 def _retain(key, kind="semantic", text="x", doc_group=None):
     r = client.post("/memory/retain", headers=H(key),

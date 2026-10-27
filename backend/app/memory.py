@@ -561,7 +561,9 @@ def update(owner_id: str, kind: str, doc_id: str, text=None, tags=None,
 def delete(owner_id: str, kind: str, doc_id: str) -> dict:
     """Delete a memory (the whole doc_group) by id. Owner-scoped: another owner's
     doc is a PermissionError (HTTP 403), matching promote. Intent (who/when/what)
-    is logged to am_mutations BEFORE the delete runs."""
+    is logged to am_mutations BEFORE the delete runs. The deleted text is
+    tombstoned so the same content cannot be re-retained (retain() consults
+    is_rejected for semantic kind)."""
     if kind not in KINDS:
         raise ValueError(f"kind must be one of {KINDS}")
     s = _get_source(kind, doc_id)
@@ -577,7 +579,15 @@ def delete(owner_id: str, kind: str, doc_id: str) -> dict:
     else:
         es("POST", f"/{idx(kind)}/_delete_by_query?refresh=true",
            {"query": {"term": {"doc_group": group}}})
-    return {"deleted": ids, "doc_group": group or doc_id}
+    tombstone.reject(owner_id, s.get("text", ""), reason="deleted by owner",
+                     source_id=doc_id)
+    # Unified return shape: REST contract (test_delete.py, a96df78) pins
+    # deleted=bool + group_deleted + deleted_ids; the POST suite uses
+    # deleted_ids for membership. ids enumerated via _group_docs (passage order).
+    return {"deleted": True, "doc_group": group or doc_id,
+            "kind": kind, "doc_id": doc_id,
+            "group_deleted": bool(ids), "deleted_ids": ids,
+            "tombstoned": True}
 
 
 def _visibility_filter(owner_id: str) -> dict:
@@ -998,28 +1008,11 @@ def reflect(owner_id: str, question: str, llm_answer_fn=None, rounds: int = 3) -
             "synthesized": True, "queries": queries_run}
 
 
-def delete(owner_id: str, kind: str, doc_id: str) -> dict:
-    """Hard-delete one memory doc, owner-checked. Multi-passage writes share a
-    doc_group: deleting the head doc also deletes its sibling passages, so a
-    long-retained document cannot linger as orphan passages. The text is
-    tombstoned so the same content cannot be re-retained (retain() consults
-    is_rejected for semantic kind). Cross-owner delete is PermissionError."""
-    if kind not in KINDS:
-        raise ValueError(f"kind must be one of {KINDS}")
-    src = es("GET", f"/{idx(kind)}/_doc/{doc_id}")
-    s = src["_source"]
-    if s["owner_id"] != owner_id:
-        raise PermissionError("only the creator can delete their memory")
-    deleted_ids = [doc_id]
-    group = s.get("doc_group")
-    if group:
-        r = es("POST", f"/{idx(kind)}/_delete_by_query?refresh=true", {
-            "query": {"term": {"doc_group": group}},
-        })
-        deleted_ids = None  # query-scoped; ids not enumerated
-    else:
-        es("DELETE", f"/{idx(kind)}/_doc/{doc_id}?refresh=true")
-    tombstone.reject(owner_id, s.get("text", ""), reason="deleted by owner",
-                     source_id=doc_id)
-    return {"deleted": True, "kind": kind, "doc_id": doc_id,
-            "doc_group": group, "group_deleted": bool(group), "deleted_ids": deleted_ids}
+def _delete_superseded_note():
+    """a96df78's delete() was removed here: it shadowed (was later in the file
+    than) the unified delete() above after the feat/memory-mutation-api merge.
+    Both call surfaces (REST DELETE /memory/{kind}/{doc_id} and POST
+    /memory/delete) now use that single delete() with superset semantics:
+    intent log (am_mutations) + tombstone + group cascade + owner check + 404
+    via LookupError. Contracts pinned by test_delete.py and test_update_delete.py."""
+    return None

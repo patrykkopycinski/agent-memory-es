@@ -164,6 +164,8 @@ def delete_memory(kind: str, doc_id: str, who: dict = Depends(caller)):
         raise HTTPException(422, str(e))
     except PermissionError:
         raise HTTPException(403, "only the creator can delete their memory")
+    except LookupError as e:
+        raise HTTPException(404, str(e)) from None
     except RuntimeError as e:
         if "-> 404:" in str(e):
             raise HTTPException(404, "memory not found") from None

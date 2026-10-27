@@ -37,10 +37,14 @@ def _clean():
             {"query": {"bool": {"should": [
                 {"term": {"owner_id": "mutationalice"}},
                 {"term": {"owner_id": "mutationbob"}}]}}})
-    try:
-        _es("DELETE", f"/{_P}am_mutations")
-    except RuntimeError:
-        pass
+    for _idxname in (f"{_P}am_rejected", f"{_P}am_mutations"):
+        try:
+            _es("POST", f"/{_idxname}/_delete_by_query?refresh=true",
+                {"query": {"bool": {"should": [
+                    {"term": {"owner_id": "mutationalice"}},
+                    {"term": {"owner_id": "mutationbob"}}]}}})
+        except RuntimeError:
+            pass
 
 
 _clean()
@@ -107,7 +111,7 @@ def test_delete_removes_doc():
     doc = _retain(ALICE, text="deletable scratch fact marker unique-zz9p")
     r = _delete(ALICE, doc["_id"])
     assert r.status_code == 200, r.text
-    assert doc["_id"] in r.json()["deleted"]
+    assert doc["_id"] in r.json()["deleted_ids"]
     assert not any("unique-zz9p" in t for t in _recall_texts(ALICE, "deletable scratch fact"))
 
 
