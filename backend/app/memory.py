@@ -2,6 +2,8 @@
 import datetime as _dt
 import hashlib
 import math
+import json
+import logging
 import os
 import re
 import time
@@ -12,6 +14,8 @@ from .store import KINDS, es, idx, ensure_indices
 from . import embeddings
 from . import tagfilter as _tf
 from . import tombstone
+
+_recall_log = logging.getLogger("ames.recall")
 
 VISIBILITIES = ("private", "team", "common")
 
@@ -48,26 +52,52 @@ KNN_MIN_SIMILARITY = _parse_similarity(os.environ.get("AMES_KNN_MIN_SIMILARITY")
 # Round 5: ES-native cross-encoder rerank (_inference/rerank) over the fused top-RERANK_DEPTH,
 # applied BEFORE the per-doc budget and the size cut (the output budget is unchanged: still
 # `size` passages). Default on; AMES_RERANK=0 or per-request rerank=false disables it. If the
-# endpoint is unavailable the fused order is kept and the response says reranked=false.
-RERANK_DEPTH = int(os.environ.get("AMES_RERANK_DEPTH", "50"))
+# endpoint is unavailable (or slower than AMES_RERANK_TIMEOUT) the fused order is kept and the
+# response carries rerank={requested, applied:false, fallback_reason, depth, ms}.
+RERANK_DEPTH_CAP = 50           # hard ceiling: the cross-encoder cost is linear in depth
+RERANK_DEPTH = min(int(os.environ.get("AMES_RERANK_DEPTH", "50")), RERANK_DEPTH_CAP)
 RERANK_DEFAULT = os.environ.get("AMES_RERANK", "0").strip().lower() in ("1", "true", "yes", "on")
 
 
+def _clamp_depth(depth) -> int:
+    """Per-request depth override -> [2, RERANK_DEPTH_CAP]; absent/garbage -> the configured default."""
+    try:
+        d = int(depth)
+    except (TypeError, ValueError):
+        return RERANK_DEPTH
+    return max(2, min(d, RERANK_DEPTH_CAP))
+
+
 def _rerank_fused(query: str, ordered: list, depth: int = None) -> tuple:
+    """Back-compat wrapper over _rerank_fused_meta: (new_ordered, reranked: bool)."""
+    new, info = _rerank_fused_meta(query, ordered, depth)
+    return new, info["applied"]
+
+
+def _rerank_fused_meta(query: str, ordered: list, depth: int = None) -> tuple:
     """Re-order the top `depth` of the fused list by cross-encoder relevance. Returns
     (new_ordered, reranked: bool). `score` is NOT touched (it stays rrf + recency, so the
     documented invariant and `min_score` semantics hold); the cross-encoder verdict is exposed as
     `rerank_score` and the final position as `rerank_rank`, which _apply_budgets sorts by.
     Candidates the endpoint did not return, and everything beyond `depth`, keep their relative
-    fused order strictly below the reranked ones."""
+    fused order strictly below the reranked ones.
+
+    Returns (new_ordered, info) with info = {requested, applied, fallback_reason, depth, ms}:
+    a rerank that did not happen says so and why (timeout | unavailable | error |
+    too_few_candidates) instead of silently serving the fused order."""
     from . import reranker as _rr
-    depth = RERANK_DEPTH if depth is None else depth
+    depth = RERANK_DEPTH if depth is None else _clamp_depth(depth)
     head, tail = ordered[:depth], ordered[depth:]
+    info = {"requested": True, "applied": False, "fallback_reason": None,
+            "depth": len(head), "ms": 0}
     if len(head) < 2:
-        return ordered, False
+        info["fallback_reason"] = "too_few_candidates"
+        return ordered, info
     out = _rr.rerank(query, head, top_n=len(head))
+    info["ms"] = int(out.get("ms") or 0)
     if not out.get("reranked"):
-        return ordered, False
+        info["fallback_reason"] = out.get("fallback_reason") or "error"
+        return ordered, info
     scored = {h.get("id") for h in out["hits"] if h.get("id") is not None}
     ranked = list(out["hits"])
     ranked += [h for h in head if h.get("id") not in scored]    # never lose a candidate
@@ -80,7 +110,8 @@ def _rerank_fused(query: str, ordered: list, depth: int = None) -> tuple:
             # (covers both an omitted head item and every item beyond `depth`)
             h.pop("rerank_score", None)
         new.append(h)
-    return new, True
+    info["applied"] = True
+    return new, info
 DEDUP_SIM_THRESHOLD = 0.92      # cosine >= this in the same visibility scope => near-dup
 # NOTE (cause 1): dedup is exact-normalized-text-hash ONLY. The spec allowed the
 # alternative "cosine >= 0.99 over the full text", but e5-small embeds only the head,
@@ -429,6 +460,153 @@ def retain(owner_id: str, kind: str, text: str, visibility: str = "private",
     return out
 
 
+def _get_source(kind: str, doc_id: str) -> dict:
+    """Fetch _source or raise LookupError (HTTP 404 at the edge), instead of the
+    generic RuntimeError store.es raises on any non-2xx."""
+    try:
+        return es("GET", f"/{idx(kind)}/_doc/{doc_id}")["_source"]
+    except RuntimeError as e:
+        if "-> 404" in str(e):
+            raise LookupError(f"no such {kind} doc: {doc_id}") from e
+        raise
+
+
+def _group_docs(owner_id: str, kind: str, doc_id: str) -> list:
+    """The doc itself + every passage sharing its doc_group, in passage order.
+    doc_id may be any passage of the group (retain returns the first).
+    PermissionError when it belongs to another owner."""
+    s = _get_source(kind, doc_id)
+    if s["owner_id"] != owner_id:
+        raise PermissionError("only the creator can modify their memory")
+    group = s.get("doc_group")
+    if not group:
+        return [doc_id]
+    r = es("POST", f"/{idx(kind)}/_search", {
+        "size": 100,
+        "query": {"bool": {"filter": [{"term": {"doc_group": group}}]}},
+        "sort": [{"passage_index": {"order": "asc"}}],
+    })
+    ids = [h["_id"] for h in r["hits"]["hits"]]
+    return ids or [doc_id]
+
+
+def _log_mutation(intent: str, owner_id: str, kind: str, doc_id: str, detail: dict) -> None:
+    """Best-effort intent log (who/what/when) written BEFORE the mutation runs.
+    A logging failure never blocks the mutation."""
+    from .store import PREFIX
+    doc = {"intent": intent, "owner_id": owner_id, "kind": kind, "doc_id": doc_id,
+           "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "detail": detail}
+    try:
+        es("PUT", f"/{PREFIX}am_mutations", {
+            "settings": {"number_of_shards": 1, "number_of_replicas": 0},
+            "mappings": {"properties": {
+                "intent": {"type": "keyword"}, "owner_id": {"type": "keyword"},
+                "kind": {"type": "keyword"}, "doc_id": {"type": "keyword"},
+                "at": {"type": "date"},
+            }},
+        })
+    except RuntimeError:
+        pass  # already exists
+    # Additive mapping migration (same pattern as store.ensure_indices): indices
+    # created before doc_id was pinned as keyword would otherwise text-map it.
+    try:
+        es("PUT", f"/{PREFIX}am_mutations/_mapping", {"properties": {
+            "intent": {"type": "keyword"}, "owner_id": {"type": "keyword"},
+            "kind": {"type": "keyword"}, "doc_id": {"type": "keyword"},
+            "at": {"type": "date"},
+        }})
+    except RuntimeError:
+        pass
+    try:
+        es("POST", f"/{PREFIX}am_mutations/_doc?refresh=true", doc)
+    except RuntimeError:
+        pass
+
+
+def update(owner_id: str, kind: str, doc_id: str, text=None, tags=None,
+           visibility=None, occurred_at=None) -> dict:
+    """Fix a memory in place: replace text (re-chunked, re-embedded) and/or
+    tags/visibility/occurred_at across the whole doc_group. The group id is
+    stable. Owner-scoped (same check as promote). The new text goes through
+    retain's full path — chunking, per-passage embeddings, tombstone check —
+    pinned to the SAME doc_group and occurred_at, so the edit is a true
+    in-place fix, not a near-duplicate."""
+    if kind not in KINDS:
+        raise ValueError(f"kind must be one of {KINDS}")
+    s = _get_source(kind, doc_id)
+    if s["owner_id"] != owner_id:
+        raise PermissionError("only the creator can modify their memory")
+    if visibility is not None and visibility not in VISIBILITIES:
+        raise ValueError(f"visibility must be one of {VISIBILITIES}")
+    group = s.get("doc_group")
+    occurred = s.get("occurred_at")
+    old_tags = s.get(_tf.TAG_FIELD)
+    old_text = s["text"] if text is not None else None
+    old_ids = _group_docs(owner_id, kind, doc_id) if text is not None else []
+    new_tags = _tf.norm_tags(tags) if tags is not None else None
+    if text is not None and text_hash(text) == text_hash(old_text) and new_tags is None \
+            and visibility in (None, s["visibility"]):
+        return {"_id": doc_id, "doc_group": group or doc_id, "updated": False,
+                "note": "no-op: identical normalized text, tags and visibility"}
+    _log_mutation("update", owner_id, kind, doc_id,
+                  {"old_text": old_text, "new_text": text, "old_ids": old_ids,
+                   "old_tags": old_tags, "tags": tags, "visibility": visibility})
+    if text is not None:
+        if len(old_ids) == 1:
+            es("DELETE", f"/{idx(kind)}/_doc/{old_ids[0]}?refresh=true")
+        else:
+            es("POST", f"/{idx(kind)}/_delete_by_query?refresh=true",
+               {"query": {"term": {"doc_group": group}}})
+        r = retain(owner_id, kind, text, visibility or s["visibility"],
+                   occurred_at=occurred, doc_group=group, tags=new_tags)
+        return {"_id": r["_id"], "doc_group": r.get("doc_group", group),
+                "passages": r.get("passages"), "updated": True}
+    patch = {}
+    if new_tags is not None:
+        patch[_tf.TAG_FIELD] = list(new_tags)
+    if visibility is not None:
+        patch["visibility"] = visibility
+    if occurred_at is not None:
+        patch["occurred_at"] = occurred_at
+    if patch:
+        for i in old_ids or _group_docs(owner_id, kind, doc_id):
+            es("POST", f"/{idx(kind)}/_update/{i}?refresh=true", {"doc": patch})
+    return {"_id": doc_id, "doc_group": group or doc_id,
+            "passages": len(old_ids), "updated": bool(patch)}
+
+
+def delete(owner_id: str, kind: str, doc_id: str) -> dict:
+    """Delete a memory (the whole doc_group) by id. Owner-scoped: another owner's
+    doc is a PermissionError (HTTP 403), matching promote. Intent (who/when/what)
+    is logged to am_mutations BEFORE the delete runs. The deleted text is
+    tombstoned so the same content cannot be re-retained (retain() consults
+    is_rejected for semantic kind)."""
+    if kind not in KINDS:
+        raise ValueError(f"kind must be one of {KINDS}")
+    s = _get_source(kind, doc_id)
+    if s["owner_id"] != owner_id:
+        raise PermissionError("only the creator can delete their memory")
+    group = s.get("doc_group")
+    _log_mutation("delete", owner_id, kind, doc_id,
+                  {"text": s["text"], "doc_group": group,
+                   "visibility": s.get("visibility")})
+    ids = _group_docs(owner_id, kind, doc_id)
+    if len(ids) == 1:
+        es("DELETE", f"/{idx(kind)}/_doc/{ids[0]}?refresh=true")
+    else:
+        es("POST", f"/{idx(kind)}/_delete_by_query?refresh=true",
+           {"query": {"term": {"doc_group": group}}})
+    tombstone.reject(owner_id, s.get("text", ""), reason="deleted by owner",
+                     source_id=doc_id)
+    # Unified return shape: REST contract (test_delete.py, a96df78) pins
+    # deleted=bool + group_deleted + deleted_ids; the POST suite uses
+    # deleted_ids for membership. ids enumerated via _group_docs (passage order).
+    return {"deleted": True, "doc_group": group or doc_id,
+            "kind": kind, "doc_id": doc_id,
+            "group_deleted": bool(ids), "deleted_ids": ids,
+            "tombstoned": True}
+
+
 def _visibility_filter(owner_id: str) -> dict:
     # private docs: only creator. team/common docs shared.
     return {"bool": {"should": [
@@ -465,12 +643,34 @@ def _tag_vocabulary(owner_id: str, kinds: list, keys: list) -> tuple:
     return out, truncated
 
 
+def _ms(t0: float) -> float:
+    return round((time.perf_counter() - t0) * 1000.0, 3)
+
+
+def _owner_hash(owner_id: str) -> str:
+    return hashlib.sha256(owner_id.encode()).hexdigest()[:12]
+
+
+def _log_recall(owner_id: str, size: int, rerank_requested: bool, filtered: bool,
+                abstained: bool, timings: dict, rerank_info: Optional[dict] = None) -> None:
+    """One structured line per recall. Carries a truncated owner hash and timings only: never
+    the query text and never the owner id in clear."""
+    line = {"owner": _owner_hash(owner_id), "k": size, "rerank": rerank_requested,
+            "filtered": filtered, "abstained": abstained, "timings_ms": timings}
+    if rerank_info is not None:
+        line["rerank_applied"] = rerank_info["applied"]
+        if rerank_info["fallback_reason"]:
+            line["rerank_fallback"] = rerank_info["fallback_reason"]
+    _recall_log.info("ames.recall %s", json.dumps(line, separators=(",", ":"), sort_keys=True))
+
+
 def recall(owner_id: str, query: str, kinds=None, size: int = 8,
            min_score: Optional[float] = None,
            as_of: Optional[str] = None,
            per_doc: Optional[int] = None,
            rerank: Optional[bool] = None,
            filter: Optional[dict] = None,
+           rerank_depth: Optional[int] = None,
            min_similarity: Optional[float] = None) -> dict:
     """Hybrid recall: BM25 + kNN fused per-kind, visibility isolation, RRF across kinds.
 
@@ -494,9 +694,13 @@ def recall(owner_id: str, query: str, kinds=None, size: int = 8,
     that matches nothing returns `results: []` with `abstained: true` and never an unfiltered
     top-k. With no filter this function is unchanged.
     """
+    t_start = time.perf_counter()
     parsed = _tf.parse_filter(filter)             # FilterError (a ValueError) -> HTTP 422
     flt_extra, flt_not, narrow_tags, resolved, vocab_truncated = [], [], None, {}, False
+    timings = {}
+    rerank_requested = bool(RERANK_DEFAULT if rerank is None else rerank)
     if parsed is not None:
+        t_filter = time.perf_counter()
         if parsed["narrow_any"] is not None:
             def _vocab(keys):
                 nonlocal vocab_truncated
@@ -505,19 +709,29 @@ def recall(owner_id: str, query: str, kinds=None, size: int = 8,
                 return vocab
             narrow_tags, resolved = _tf.resolve_narrow(parsed["narrow_any"], _vocab)
             if not narrow_tags:
-                return _abstained(query, parsed, resolved, vocab_truncated)
+                timings["filter_resolve"] = _ms(t_filter)
+                timings["total"] = _ms(t_start)
+                out = _abstained(query, parsed, resolved, vocab_truncated)
+                out["timings_ms"] = timings
+                out["context_chars"] = 0
+                _log_recall(owner_id, size, rerank_requested, True, True, timings)
+                return out
         flt_extra, flt_not = _tf.es_clauses(parsed, narrow_tags)
+        timings["filter_resolve"] = _ms(t_filter)
     now = None
     if as_of:
         now = _parse_as_of(as_of)
     kinds = kinds or list(KINDS)
     sim_floor = KNN_MIN_SIMILARITY if min_similarity is None else _parse_similarity(min_similarity)
     qvec = None
+    t_embed = time.perf_counter()
     try:
         qvec = embeddings.embed([query])[0]
     except Exception:
         pass
+    timings["embed"] = _ms(t_embed)
     results = {}
+    search_by_kind, es_took = {}, 0
     # Over-fetch: the per-doc collapse runs AFTER ranking and can only shrink the list,
     # so each arm must return more than `size` candidates or a size-8 window would come
     # back under-filled whenever a group hits its cap.
@@ -561,14 +775,21 @@ def recall(owner_id: str, query: str, kinds=None, size: int = 8,
                 }},
                 "sort": [{"_score": {"order": "desc"}}, {"occurred_at": {"order": "desc"}}],
             }
+        t_search = time.perf_counter()
         r = es("POST", f"/{idx(kind)}/_search", body)
+        search_by_kind[kind] = _ms(t_search)
+        es_took += r.get("took") or 0
         results[kind] = [
             {"id": h["_id"], "kind": kind, "score": h["_score"],
              **{k: v for k, v in h["_source"].items()
                 if k not in ("kind", "embedding")}}
             for h in r["hits"]["hits"]
         ]
+    timings["search"] = round(sum(search_by_kind.values()), 3)
+    timings["by_kind"] = search_by_kind
+    timings["es_took"] = es_took
     # rank-fusion across kinds (simple RRF, k=RANK_CONSTANT)
+    t_fuse = time.perf_counter()
     fused = {}
     for kind, hits in results.items():
         for rank, h in enumerate(hits):
@@ -628,14 +849,21 @@ def recall(owner_id: str, query: str, kinds=None, size: int = 8,
     ordered = sorted(fused.values(), key=lambda x: -x["score"])
     if min_score is not None:
         ordered = [h for h in ordered if h["score"] >= min_score]
-    reranked = False
-    if (RERANK_DEFAULT if rerank is None else rerank):
-        ordered, reranked = _rerank_fused(query, ordered)
+    reranked, rerank_info = False, None
+    rerank_ms = 0.0
+    if rerank_requested:
+        t_rerank = time.perf_counter()
+        ordered, rerank_info = _rerank_fused_meta(query, ordered, rerank_depth)
+        reranked = rerank_info["applied"]
+        timings["rerank"] = rerank_ms = _ms(t_rerank)
     window = _apply_budgets(ordered, size, per_doc_budget=per_doc or PER_DOC_BUDGET)
     # Extracted facts have a separate evidence lane and do not displace chunks.
     fact_hits = [h for h in results.get("semantic", []) if h.get("source_id")][:24] if "semantic" in kinds else []
     chunks = [h for h in ordered if not h.get("source_id")][:8]
     evidence = fact_hits + chunks
+    # `fuse` = everything after the per-kind searches, rerank excluded: RRF, the graph and
+    # temporal arms (they issue their own ES calls), recency, budgets.
+    timings["fuse"] = round(max(0.0, _ms(t_fuse) - rerank_ms), 3)
     out = {
         "query": query,
         "results": window,
@@ -649,6 +877,8 @@ def recall(owner_id: str, query: str, kinds=None, size: int = 8,
         "doc_groups": len({it.get("doc_group") or it.get("id") for it in window}),
         "reranked": reranked,
     }
+    if rerank_info is not None:
+        out["rerank"] = rerank_info     # additive: only present when a rerank was requested
     if parsed is not None:
         out["filter"] = {"applied": True, "resolved": resolved}
         if vocab_truncated:
@@ -666,6 +896,9 @@ def recall(owner_id: str, query: str, kinds=None, size: int = 8,
         pass
     if temporal_meta:
         out["temporal"] = temporal_meta
+    timings["total"] = _ms(t_start)
+    out["timings_ms"] = timings
+    _log_recall(owner_id, size, rerank_requested, parsed is not None, out["abstained"], timings, rerank_info)
     return out
 
 
@@ -793,3 +1026,13 @@ def reflect(owner_id: str, question: str, llm_answer_fn=None, rounds: int = 3) -
     return {"question": question, "answer": answer,
             "sources": cited or [s["id"] for s in sources],
             "synthesized": True, "queries": queries_run}
+
+
+def _delete_superseded_note():
+    """a96df78's delete() was removed here: it shadowed (was later in the file
+    than) the unified delete() above after the feat/memory-mutation-api merge.
+    Both call surfaces (REST DELETE /memory/{kind}/{doc_id} and POST
+    /memory/delete) now use that single delete() with superset semantics:
+    intent log (am_mutations) + tombstone + group cascade + owner check + 404
+    via LookupError. Contracts pinned by test_delete.py and test_update_delete.py."""
+    return None
