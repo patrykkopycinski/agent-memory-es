@@ -44,3 +44,5 @@ if os.environ.get("AMES_TEST_OFFLINE") != "1":
     _mm.ensure_models_index()
     _pg.ensure_pages_index()
     _tb._ensure_index()
+else:
+    store._indices_ready = True  # offline units mock memory.es; don't bootstrap a dead ES
