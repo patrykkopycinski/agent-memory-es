@@ -36,7 +36,11 @@ def ensure_models_index() -> None:
 
 def upsert_model(owner_id: str, question_pattern: str, summary: str,
                  visibility: str = "private") -> dict:
-    """Explicit owner-curated model — the ONLY path to status=active."""
+    """Explicit owner-curated model — the ONLY path to status=active.
+    Idempotent per (owner, question_pattern): an existing model of any
+    status is updated in place (summary, visibility, status=active) instead
+    of appending a duplicate — promoting a worker draft flips that draft
+    doc to active, keeping its source_ids provenance."""
     ensure_models_index()
     doc = {
         "owner_id": owner_id, "visibility": visibility,
@@ -44,8 +48,13 @@ def upsert_model(owner_id: str, question_pattern: str, summary: str,
         "updated_at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "status": "active",
     }
+    existing = _find_existing_model(owner_id, question_pattern)
+    if existing is not None:
+        es("POST", f"/{PREFIX}am_models/_update/{existing['id']}?refresh=true",
+           {"doc": doc})
+        return {"id": existing["id"], "created": False, **doc}
     r = es("POST", f"/{PREFIX}am_models/_doc?refresh=true", doc)
-    return {"id": r["_id"], **doc}
+    return {"id": r["_id"], "created": True, **doc}
 
 
 def normalize_pattern(pattern: str) -> str:
@@ -99,17 +108,21 @@ def propose_draft(owner_id: str, question_pattern: str, summary: str,
     return {"id": r["_id"], "created": True, **doc}
 
 
-def _find_existing_draft(owner_id: str, question_pattern: str) -> dict | None:
-    """Newest draft with this exact owner + question_pattern, or None."""
+def _find_existing_model(owner_id: str, question_pattern: str,
+                         status: Optional[str] = None) -> dict | None:
+    """Newest model (any status, or the given one) with this exact owner +
+    question_pattern, or None."""
     ensure_models_index()
     # question_pattern is a text field (loose matching elsewhere), so filter
     # by match_phrase then verify the exact normalized string client-side.
+    filters = [{"term": {"owner_id": owner_id}}]
+    if status:
+        filters.append({"term": {"status": status}})
     r = es("POST", f"/{PREFIX}am_models/_search", {
         "size": 20,
-        "query": {"bool": {"filter": [
-            {"term": {"owner_id": owner_id}},
-            {"term": {"status": "draft"}},
-        ], "must": [{"match_phrase": {"question_pattern": question_pattern}}]}},
+        "query": {"bool": {"filter": filters,
+                           "must": [{"match_phrase": {"question_pattern":
+                                                      question_pattern}}]}},
         "sort": [{"updated_at": {"order": "desc"}}],
     })
     for h in r["hits"]["hits"]:
@@ -117,6 +130,10 @@ def _find_existing_draft(owner_id: str, question_pattern: str) -> dict | None:
                 == normalize_pattern(question_pattern):
             return {"id": h["_id"], **h["_source"]}
     return None
+
+
+def _find_existing_draft(owner_id: str, question_pattern: str) -> dict | None:
+    return _find_existing_model(owner_id, question_pattern, status="draft")
 
 
 def list_drafts(owner_id: str) -> list:
