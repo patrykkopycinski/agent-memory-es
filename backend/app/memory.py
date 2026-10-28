@@ -669,10 +669,8 @@ def delete(owner_id: str, kind: str, doc_id: str) -> dict:
     else:
         es("POST", f"/{idx(kind)}/_delete_by_query?refresh=true",
            {"query": _owned_group_query(owner_id, group)})
-    tombstoned = kind == "semantic"
-    if tombstoned:
-        tombstone.reject(owner_id, s.get("text", ""), reason="deleted by owner",
-                         source_id=doc_id)
+    tombstoned = kind == "semantic" and tombstone.reject(
+        owner_id, s.get("text", ""), reason="deleted by owner", source_id=doc_id) is not None
     # Unified return shape: REST contract (test_delete.py, a96df78) pins
     # deleted=bool + group_deleted + deleted_ids; the POST suite uses
     # deleted_ids for membership. ids enumerated via _group_docs (passage order).

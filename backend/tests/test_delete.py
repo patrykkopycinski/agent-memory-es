@@ -89,6 +89,16 @@ def test_delete_tombstone_semantic_only():
         assert _tombstones_for(m["_id"]) == 0
 
 
+def test_delete_termless_text_writes_no_tombstone():
+    m = _retain(ALICE, text="ok")
+    d = client.delete(f"/memory/semantic/{m['_id']}", headers=H(ALICE)).json()
+    assert d["deleted"] is True and d["tombstoned"] is False
+    assert _tombstones_for(m["_id"]) == 0
+    again = client.post("/memory/retain", headers=H(ALICE),
+                        json={"kind": "semantic", "text": "no", "extract_facts": False})
+    assert again.status_code == 200, again.text
+
+
 def test_delete_group_cascade():
     """Multi-passage retain shares doc_group: delete head deletes all passages."""
     filler = " ".join(f"passage filler {i}" for i in range(200))  # > CHUNK_TARGET_CHARS
