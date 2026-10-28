@@ -16,6 +16,7 @@ labelled query->doc pairs, the lowest relevant cosine is 0.840 and the highest n
 cosine is 0.833. The positive control fails loudly if a different model shifts that
 range.
 """
+import json
 import os
 import sys
 
@@ -99,9 +100,10 @@ def test_floor_keeps_long_procedural_doc_for_on_topic_query():
     assert _in_top3(ON_TOPIC, FLOOR)
 
 
-def test_floor_alone_leaves_long_procedural_doc_top3_for_unrelated_questions():
+def test_floor_alone_leaves_long_procedural_doc_top3_for_unrelated_questions(monkeypatch):
     # Control for the next test: without stopword stripping the lexical arm matches
     # the/of/is, so the kNN floor cannot keep the doc out.
+    monkeypatch.setattr(memory, "LEXICAL_STOPWORDS", False)
     assert any(_in_top3(q, FLOOR) for q in UNRELATED)
 
 
@@ -130,3 +132,30 @@ def test_stopword_clause_strips_text_query_and_keeps_entities_raw(monkeypatch):
 def test_all_stopword_query_matches_no_text(monkeypatch):
     monkeypatch.setattr(memory, "LEXICAL_STOPWORDS", True)
     assert memory._lexical_clause("the of is")["bool"]["should"][0]["match"]["text"]["query"] == ""
+
+
+def _recall_body_text(monkeypatch, query):
+    # recall() with es/embed stubbed: the JSON of every _search body it sends.
+    sent = []
+
+    def fake_es(method, path, body=None):
+        if path.endswith("/_search"):
+            sent.append(json.dumps(body, sort_keys=True))
+        return {"hits": {"hits": []}}
+
+    monkeypatch.setattr(memory.embeddings, "embed", lambda texts: [[0.1] * 384 for _ in texts])
+    monkeypatch.setattr(memory, "es", fake_es)
+    memory.recall("u-shape", query, kinds=["procedural"], size=3, rerank=False)
+    assert sent
+    return "\n".join(sent)
+
+
+def test_recall_sends_lexical_clause_off_and_on(monkeypatch):
+    q = "what is the capital of france"
+    monkeypatch.setattr(memory, "LEXICAL_STOPWORDS", False)
+    off = _recall_body_text(monkeypatch, q)
+    assert json.dumps(memory._lexical_clause(q), sort_keys=True) in off
+    monkeypatch.setattr(memory, "LEXICAL_STOPWORDS", True)
+    on = _recall_body_text(monkeypatch, q)
+    assert '"multi_match"' not in on
+    assert json.dumps({"match": {"text": {"boost": 3, "query": "what capital france"}}}, sort_keys=True) in on
