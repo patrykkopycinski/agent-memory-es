@@ -51,6 +51,12 @@ services:
     environment:
       AMES_ES_URL: http://ames-es:9200
       AMES_EMBED_BACKEND: es
+      # Without the backend's key store known_owners() is empty and every
+      # consolidation pass is a silent no-op.
+      AMES_API_KEYS_FILE: /data/ames_keys.json
+      AMES_CONSOLIDATE_INTERVAL: "600"
+    volumes:
+      - ames-app-data:/data
     command: python -m app.worker
 
 volumes:
