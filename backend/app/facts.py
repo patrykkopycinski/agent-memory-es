@@ -24,7 +24,36 @@ BACKFILL_MAPPING = {"settings": {"number_of_shards": 1, "number_of_replicas": 0}
         "lease_token": {"type": "keyword"}, "lease_until": {"type": "date"},
         "created_at": {"type": "date"}, "finished_at": {"type": "date"}}}}
 MAX_ATTEMPTS = 4
-LEASE_SECONDS = 3600  # covers bounded extraction + 12 judgement calls at 120s each
+
+
+class BackfillHeartbeatAbort(RuntimeError):
+    """Scope lease renewal failed; do not charge the source's retry budget."""
+
+
+LEASE_SECONDS = 3600  # generic-worker lease; upstream calls have bounded retry budgets
+# Backfill claims use short leases for both scope and job; the heartbeat renews
+# only this holder's minted job token. Dead holders become claimable after at most
+# BACKFILL_LEASE_SECONDS plus clock skew (assuming synchronized hosts).
+# Generic workers retain the longer, non-heartbeated LEASE_SECONDS horizon.
+BACKFILL_LEASE_SECONDS = 90
+HEARTBEAT_SECONDS = 15
+# inner-loop no-progress limit: run_once attempts that change nothing
+MAX_SCHEDULED_WAIT = 2 * 900  # 2x the largest backoff we ever schedule
+NO_PROGRESS_LIMIT = 30
+MAX_CONSECUTIVE_RUN_FAILURES = 3
+
+
+def _parse_iso(value):
+    """Parse a stored ISO timestamp to an aware UTC datetime, or None."""
+    if not value:
+        return None
+    try:
+        stamp = dt.datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=dt.timezone.utc)
+    return stamp.astimezone(dt.timezone.utc)
 MAX_FACTS = 12
 MAX_FACT_CHARS = 320
 PROMPT_VERSION = "document-v2"
@@ -119,7 +148,8 @@ def retry_failed_job(owner_id, job_id):
         raise ValueError("only failed jobs can be retried")
     es("POST", f"/{QUEUE}/_update/{job_id}?if_seq_no={current['_seq_no']}&if_primary_term={current['_primary_term']}&refresh=true",
        {"doc": {"state": "pending", "attempts": 0, "next_at": _iso(_now()),
-                "error": "", "finished_at": None, "lease_token": None, "lease_until": None}})
+                "error": "", "finished_at": None, "lease_token": None, "lease_until": None,
+                "transient_retries": 0}})
     return {"state": "pending", "job_id": job_id}
 
 
@@ -142,7 +172,7 @@ def retry_failed_backfill(owner_id, visibility):
     return backfill_status(owner_id, visibility)
 
 
-def claim(owner_id=None, job_id=None):
+def claim(owner_id=None, job_id=None, lease_seconds=LEASE_SECONDS):
     now = _now()
     response = es("POST", f"/{QUEUE}/_search", {"size": 20, "seq_no_primary_term": True,
         "sort": [{"next_at": {"order": "asc", "missing": "_last"}}], "query": {"bool": {"should": [
@@ -163,7 +193,7 @@ def claim(owner_id=None, job_id=None):
         token = uuid.uuid4().hex
         try:
             es("POST", f"/{QUEUE}/_update/{hit['_id']}?if_seq_no={hit['_seq_no']}&if_primary_term={hit['_primary_term']}&refresh=true",
-               {"doc": {"state": "running", "lease_until": _iso(now + dt.timedelta(seconds=LEASE_SECONDS)),
+               {"doc": {"state": "running", "lease_until": _iso(now + dt.timedelta(seconds=lease_seconds)),
                         "lease_token": token}})
             return hit["_id"], hit["_source"], token
         except RuntimeError as exc:
@@ -173,17 +203,17 @@ def claim(owner_id=None, job_id=None):
 
 
 def _finish(job_id, token, state, **fields):
-    current = es("GET", f"/{QUEUE}/_doc/{job_id}")
-    if current["_source"].get("lease_token") != token:
-        return False
-    try:
-        es("POST", f"/{QUEUE}/_update/{job_id}?if_seq_no={current['_seq_no']}&if_primary_term={current['_primary_term']}&refresh=true",
-           {"doc": {"state": state, **fields}})
-        return True
-    except RuntimeError as exc:
-        if "-> 409:" in str(exc):
+    for attempt in range(5):
+        current = es("GET", f"/{QUEUE}/_doc/{job_id}")
+        if current["_source"].get("lease_token") != token:
             return False
-        raise
+        try:
+            es("POST", f"/{QUEUE}/_update/{job_id}?if_seq_no={current['_seq_no']}&if_primary_term={current['_primary_term']}&refresh=true",
+               {"doc": {"state": state, **fields}})
+            return True
+        except RuntimeError as exc:
+            if "-> 409:" not in str(exc) or attempt == 4:
+                raise
 
 
 def _date(value):
@@ -268,8 +298,8 @@ def _replacement_ids(owner, visibility, vector, text, date):
                 "future" if isinstance(i, str) and any(
                     h["_id"] == i and h["_source"].get("valid_from", "") > date
                     for h in candidates) else "unknown")
-            log.warning("supersession dropped id: fact=%r id=%r reason=%s",
-                        text[:80], i, reason)
+            log.warning("supersession dropped id: fact_sha=%s id=%r reason=%s",
+                        hashlib.sha256(text.encode()).hexdigest()[:12], i, reason)
     return list(dict.fromkeys(kept))
 
 
@@ -315,13 +345,19 @@ def _passages(source_id, source):
     return [(h["_id"], h["_source"]["text"]) for h in hits]
 
 
-def process(source_id, owner_id):
+def process(source_id, owner_id, abort=None):
+    def check_abort():
+        if abort is not None and abort.is_set():
+            raise BackfillHeartbeatAbort("backfill heartbeat abort (lease renewal failed)")
+
+    check_abort()
     source = es("GET", f"/{idx('episodic')}/_doc/{source_id}")["_source"]
     if source["owner_id"] != owner_id or not source.get("active", True):
         raise ValueError("source missing, inactive, or owner mismatch")
     date = _date(source["occurred_at"])
     passages = _passages(source_id, source)
     for fact in _document_facts(passages, date):
+        check_abort()
         fact_id = hashlib.sha256(f"{owner_id}\0{source_id}\0{fact}".encode()).hexdigest()
         # Retry after a partial failure must finish any missing history links.
         existing = None
@@ -346,6 +382,7 @@ def process(source_id, owner_id):
                    "entities": [], "occurred_at": source["occurred_at"], "active": True,
                    "valid_from": date, "doc_group": source.get("doc_group", source_id),
                    "supersedes": replacements}
+            check_abort()
             try:
                 es("PUT", f"/{idx('semantic')}/_create/{fact_id}?refresh=true", doc)
             except RuntimeError as exc:
@@ -358,15 +395,29 @@ def process(source_id, owner_id):
                 "params": {"owner": owner_id, "scope": source["visibility"], "newid": fact_id, "date": date}}})
 
 
-def run_once(owner_id=None, job_id=None):
-    claimed = claim(owner_id, job_id) if owner_id or job_id else claim()
+def run_once(owner_id=None, job_id=None, on_claim=None, on_finish=None, abort=None):
+    claimed = claim(owner_id, job_id, lease_seconds=BACKFILL_LEASE_SECONDS) if on_claim else (
+        claim(owner_id, job_id) if owner_id or job_id else claim())
     if claimed is None:
         return False
     job_id, job, token = claimed
     try:
-        process(job["source_id"], job["owner_id"])
-        _finish(job_id, token, "completed", finished_at=_iso(_now()), error="")
+        if on_claim:
+            on_claim(job_id, token)
+        if abort is not None and abort.is_set():
+            raise BackfillHeartbeatAbort("backfill heartbeat abort (lease renewal failed)")
+        if abort is None:
+            process(job["source_id"], job["owner_id"])
+        else:
+            process(job["source_id"], job["owner_id"], abort=abort)
+        if abort is not None and abort.is_set():
+            raise BackfillHeartbeatAbort("backfill heartbeat abort (lease renewal failed)")
+    except BackfillHeartbeatAbort:
+        _finish(job_id, token, "pending", next_at=_iso(_now()))
     except Exception as exc:
+        if abort is not None and abort.is_set():
+            _finish(job_id, token, "pending", next_at=_iso(_now()))
+            return True
         if http_retry.is_transient(exc):
             # Transient upstream failure: requeue WITHOUT consuming an attempt.
             transient = job.get("transient_retries", 0) + 1
@@ -390,6 +441,13 @@ def run_once(owner_id=None, job_id=None):
         _finish(job_id, token, state, attempts=attempts, error=str(exc)[:900],
                 next_at=_iso(_now() + dt.timedelta(seconds=min(300, 2 ** attempts * 5))),
                 **({"finished_at": _iso(_now())} if state == "failed" else {}))
+    else:
+        # Finalization failures are not extraction failures. Leave the lease for
+        # reclaim rather than charging a successfully processed source an attempt.
+        _finish(job_id, token, "completed", finished_at=_iso(_now()), error="")
+    finally:
+        if on_finish:
+            on_finish()
     return True
 
 
@@ -437,20 +495,66 @@ def backfill_status(owner_id, visibility):
 
 
 def _update_backfill(key, token, **fields):
-    current = es("GET", f"/{BACKFILLS}/_doc/{key}")
-    if current["_source"].get("lease_token") != token or current["_source"]["state"] != "running":
-        raise RuntimeError("backfill lease lost")
-    es("POST", f"/{BACKFILLS}/_update/{key}?if_seq_no={current['_seq_no']}&if_primary_term={current['_primary_term']}&refresh=true",
-       {"doc": fields})
-
-
-def _heartbeat(key, token, stop):
-    while not stop.wait(30):
+    for attempt in range(5):
+        current = es("GET", f"/{BACKFILLS}/_doc/{key}")
+        if current["_source"].get("lease_token") != token or current["_source"]["state"] != "running":
+            raise RuntimeError("backfill lease lost")
         try:
-            _update_backfill(key, token, lease_until=_iso(_now() + dt.timedelta(seconds=LEASE_SECONDS)))
-        except Exception:
-            log.exception("backfill lease renewal failed: %s", key)
+            es("POST", f"/{BACKFILLS}/_update/{key}?if_seq_no={current['_seq_no']}&if_primary_term={current['_primary_term']}&refresh=true",
+               {"doc": fields})
             return
+        except RuntimeError as exc:
+            if "-> 409:" not in str(exc) or attempt == 4:
+                raise
+
+
+def _heartbeat(key, token, stop, abort=None, current_job=None, job_lock=None):
+    """Renew the backfill and this holder's job every HEARTBEAT_SECONDS.
+    Retry scope renewal twice within the same interval; abort before its lease
+    expires. Job renewal failures are logged separately and never abort scope.
+    """
+    while not stop.wait(HEARTBEAT_SECONDS):
+        for attempt in range(3):
+            try:
+                _update_backfill(key, token,
+                                 lease_until=_iso(_now() + dt.timedelta(
+                                     seconds=BACKFILL_LEASE_SECONDS)))
+                break
+            except Exception:
+                log.exception("backfill lease renewal failed (%d/3): %s", attempt + 1, key)
+                if attempt == 2:
+                    if abort is not None:
+                        abort.set()
+                    return
+                if stop.wait(min(2, HEARTBEAT_SECONDS / 4)):
+                    return
+        if current_job is not None and job_lock is not None:
+            with job_lock:
+                job_id = current_job.get("id")
+                job_token = current_job.get("token")
+            if job_id and job_token:
+                try:
+                    if not _renew_job_lease(job_id, job_token):
+                        log.warning("job lease renewal skipped (lost token/state): %s", job_id)
+                except Exception:
+                    log.exception("job lease renewal failed: %s", job_id)
+
+
+def _renew_job_lease(job_id, token):
+    """Extend a running job's lease only while its minted token remains held."""
+    current = es("GET", f"/{QUEUE}/_doc/{job_id}")
+    if current["_source"].get("lease_token") != token or current["_source"].get("state") != "running":
+        return False
+    try:
+        es("POST", f"/{QUEUE}/_update/{job_id}?if_seq_no={current['_seq_no']}"
+                   f"&if_primary_term={current['_primary_term']}&refresh=true",
+           {"doc": {"lease_until": _iso(_now() + dt.timedelta(
+               seconds=BACKFILL_LEASE_SECONDS))}})
+        return True
+    except RuntimeError as exc:
+        if "-> 409:" not in str(exc):
+            raise
+        return False
 
 
 def claim_backfill():
@@ -466,7 +570,7 @@ def claim_backfill():
         try:
             es("POST", f"/{BACKFILLS}/_update/{hit['_id']}?if_seq_no={hit['_seq_no']}&if_primary_term={hit['_primary_term']}&refresh=true",
                {"doc": {"state": "running", "lease_token": token,
-                        "lease_until": _iso(_now() + dt.timedelta(seconds=LEASE_SECONDS))}})
+                        "lease_until": _iso(_now() + dt.timedelta(seconds=BACKFILL_LEASE_SECONDS))}})
             return hit["_id"], hit["_source"], token
         except RuntimeError as exc:
             if "-> 409:" not in str(exc):
@@ -474,11 +578,57 @@ def claim_backfill():
     return None
 
 
-def _run_backfill(key, doc, token):
+def _run_backfill(key, doc, token, abort=None, current_job=None, job_lock=None):
     owner_id, visibility = doc["owner_id"], doc["visibility"]
     after = json.loads(doc["cursor"]) if doc.get("cursor") else None
     queued = doc.get("queued", 0)
+    no_progress = 0
+    lease_warned = False
+    last_run_error = None
+    consecutive_run_failures = 0
+
+    def _track(job_id, job_token):
+        if current_job is not None and job_lock is not None:
+            with job_lock:
+                current_job["id"] = job_id
+                current_job["token"] = job_token
+
+    def _untrack():
+        if current_job is not None and job_lock is not None:
+            with job_lock:
+                current_job.pop("id", None)
+                current_job.pop("token", None)
+    def _run_and_count_failures():
+        """Review6 F3: a non-abort exception out of run_once (e.g. a finalize
+        5x409 or transport error) must not fail the whole scope. Log it and
+        count no progress; the job keeps its running lease and is reclaimed
+        by lease expiry."""
+        nonlocal last_run_error, consecutive_run_failures
+        try:
+            result = run_once(owner_id, job_id, on_claim=_track, on_finish=_untrack, abort=abort)
+            consecutive_run_failures = 0
+            return result
+        except Exception as exc:
+            if abort is not None and abort.is_set():
+                raise
+            last_run_error = f"{type(exc).__name__}: {str(exc)[:200]}"
+            consecutive_run_failures += 1
+            if consecutive_run_failures >= MAX_CONSECUTIVE_RUN_FAILURES:
+                # Each failed run re-arms the job lease, which looks like progress
+                # to the poll loop; without this cap a deterministic failure
+                # re-runs extraction every lease forever.
+                raise RuntimeError(
+                    f"backfill {key}: job {job_id} failed after processing "
+                    f"{consecutive_run_failures} times in a row; last run_once error: "
+                    f"{last_run_error}") from exc
+            log.warning("backfill %s: job %s run_once failed after processing "
+                        "(%s: %s); leaving for lease reclaim, counting no progress",
+                        key, job_id, type(exc).__name__, str(exc)[:200])
+            return False
+
     while True:
+        if abort is not None and abort.is_set():
+            raise RuntimeError(f"backfill {key}: heartbeat abort (lease renewal failed)")
         body = {"size": 1, "query": {"bool": {"filter": [
             {"term": {"owner_id": owner_id}}, {"term": {"visibility": visibility}},
             {"term": {"passage_index": 0}}, {"term": {"active": True}}]}},
@@ -491,26 +641,102 @@ def _run_backfill(key, doc, token):
             return
         hit = hits[0]
         job_id = enqueue(owner_id, hit["_id"])
+        consecutive_run_failures = 0   # the cap is per job, not per scope
         es("POST", f"/{idx('episodic')}/_update/{hit['_id']}?refresh=true",
            {"doc": {"fact_requested": True}})
         while True:
+            if abort is not None and abort.is_set():
+                raise RuntimeError(f"backfill {key}: heartbeat abort (lease renewal failed)")
             job = es("GET", f"/{QUEUE}/_doc/{job_id}")["_source"]
             if job["state"] == "completed":
                 break
             if job["state"] == "failed":
                 raise RuntimeError(f"backfill job failed: {job_id}: {job.get('error')}")
-            now = _iso(_now())
-            if job["state"] == "pending" and job["next_at"] <= now:
-                run_once(owner_id, job_id)
-            elif job["state"] == "running" and job.get("lease_until", "") <= now:
+            now_dt = _now()
+            lease_dt = _parse_iso(job.get("lease_until"))
+            next_dt = _parse_iso(job.get("next_at"))
+            before = (job["state"], job.get("lease_until"), job.get("attempts"))
+            if job["state"] == "running" and lease_dt is None:
+                # a running job without a parsable lease is never "expired" —
+                # stealing it could double-process. It counts toward the no-progress
+                # abort so a permanently unleased job cannot stall the scope.
+                if not lease_warned:
+                    log.warning("job %s running without parsable lease_until=%r; waiting",
+                                job_id, job.get("lease_until"))
+                    lease_warned = True
+                no_progress += 1
+            elif job["state"] == "running" and lease_dt is not None and lease_dt > now_dt:
+                # Live-looking lease (H1). THIS holder's heartbeat renews its own
+                # job leases to the short horizon, so a lease still far in the
+                # future here belongs to a foreign holder: either alive (it will
+                # complete the job) or dead (the live incident — old code slept
+                # a full LEASE_SECONDS). Bounded: a job that never advances counts
+                # toward the no-progress abort; a live foreign holder finishing
+                # the job resets the counter via the state change.
+                no_progress += 1
+                if no_progress >= NO_PROGRESS_LIMIT:
+                    raise RuntimeError(
+                        f"backfill {key}: job {job_id} stuck under a foreign lease "
+                        f"with no progress after {no_progress} polls "
+                        f"(lease_until={job.get('lease_until')})"
+                        + (f"; last run_once error: {last_run_error}" if last_run_error else ""))
+                # Poll no faster than the lease can plausibly expire, so the poll
+                # budget spans a full short lease (incl. our own orphaned job).
+                time.sleep(min(15, max(2, (lease_dt - now_dt).total_seconds())))
+                continue
+            elif job["state"] == "pending" and next_dt is not None and next_dt <= now_dt:
+                _run_and_count_failures()
+                after_doc = es("GET", f"/{QUEUE}/_doc/{job_id}")["_source"]
+                after_state = (after_doc["state"], after_doc.get("lease_until"),
+                               after_doc.get("attempts"))
+                no_progress = no_progress + 1 if after_state == before else 0
+            elif job["state"] == "running" and lease_dt is not None and lease_dt <= now_dt:
                 # orphaned running job (worker died mid-lease, e.g. a rollout):
                 # claim() re-runs expired leases by id; without this the scope
                 # sleeps forever while generic workers skip the active scope.
-                run_once(owner_id, job_id)
+                _run_and_count_failures()
+                after_doc = es("GET", f"/{QUEUE}/_doc/{job_id}")["_source"]
+                after_state = (after_doc["state"], after_doc.get("lease_until"),
+                               after_doc.get("attempts"))
+                no_progress = no_progress + 1 if after_state == before else 0
+            elif job["state"] == "pending" and next_dt is not None:
+                wait_s = (next_dt - now_dt).total_seconds()
+                if wait_s > MAX_SCHEDULED_WAIT:
+                    # Review6 F1: clock skew or a bad next_at must not stall the
+                    # owner forever (claim() skips jobs under an active backfill).
+                    # Warn once, count no progress, let the existing abort path
+                    # fail the scope so retry_failed_backfill can requeue it.
+                    if not lease_warned:
+                        log.warning(
+                            "job %s pending with next_at %s beyond %ss "
+                            "(clock skew or bad value); counting no progress",
+                            job_id, job.get("next_at"), MAX_SCHEDULED_WAIT)
+                        lease_warned = True
+                    no_progress += 1
+                else:
+                    time.sleep(min(15, max(0.5, wait_s)))
+                    continue
+            elif job["state"] == "pending":
+                # Missing or invalid next_at cannot make scheduled progress.
+                if not lease_warned:
+                    log.warning("job %s pending with missing or unparsable next_at=%r",
+                                job_id, job.get("next_at"))
+                    lease_warned = True
+                no_progress += 1
             else:
-                time.sleep(2)
+                no_progress += 1
+            if no_progress >= NO_PROGRESS_LIMIT:
+                state_now = (es("GET", f"/{QUEUE}/_doc/{job_id}")["_source"]["state"]
+                             if job["state"] in ("pending", "running") else job["state"])
+                cause = f"; last run_once error: {last_run_error}" if last_run_error else ""
+                raise RuntimeError(
+                    f"backfill {key}: job {job_id} made no progress after "
+                    f"{no_progress} attempts (state={state_now}){cause}")
+            if no_progress:
+                time.sleep(2)      # M4: only sleep when the last round made no progress
         after = hit["sort"]
         queued += 1
+        _untrack()
         _update_backfill(key, token, cursor=json.dumps(after), queued=queued)
 
 
@@ -520,10 +746,16 @@ def run_backfill_once():
         return False
     key, doc, token = claimed
     stop = threading.Event()
-    heartbeat = threading.Thread(target=_heartbeat, args=(key, token, stop), daemon=True)
+    abort = threading.Event()
+    current_job = {}                 # {"id","token"} of the job this holder runs
+    job_lock = threading.Lock()
+    heartbeat = threading.Thread(
+        target=_heartbeat, args=(key, token, stop, abort, current_job, job_lock),
+        daemon=True)
     heartbeat.start()
     try:
-        _run_backfill(key, doc, token)
+        _run_backfill(key, doc, token, abort=abort,
+                      current_job=current_job, job_lock=job_lock)
     except Exception as exc:
         log.exception("backfill %s failed", key)
         try:

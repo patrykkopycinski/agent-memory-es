@@ -33,7 +33,9 @@ def stalled_es(monkeypatch):
     srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Stall)
     srv.daemon_threads = True
     threading.Thread(target=srv.serve_forever, daemon=True).start()
-    monkeypatch.setattr(reranker, "ES_URL", "http://127.0.0.1:%d" % srv.server_port)
+    # The reranker resolves the ES URL lazily via its own imported _es_url binding;
+    # patch only that binding so seeding/recall still reach the real cluster.
+    monkeypatch.setattr(reranker, "_es_url", lambda: "http://127.0.0.1:%d" % srv.server_port)
     monkeypatch.setattr(reranker, "RERANK_TIMEOUT", 0.3)
     yield
     srv.shutdown()

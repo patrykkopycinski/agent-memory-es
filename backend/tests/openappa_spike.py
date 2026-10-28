@@ -4,7 +4,12 @@ Scopes a simple sensitivity contract — private markers that must never reach a
 visibility — as code, not a classifier. This is a SPIKE: measures block/false-block rates
 on a seeded corpus to decide adopt/reject of a real APPA integration (repo is Preview/RFC).
 """
+import os
 import re
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+import _safety  # noqa: F401  (must precede app imports)
 
 # deterministic markers: if a private memory contains one, promotion to shared is blocked
 PRIVATE_MARKERS = re.compile(

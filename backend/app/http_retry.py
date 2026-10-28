@@ -22,7 +22,7 @@ def is_transient(exc):
         return exc.code in TRANSIENT_STATUSES
     return isinstance(exc, (urllib.error.URLError, ConnectionRefusedError,
                             ConnectionResetError, http.client.RemoteDisconnected,
-                            socket.timeout))
+                            http.client.IncompleteRead, socket.timeout))
 
 
 def budget_seconds():

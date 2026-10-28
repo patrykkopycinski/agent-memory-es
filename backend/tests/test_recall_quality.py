@@ -4,8 +4,9 @@ Covers: flat fused `results` shape, per-kind/per-doc result budgets, occurred_at
 recency arm, min_score abstention, dedup-on-write. Integration tests run against
 live ES (AMES_ES_URL). Run in the backend image:
 
-  docker run --rm -v <repo>:/srv -w /srv/backend \
-    -e AMES_ES_URL=http://host.docker.internal:9268 \
+  docker run --rm --network host -v <repo>:/srv -w /srv/backend \
+    -e AMES_ES_URL=http://127.0.0.1:19200 \
+    -e AMES_INDEX_PREFIX=amtest_rq_ \
     backend-ames-backend python -m pytest tests/test_recall_quality.py -v
 """
 import datetime as dt
@@ -13,6 +14,7 @@ import os
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+import _safety  # noqa: F401  (script-path guard: conftest bypass)
 
 from app import memory  # noqa: E402
 from app.store import es, idx  # noqa: E402

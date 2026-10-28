@@ -36,7 +36,11 @@ def ensure_models_index() -> None:
 
 def upsert_model(owner_id: str, question_pattern: str, summary: str,
                  visibility: str = "private") -> dict:
-    """Explicit owner-curated model — the ONLY path to status=active."""
+    """Explicit owner-curated model — the ONLY path to status=active.
+    Idempotent per (owner, question_pattern): an existing model of any
+    status is updated in place (summary, visibility, status=active) instead
+    of appending a duplicate — promoting a worker draft flips that draft
+    doc to active, keeping its source_ids provenance."""
     ensure_models_index()
     doc = {
         "owner_id": owner_id, "visibility": visibility,
@@ -44,8 +48,40 @@ def upsert_model(owner_id: str, question_pattern: str, summary: str,
         "updated_at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "status": "active",
     }
+    existing = _find_existing_model(owner_id, question_pattern)
+    if existing is not None:
+        es("POST", f"/{PREFIX}am_models/_update/{existing['id']}?refresh=true",
+           {"doc": doc})
+        return {"id": existing["id"], "created": False, **doc}
     r = es("POST", f"/{PREFIX}am_models/_doc?refresh=true", doc)
-    return {"id": r["_id"], **doc}
+    return {"id": r["_id"], "created": True, **doc}
+
+
+def normalize_pattern(pattern: str) -> str:
+    """Canonical form for exact draft/cover matching: lowercase,
+    whitespace-collapsed."""
+    return " ".join(pattern.lower().split())
+
+
+def find_models(owner_id: str, pattern: str,
+                status: Optional[str] = None) -> list:
+    """Exact normalized question_pattern matches among the owner's models;
+    optional status filter. Unlike match_model (BM25, loose), this is exact —
+    worker cover checks need it because every generated pattern shares the
+    'facts and conventions' tail."""
+    ensure_models_index()
+    q: dict = {"term": {"owner_id": owner_id}}
+    if status:
+        q = {"bool": {"filter": [{"term": {"owner_id": owner_id}},
+                                 {"term": {"status": status}}]}}
+    r = es("POST", f"/{PREFIX}am_models/_search", {
+        "size": 20,
+        "query": {"bool": {"filter": [q],
+                           "must": [{"match_phrase": {"question_pattern":
+                                                      pattern}}]}}})
+    return [h["_source"] for h in r["hits"]["hits"]
+            if normalize_pattern(h["_source"]["question_pattern"])
+            == normalize_pattern(pattern)]
 
 
 def propose_draft(owner_id: str, question_pattern: str, summary: str,
@@ -67,28 +103,37 @@ def propose_draft(owner_id: str, question_pattern: str, summary: str,
     if existing is not None:
         es("POST", f"/{PREFIX}am_models/_update/{existing['id']}?refresh=true",
            {"doc": doc})
-        return {"id": existing["id"], **doc}
+        return {"id": existing["id"], "created": False, **doc}
     r = es("POST", f"/{PREFIX}am_models/_doc?refresh=true", doc)
-    return {"id": r["_id"], **doc}
+    return {"id": r["_id"], "created": True, **doc}
 
 
-def _find_existing_draft(owner_id: str, question_pattern: str) -> dict | None:
-    """Newest draft with this exact owner + question_pattern, or None."""
+def _find_existing_model(owner_id: str, question_pattern: str,
+                         status: Optional[str] = None) -> dict | None:
+    """Newest model (any status, or the given one) with this exact owner +
+    question_pattern, or None."""
     ensure_models_index()
     # question_pattern is a text field (loose matching elsewhere), so filter
-    # by match_phrase then verify the exact string client-side.
+    # by match_phrase then verify the exact normalized string client-side.
+    filters = [{"term": {"owner_id": owner_id}}]
+    if status:
+        filters.append({"term": {"status": status}})
     r = es("POST", f"/{PREFIX}am_models/_search", {
         "size": 20,
-        "query": {"bool": {"filter": [
-            {"term": {"owner_id": owner_id}},
-            {"term": {"status": "draft"}},
-        ], "must": [{"match_phrase": {"question_pattern": question_pattern}}]}},
+        "query": {"bool": {"filter": filters,
+                           "must": [{"match_phrase": {"question_pattern":
+                                                      question_pattern}}]}},
         "sort": [{"updated_at": {"order": "desc"}}],
     })
     for h in r["hits"]["hits"]:
-        if h["_source"]["question_pattern"] == question_pattern:
+        if normalize_pattern(h["_source"]["question_pattern"]) \
+                == normalize_pattern(question_pattern):
             return {"id": h["_id"], **h["_source"]}
     return None
+
+
+def _find_existing_draft(owner_id: str, question_pattern: str) -> dict | None:
+    return _find_existing_model(owner_id, question_pattern, status="draft")
 
 
 def list_drafts(owner_id: str) -> list:
@@ -102,18 +147,25 @@ def list_drafts(owner_id: str) -> list:
 
 
 def staleness(owner_id: str, model: dict) -> bool:
-    """True when the owner has ACTIVE semantic facts newer than the model whose
-    text matches the model's question_pattern (BM25 min_score 1.0)."""
+    """True when the owner has ACTIVE semantic facts newer than the model that
+    share an entity with its question_pattern. Keyword match, not BM25
+    min_score: BM25 scores scale with index-wide IDF, so the same fact would
+    flip stale/not-stale as unrelated owners grow the index."""
+    from .memory import extract_entities
     from .store import idx
+    from .worker import _DRAFT_ENTITY_DENYLIST
+    ents = [e for e in extract_entities(model["question_pattern"])
+            if e not in _DRAFT_ENTITY_DENYLIST]
+    if not ents:
+        return False
     r = es("POST", f"/{idx('semantic')}/_search", {
         "size": 1,
         "query": {"bool": {
-            "must": [{"match": {"text": {"query": model["question_pattern"]}}}],
             "filter": [{"term": {"owner_id": owner_id}},
                        {"term": {"active": True}},
+                       {"terms": {"entities": ents}},
                        {"range": {"occurred_at": {"gt": model["updated_at"]}}}],
         }},
-        "min_score": 1.0,
     })
     return r["hits"]["total"]["value"] > 0
 
