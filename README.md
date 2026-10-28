@@ -11,13 +11,15 @@ HTTP / curl ──┘   (auth · ops · worker)           └─ procedural (pla
 ## Quickstart (60 seconds)
 
 ```bash
-# 1. everything up (ES + API + worker, named volumes):
+# 1. everything up (ES + API + worker, named volumes). There is no default
+#    admin token: without one, key minting is disabled.
+export AMES_ADMIN_TOKEN="$(openssl rand -hex 24)"
 cd backend && docker compose -f docker-compose.quickstart.yml up -d
 # 1b. host-side tools (importer, doctor) talk to the compose ES — NEVER to
 #     :9268, which may be an ssh tunnel to someone's PROD cluster:
 export AMES_ES_URL=http://localhost:19200
 # 2. mint a key:
-curl -X POST -H 'X-Admin-Token: dev-admin' \
+curl -X POST -H "X-Admin-Token: $AMES_ADMIN_TOKEN" \
   'http://localhost:8123/admin/keys?owner_id=you'
 # 3. preflight:
 python ../scripts/ames_doctor.py
@@ -101,7 +103,7 @@ AMES sends less context than Hindsight on every holdout question (median 17.3k v
 - **Three indices**: episodic (raw events), semantic (facts), procedural (playbooks/skills)
 - **Recall**: hybrid BM25 + dense (`dense_vector` kNN) fused with RRF; token-budget cut
 - **Tenancy**: every doc carries `owner_id` + `visibility ∈ {private, team, common}`; the recall filter `owner_id == me OR visibility != private` is applied server-side — owner identity comes from the API key, never from a request argument
-- **Promotion guard**: deterministic sensitive-marker regex blocks private→shared promotion; user rejection tombstones block re-learning forgotten values
+- **Promotion guard**: deterministic sensitive-marker regex blocks private→shared promotion (and the same widening through `/memory/update`); user rejection tombstones block re-learning forgotten values
 - **Consolidation**: background worker dedups and supersedes semantic facts (propose-then-apply); audit history preserved
 - **Surfaces**: native Hermes memory-provider plugin + MCP endpoint (Claude Code, Cursor, Codex, any MCP client) + plain HTTP
 - **Graceful degrade**: no embeddings backend → BM25-only recall

@@ -77,8 +77,9 @@ def test_endpoint_auth_and_owner_forwarding():
         main.caller(None)
     assert exc.value.status_code == 401
     with patch.object(main.facts, 'retry_failed_job', return_value={'state': 'pending'}) as retry:
-        assert main.fact_job_retry('j', {'owner_id': 'alice'}) == {'state': 'pending'}
-        retry.assert_called_once_with('alice', 'j')
+        job = 'a' * 64  # job ids are sha256 hex; the route 404s anything else
+        assert main.fact_job_retry(job, {'owner_id': 'alice'}) == {'state': 'pending'}
+        retry.assert_called_once_with('alice', job)
     with patch.object(main.facts, 'retry_failed_backfill', return_value={'state': 'pending'}) as retry:
         main.fact_backfill_retry('private', {'owner_id': 'alice'})
         retry.assert_called_once_with('alice', 'private')

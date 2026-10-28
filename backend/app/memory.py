@@ -7,6 +7,7 @@ import logging
 import os
 import re
 import time
+import urllib.parse
 import uuid
 from typing import Any, Optional
 
@@ -147,6 +148,13 @@ DEDUP_DROP_SIM = 0.99
 CHUNK_TARGET_CHARS = 1800       # ~450 tokens: under e5-small's 512-token window
 CHUNK_OVERLAP_CHARS = 240       # ~60 tokens of shared tail between passages
 CHUNK_MIN_CHARS = 400           # shorter than this is never split
+# Request bounds. Each passage is one embed call plus one refresh=true write, so
+# unbounded text is unbounded ES/embedding work per request. 100k chars is ~65
+# passages; the live bank's largest doc is 3 passages.
+MAX_TEXT_CHARS = int(os.environ.get("AMES_MAX_TEXT_CHARS", "100000"))
+MAX_PASSAGES = 100              # group lookups read at most this many passages
+MAX_RECALL_SIZE = 50
+MAX_PER_DOC = 50
 
 import re as _re
 _PRIVATE_MARKERS = _re.compile(
@@ -232,9 +240,14 @@ def _apply_budgets(ordered: list, size: int, per_kind_budget: Optional[int] = No
         per_kind_budget = size if n == 1 else max(1, -(-size // n))
     picked, kind_count, doc_count = [], {}, {}
     overflow = []
+
+    def doc_key(it):
+        # groups are per owner: another owner's same-named group must not share the cap
+        return (it.get("owner_id"), it.get("doc_group") or it.get("id"))
+
     for it in ordered:
         kind = it.get("kind")
-        doc = it.get("doc_group") or it.get("id")
+        doc = doc_key(it)
         if kind_count.get(kind, 0) < per_kind_budget and doc_count.get(doc, 0) < per_doc_budget:
             picked.append(it)
             kind_count[kind] = kind_count.get(kind, 0) + 1
@@ -244,7 +257,7 @@ def _apply_budgets(ordered: list, size: int, per_kind_budget: Optional[int] = No
     for it in overflow:
         if len(picked) >= size:
             break
-        doc = it.get("doc_group") or it.get("id")
+        doc = doc_key(it)
         if doc_count.get(doc, 0) < per_doc_budget:
             picked.append(it)
             doc_count[doc] = doc_count.get(doc, 0) + 1
@@ -372,6 +385,7 @@ def retain(owner_id: str, kind: str, text: str, visibility: str = "private",
         raise ValueError(f"kind must be one of {KINDS}")
     if visibility not in VISIBILITIES:
         raise ValueError(f"visibility must be one of {VISIBILITIES}")
+    _check_text_size(text)
     ensure_indices_once()
     # Tag filtering (decision record): both inputs are optional; absent => nothing below runs.
     write_tags = _tf.norm_tags(tags)              # FilterError (a ValueError) -> HTTP 422
@@ -484,34 +498,59 @@ def retain(owner_id: str, kind: str, text: str, visibility: str = "private",
     return out
 
 
+def _q(doc_id: str) -> str:
+    """Percent-encode an id for an ES path segment: a raw '?' or '/' in a
+    caller-supplied id would otherwise add query params or path segments."""
+    return urllib.parse.quote(str(doc_id), safe="")
+
+
+def _check_text_size(text) -> None:
+    if text is not None and len(text) > MAX_TEXT_CHARS:
+        raise ValueError(f"text too long: {len(text)} chars (max {MAX_TEXT_CHARS})")
+
+
 def _get_source(kind: str, doc_id: str) -> dict:
     """Fetch _source or raise LookupError (HTTP 404 at the edge), instead of the
     generic RuntimeError store.es raises on any non-2xx."""
     try:
-        return es("GET", f"/{idx(kind)}/_doc/{doc_id}")["_source"]
+        return es("GET", f"/{idx(kind)}/_doc/{_q(doc_id)}")["_source"]
     except RuntimeError as e:
         if "-> 404" in str(e):
             raise LookupError(f"no such {kind} doc: {doc_id}") from e
         raise
 
 
-def _group_docs(owner_id: str, kind: str, doc_id: str) -> list:
-    """The doc itself + every passage sharing its doc_group, in passage order.
-    doc_id may be any passage of the group (retain returns the first).
-    PermissionError when it belongs to another owner."""
+def _owned_group_query(owner_id: str, group: str) -> dict:
+    # doc_group is a caller-chosen string (often a session id), so two owners can
+    # share one. It is not a tenant boundary: every group-level read or delete must
+    # also match the owner. Refusing shared names instead would let anyone squat a
+    # predictable group and block the real owner's writes.
+    return {"bool": {"filter": [{"term": {"doc_group": group}},
+                                {"term": {"owner_id": owner_id}}]}}
+
+
+def _group_hits(owner_id: str, kind: str, doc_id: str) -> list:
+    """(id, text) for the doc and every passage of the caller's doc_group, in
+    passage order. doc_id may be any passage of the group (retain returns the
+    first). PermissionError when it belongs to another owner."""
     s = _get_source(kind, doc_id)
     if s["owner_id"] != owner_id:
         raise PermissionError("only the creator can modify their memory")
     group = s.get("doc_group")
     if not group:
-        return [doc_id]
+        return [(doc_id, s.get("text", ""))]
     r = es("POST", f"/{idx(kind)}/_search", {
-        "size": 100,
-        "query": {"bool": {"filter": [{"term": {"doc_group": group}}]}},
+        "size": MAX_PASSAGES,
+        "_source": ["text"],
+        "query": _owned_group_query(owner_id, group),
         "sort": [{"passage_index": {"order": "asc"}}],
     })
-    ids = [h["_id"] for h in r["hits"]["hits"]]
-    return ids or [doc_id]
+    hits = [(h["_id"], h["_source"].get("text", "")) for h in r["hits"]["hits"]]
+    return hits or [(doc_id, s.get("text", ""))]
+
+
+def _group_docs(owner_id: str, kind: str, doc_id: str) -> list:
+    return [i for i, _ in _group_hits(owner_id, kind, doc_id)]
 
 
 def _log_mutation(intent: str, owner_id: str, kind: str, doc_id: str, detail: dict) -> None:
@@ -562,12 +601,22 @@ def update(owner_id: str, kind: str, doc_id: str, text=None, tags=None,
         raise PermissionError("only the creator can modify their memory")
     if visibility is not None and visibility not in VISIBILITIES:
         raise ValueError(f"visibility must be one of {VISIBILITIES}")
+    _check_text_size(text)
     group = s.get("doc_group")
     occurred = s.get("occurred_at")
     old_tags = s.get(_tf.TAG_FIELD)
     old_text = s["text"] if text is not None else None
-    old_ids = _group_docs(owner_id, kind, doc_id) if text is not None else []
+    hits = _group_hits(owner_id, kind, doc_id)
+    old_ids = [i for i, _ in hits] if text is not None else []
     new_tags = _tf.norm_tags(tags) if tags is not None else None
+    target_vis = visibility or s["visibility"]
+    if s["visibility"] == "private" and target_vis != "private":
+        # Same write-guard as promote(): widening through update must not be a side
+        # door for marker-bearing text. Checked against the whole group, not one passage.
+        allowed, reason = guard_promotion(
+            text if text is not None else "\n".join(t for _, t in hits), target_vis)
+        if not allowed:
+            raise ValueError(reason)
     if text is not None and text_hash(text) == text_hash(old_text) and new_tags is None \
             and visibility in (None, s["visibility"]):
         return {"_id": doc_id, "doc_group": group or doc_id, "updated": False,
@@ -577,11 +626,11 @@ def update(owner_id: str, kind: str, doc_id: str, text=None, tags=None,
                    "old_tags": old_tags, "tags": tags, "visibility": visibility})
     if text is not None:
         if len(old_ids) == 1:
-            es("DELETE", f"/{idx(kind)}/_doc/{old_ids[0]}?refresh=true")
+            es("DELETE", f"/{idx(kind)}/_doc/{_q(old_ids[0])}?refresh=true")
         else:
             es("POST", f"/{idx(kind)}/_delete_by_query?refresh=true",
-               {"query": {"term": {"doc_group": group}}})
-        r = retain(owner_id, kind, text, visibility or s["visibility"],
+               {"query": _owned_group_query(owner_id, group)})
+        r = retain(owner_id, kind, text, target_vis,
                    occurred_at=occurred, doc_group=group, tags=new_tags)
         return {"_id": r["_id"], "doc_group": r.get("doc_group", group),
                 "passages": r.get("passages"), "updated": True}
@@ -593,8 +642,8 @@ def update(owner_id: str, kind: str, doc_id: str, text=None, tags=None,
     if occurred_at is not None:
         patch["occurred_at"] = occurred_at
     if patch:
-        for i in old_ids or _group_docs(owner_id, kind, doc_id):
-            es("POST", f"/{idx(kind)}/_update/{i}?refresh=true", {"doc": patch})
+        for i, _ in hits:
+            es("POST", f"/{idx(kind)}/_update/{_q(i)}?refresh=true", {"doc": patch})
     return {"_id": doc_id, "doc_group": group or doc_id,
             "passages": len(old_ids), "updated": bool(patch)}
 
@@ -616,10 +665,10 @@ def delete(owner_id: str, kind: str, doc_id: str) -> dict:
                    "visibility": s.get("visibility")})
     ids = _group_docs(owner_id, kind, doc_id)
     if len(ids) == 1:
-        es("DELETE", f"/{idx(kind)}/_doc/{ids[0]}?refresh=true")
+        es("DELETE", f"/{idx(kind)}/_doc/{_q(ids[0])}?refresh=true")
     else:
         es("POST", f"/{idx(kind)}/_delete_by_query?refresh=true",
-           {"query": {"term": {"doc_group": group}}})
+           {"query": _owned_group_query(owner_id, group)})
     tombstone.reject(owner_id, s.get("text", ""), reason="deleted by owner",
                      source_id=doc_id)
     # Unified return shape: REST contract (test_delete.py, a96df78) pins
@@ -719,6 +768,14 @@ def recall(owner_id: str, query: str, kinds=None, size: int = 8,
     top-k. With no filter this function is unchanged.
     """
     t_start = time.perf_counter()
+    if kinds:
+        bad = [k for k in kinds if k not in KINDS]
+        if bad:
+            raise _tf.FilterError(f"kinds must be drawn from {KINDS}; got {bad[:3]}")
+        kinds = list(dict.fromkeys(kinds))   # one ES search per kind: dedupe
+    size = max(1, min(int(size), MAX_RECALL_SIZE))
+    if per_doc is not None:
+        per_doc = max(1, min(int(per_doc), MAX_PER_DOC))
     ensure_indices_once()
     parsed = _tf.parse_filter(filter)             # FilterError (a ValueError) -> HTTP 422
     flt_extra, flt_not, narrow_tags, resolved, vocab_truncated = [], [], None, {}, False
@@ -931,7 +988,7 @@ def promote(owner_id: str, kind: str, doc_id: str, to_visibility: str) -> dict:
     """Copy-on-promote: private -> team/common creates a promoted copy; original stays private."""
     if to_visibility not in ("team", "common"):
         raise ValueError("promotion target must be team or common")
-    src = es("GET", f"/{idx(kind)}/_doc/{doc_id}")
+    src = es("GET", f"/{idx(kind)}/_doc/{_q(doc_id)}")
     s = src["_source"]
     if s["owner_id"] != owner_id:
         raise PermissionError("only the creator can promote their memory")

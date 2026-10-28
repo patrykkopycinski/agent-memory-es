@@ -1,6 +1,8 @@
 """FastAPI app: REST surface + MCP-style tools endpoint + auth middleware."""
+import hmac
 import logging
 import os
+import re
 from typing import Optional
 
 from fastapi import Depends, FastAPI, Header, HTTPException
@@ -76,7 +78,7 @@ class UpdateIn(BaseModel):
     doc_id: str
     text: Optional[str] = None          # replace the doc text (re-chunked, re-embedded)
     tags: Optional[list] = None         # replace tags; None = leave untouched
-    visibility: Optional[str] = None    # change visibility in place (no promote guard)
+    visibility: Optional[str] = None    # change visibility in place (same marker guard as promote)
     occurred_at: Optional[str] = None   # retime in place
 
 
@@ -91,7 +93,12 @@ class ReflectIn(BaseModel):
 
 @app.post("/admin/keys")
 def mint_key(owner_id: str, role: str = "member", _admin: str = Header(None, alias="X-Admin-Token")):
-    if _admin != os.environ.get("AMES_ADMIN_TOKEN", "dev-admin"):
+    # No default token: an unset or empty AMES_ADMIN_TOKEN disables key minting
+    # rather than accepting a guessable or empty header.
+    expected = os.environ.get("AMES_ADMIN_TOKEN", "")
+    if not expected:
+        raise HTTPException(403, "key minting disabled: AMES_ADMIN_TOKEN is not set")
+    if not _admin or not hmac.compare_digest(_admin.encode(), expected.encode()):
         raise HTTPException(403, "bad admin token")
     return {"api_key": auth.create_key(owner_id, role), "owner_id": owner_id}
 
@@ -111,6 +118,9 @@ def fact_drain(who: dict = Depends(caller)):
 
 @app.post("/memory/facts/jobs/{job_id}/retry")
 def fact_job_retry(job_id: str, who: dict = Depends(caller)):
+    # job ids are sha256 hex (facts.enqueue); anything else would reach the ES path raw
+    if not re.fullmatch(r"[0-9a-f]{64}", job_id):
+        raise HTTPException(404, "job not found")
     try:
         return facts.retry_failed_job(who["owner_id"], job_id)
     except ValueError as exc:

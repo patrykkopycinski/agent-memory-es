@@ -12,7 +12,7 @@ services:
       xpack.security.enabled: "false"
       ES_JAVA_OPTS: -Xms512m -Xmx512m
     ports:
-      - "19200:9200"
+      - "127.0.0.1:19200:9200"
     volumes:
       - ames-es-data:/usr/share/elasticsearch/data
     healthcheck:
@@ -32,11 +32,11 @@ services:
     environment:
       AMES_ES_URL: http://ames-es:9200
       AMES_EMBED_BACKEND: es
-      AMES_ADMIN_TOKEN: ${AMES_ADMIN_TOKEN:-dev-admin}
+      AMES_ADMIN_TOKEN: ${AMES_ADMIN_TOKEN:?set AMES_ADMIN_TOKEN (no default; key minting is disabled without it)}
       AMES_API_KEYS_FILE: /data/ames_keys.json
       AMES_CONSOLIDATE_INTERVAL: "600"
     ports:
-      - "8123:8123"
+      - "127.0.0.1:8123:8123"   # loopback: front it with a proxy to expose it
     volumes:
       - ames-app-data:/data
     command: uvicorn app.main:app --host 0.0.0.0 --port 8123
