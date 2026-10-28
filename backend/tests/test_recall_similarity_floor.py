@@ -46,7 +46,7 @@ def test_parse_similarity_accepts_unset_and_range():
     assert memory._parse_similarity(-1) == -1.0
 
 
-@pytest.mark.parametrize("bad", ["1.5", "-1.01", "abc"])
+@pytest.mark.parametrize("bad", ["1.5", "-1.01", "abc", "nan", [1], {"v": 1}, True])
 def test_parse_similarity_rejects_out_of_range(bad):
     with pytest.raises(ValueError):
         memory._parse_similarity(bad)
@@ -76,7 +76,9 @@ def _knn_bodies(monkeypatch, **kw):
 
 def test_default_sends_no_similarity_to_knn(monkeypatch):
     monkeypatch.setattr(memory, "KNN_MIN_SIMILARITY", None)
-    assert all("similarity" not in k for k in _knn_bodies(monkeypatch))
+    # exact key set: the default knn body must match main's, not merely lack `similarity`
+    assert [list(k) for k in _knn_bodies(monkeypatch)] == [
+        ["field", "query_vector", "num_candidates", "k", "filter"]]
 
 
 def test_request_floor_is_forwarded_to_knn(monkeypatch):
@@ -93,6 +95,48 @@ def test_env_floor_applies_and_request_overrides_it(monkeypatch):
 def test_zero_floor_is_forwarded_not_treated_as_unset(monkeypatch):
     monkeypatch.setattr(memory, "KNN_MIN_SIMILARITY", None)
     assert [k["similarity"] for k in _knn_bodies(monkeypatch, min_similarity=0.0)] == [0.0]
+
+
+# ------------------------------------------------------------------ HTTP / MCP wiring
+@pytest.fixture
+def api(monkeypatch):
+    from fastapi.testclient import TestClient
+    from app import main
+    seen = []
+
+    def spy(*args, **kwargs):
+        seen.append((args, kwargs))
+        return {"results": []}
+    monkeypatch.setattr(main.memory, "recall", spy)
+    monkeypatch.setattr(main.auth, "owner_of", lambda key: {"owner_id": OWNER} if key == "k" else None)
+    return TestClient(main.app), seen
+
+
+def test_http_recall_forwards_min_similarity(api):
+    client, seen = api
+    r = client.post("/memory/recall", headers={"X-API-Key": "k"},
+                    json={"query": QUERY, "min_similarity": 0.5})
+    assert r.status_code == 200, r.text
+    assert seen[-1][1]["min_similarity"] == 0.5
+
+
+@pytest.mark.parametrize("bad", [1.5, -1.01, "abc"])
+def test_http_recall_rejects_invalid_min_similarity(api, bad):
+    client, seen = api
+    r = client.post("/memory/recall", headers={"X-API-Key": "k"},
+                    json={"query": QUERY, "min_similarity": bad})
+    assert r.status_code == 422, r.text
+    assert not seen
+
+
+def test_mcp_recall_forwards_min_similarity_and_keeps_bindings(api):
+    client, seen = api
+    r = client.post("/mcp/tools/recall", headers={"X-API-Key": "k"},
+                    json={"query": QUERY, "min_similarity": 0.5, "rerank_depth": 7})
+    assert r.status_code == 200 and "error" not in r.json(), r.text
+    args, kwargs = seen[-1]
+    assert kwargs["min_similarity"] == 0.5 and kwargs["rerank_depth"] == 7
+    assert len(args) == 8  # owner, query, kinds, size, min_score, as_of, per_doc, rerank
 
 
 # ------------------------------------------------------------------ integration

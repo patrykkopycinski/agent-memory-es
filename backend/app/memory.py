@@ -37,9 +37,15 @@ RECALL_FETCH_CAP = 50
 # absolute cosine floor drops hits below it. Default OFF: E5-family cosines are compressed into
 # a narrow band, so a floor must be calibrated against an eval run before it is enabled.
 def _parse_similarity(raw):
-    if raw in (None, ""):
+    if raw is None or raw == "":
         return None
-    v = float(raw)
+    # bool is an int subclass: float(True) == 1.0 would silently become a maximal floor
+    if isinstance(raw, bool) or not isinstance(raw, (int, float, str)):
+        raise ValueError(f"min_similarity must be a number, got {raw!r}")
+    try:
+        v = float(raw)
+    except ValueError:
+        raise ValueError(f"min_similarity must be a number, got {raw!r}") from None
     if not -1.0 <= v <= 1.0:
         raise ValueError(f"min_similarity must be within [-1, 1], got {v}")
     return v
