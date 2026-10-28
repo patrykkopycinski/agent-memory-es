@@ -392,6 +392,9 @@ def retain(owner_id: str, kind: str, text: str, visibility: str = "private",
     label_groups = _tf.validate_labels(labels)
     if kind == "semantic":
         rej = tombstone.is_rejected(owner_id, text)
+        if rej and rej.get("capacity"):
+            raise ValueError("text too long for tombstone check "
+                             "(owner has too many candidate tombstones)")
         if rej:
             raise ValueError(f"rejected value: {rej['reason']}")
     h = text_hash(text)

@@ -7,6 +7,7 @@ cheap enough to check on every write. Embedding-similarity rejection is future w
 """
 import hashlib
 import json
+import os
 import re
 import time
 
@@ -74,7 +75,9 @@ def reject(owner_id: str, text: str, reason: str, source_id: str = "") -> dict |
 MIN_FUZZY_TERMS = 3   # below this a tombstone is too thin to generalize: exact term-set only
 PAGE = 500
 MAX_PAGES = 20        # candidate-scan cap per call; hitting it fails closed
-TERMS_CHUNK = 4096    # terms_set clause count is capped by ES (~6.5k); longer texts use the scan path
+# terms_set expands to one clause per term and ES caps clauses at indices.query.bool.max_clause_count
+# (4096 by default on ES 9.x, scaled down/up with heap); texts above this use the paged scan path.
+TERMS_CHUNK = int(os.environ.get("AMES_TOMBSTONE_TERMS_CHUNK", "1024"))
 # ceil(0.8 * n) in int math for tombstones with >= MIN_FUZZY_TERMS terms; thinner ones get an
 # unreachable n + 1 so only the value_key clause (exact term set) can match them
 _MIN_MATCH = "int n = doc['terms'].size(); return n >= 3 ? (4 * n + 4) / 5 : n + 1;"
@@ -98,7 +101,8 @@ def is_rejected(owner_id: str, text: str) -> dict | None:
     legacy empty-terms records), so the cost tracks real matches, not tombstones that merely
     share a word. Texts above TERMS_CHUNK terms exceed ES's clause cap and fall back to paging
     all of the owner's tombstones through the same Python check. Paging is capped at
-    MAX_PAGES and FAILS CLOSED: an unchecked backlog is treated as a rejection."""
+    MAX_PAGES and FAILS CLOSED: an unchecked backlog is reported as a rejection record carrying
+    capacity=True, so callers can tell it apart from a content match."""
     terms = _terms(text)
     if not terms:
         return None
@@ -121,4 +125,4 @@ def is_rejected(owner_id: str, text: str) -> dict | None:
             return None
         body["search_after"] = hits[-1]["sort"]
     return {"reason": f"tombstone check exceeded {MAX_PAGES * PAGE} candidates; failing closed",
-            "value_key": key, "owner_id": owner_id}
+            "value_key": key, "owner_id": owner_id, "capacity": True}
