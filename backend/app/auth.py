@@ -61,14 +61,23 @@ def _load() -> dict:
     return keys
 
 
+class KeyStoreNotWritable(OSError):
+    """The key store directory or its lock file cannot be created/opened for writing."""
+
+
 @contextlib.contextmanager
 def _guard():
     """Serialize load-modify-save: threading.Lock within a process, flock on a sidecar file
-    across processes (backend and any other writer sharing the key volume)."""
+    across processes (backend and any other writer sharing the key volume). Writer paths
+    only: readers must not take it (see owner_of)."""
     with _lock:
         path = _keys_file()
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path + ".lock", "a") as lf:
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            lf = open(path + ".lock", "a")
+        except OSError as e:
+            raise KeyStoreNotWritable(f"key store not writable: {path}: {e}") from e
+        with lf:
             fcntl.flock(lf, fcntl.LOCK_EX)
             try:
                 yield
@@ -86,11 +95,18 @@ def _save(keys: dict) -> None:
     try:
         with os.fdopen(fd, "w") as f:
             json.dump(keys, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())  # data on disk before the rename can make it visible
         try:
             os.chmod(tmp, os.stat(path).st_mode & 0o777)
         except FileNotFoundError:
             pass  # new file keeps mkstemp's 0600
         os.replace(tmp, path)
+        dfd = os.open(d, os.O_RDONLY)
+        try:
+            os.fsync(dfd)  # persist the rename itself
+        finally:
+            os.close(dfd)
     except BaseException:
         if os.path.exists(tmp):
             os.unlink(tmp)
@@ -112,8 +128,15 @@ def owner_of(token: str) -> Optional[dict]:
     if not token:
         return None
     digest = hashlib.sha256(token.encode()).hexdigest()
-    with _guard():
-        return _load().get(digest)
+    # lock-free: _save is an atomic os.replace, so a reader sees a whole old or new file
+    keys = _read()
+    if _normalize_legacy(keys):
+        try:  # persist the migration best-effort; the in-memory result already answers this lookup
+            with _guard():
+                _load()
+        except OSError:
+            pass
+    return keys.get(digest)
 
 
 def delete_key(token: str) -> bool:
