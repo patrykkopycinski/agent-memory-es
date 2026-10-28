@@ -651,9 +651,9 @@ def update(owner_id: str, kind: str, doc_id: str, text=None, tags=None,
 def delete(owner_id: str, kind: str, doc_id: str) -> dict:
     """Delete a memory (the whole doc_group) by id. Owner-scoped: another owner's
     doc is a PermissionError (HTTP 403), matching promote. Intent (who/when/what)
-    is logged to am_mutations BEFORE the delete runs. The deleted text is
+    is logged to am_mutations BEFORE the delete runs. Deleted semantic text is
     tombstoned so the same content cannot be re-retained (retain() consults
-    is_rejected for semantic kind)."""
+    is_rejected for semantic kind only, so other kinds write no tombstone)."""
     if kind not in KINDS:
         raise ValueError(f"kind must be one of {KINDS}")
     s = _get_source(kind, doc_id)
@@ -669,15 +669,17 @@ def delete(owner_id: str, kind: str, doc_id: str) -> dict:
     else:
         es("POST", f"/{idx(kind)}/_delete_by_query?refresh=true",
            {"query": _owned_group_query(owner_id, group)})
-    tombstone.reject(owner_id, s.get("text", ""), reason="deleted by owner",
-                     source_id=doc_id)
+    tombstoned = kind == "semantic"
+    if tombstoned:
+        tombstone.reject(owner_id, s.get("text", ""), reason="deleted by owner",
+                         source_id=doc_id)
     # Unified return shape: REST contract (test_delete.py, a96df78) pins
     # deleted=bool + group_deleted + deleted_ids; the POST suite uses
     # deleted_ids for membership. ids enumerated via _group_docs (passage order).
     return {"deleted": True, "doc_group": group or doc_id,
             "kind": kind, "doc_id": doc_id,
             "group_deleted": bool(ids), "deleted_ids": ids,
-            "tombstoned": True}
+            "tombstoned": tombstoned}
 
 
 def _visibility_filter(owner_id: str) -> dict:
@@ -1115,6 +1117,6 @@ def _delete_superseded_note():
     than) the unified delete() above after the feat/memory-mutation-api merge.
     Both call surfaces (REST DELETE /memory/{kind}/{doc_id} and POST
     /memory/delete) now use that single delete() with superset semantics:
-    intent log (am_mutations) + tombstone + group cascade + owner check + 404
+    intent log (am_mutations) + tombstone (semantic only) + group cascade + owner check + 404
     via LookupError. Contracts pinned by test_delete.py and test_update_delete.py."""
     return None

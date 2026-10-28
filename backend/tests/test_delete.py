@@ -71,6 +71,24 @@ def test_delete_tombstones_text():
     assert "rejected value" in again.json()["detail"]
 
 
+def _tombstones_for(doc_id):
+    r = es("POST", f"/{PREFIX}am_rejected/_search",
+           {"size": 5, "query": {"term": {"source_id": doc_id}}})
+    return r["hits"]["total"]["value"]
+
+
+def test_delete_tombstone_semantic_only():
+    sem = _retain(ALICE, text="semantic tombstone flag unique qz7")
+    d = client.delete(f"/memory/semantic/{sem['_id']}", headers=H(ALICE)).json()
+    assert d["tombstoned"] is True
+    assert _tombstones_for(sem["_id"]) == 1
+    for kind in ("episodic", "procedural"):
+        m = _retain(ALICE, kind=kind, text=f"{kind} no tombstone unique qz8")
+        d = client.delete(f"/memory/{kind}/{m['_id']}", headers=H(ALICE)).json()
+        assert d["deleted"] is True and d["tombstoned"] is False
+        assert _tombstones_for(m["_id"]) == 0
+
+
 def test_delete_group_cascade():
     """Multi-passage retain shares doc_group: delete head deletes all passages."""
     filler = " ".join(f"passage filler {i}" for i in range(200))  # > CHUNK_TARGET_CHARS

@@ -56,23 +56,45 @@ def reject(owner_id: str, text: str, reason: str, source_id: str = "") -> dict:
     return doc
 
 
+MIN_FUZZY_TERMS = 3   # below this a tombstone is too thin to generalize: exact term-set only
+PAGE = 500
+TERMS_CHUNK = 4096    # stay far under ES index.max_terms_count (65536) for very long texts
+
+
 def is_rejected(owner_id: str, text: str) -> dict | None:
     """Return the rejection record if this value was rejected for this owner.
-    Matches exact term-set, or a rewording whose salient terms are a superset of
-    >=80% of a recorded rejection's terms (blocks 'Microsoft is where Alice works'
-    against a rejection of 'Alice works at Microsoft')."""
+    Matches exact term-set, or (for tombstones with >= MIN_FUZZY_TERMS terms) a
+    rewording whose salient terms are a superset of >=80% of the recorded terms
+    (blocks 'Microsoft is where Alice works' against a rejection of 'Alice works at
+    Microsoft'). Thinner tombstones would over-block, so they need an exact match.
+
+    The candidate filter runs in ES (owner + shares >=1 term, or same value_key for
+    legacy records with no terms) and is paged with search_after, so correctness
+    never depends on a hit cap. Sorting on value_key alone is safe despite ties:
+    records with equal value_key have identical term sets, hence identical verdicts."""
     _ensure_index()
     terms = _terms(text)
-    body = {"size": 50, "query": {"bool": {"filter": [{"term": {"owner_id": owner_id}}]}}}
-    r = es("POST", f"/{PREFIX}am_rejected/_search", body)
-    for h in r["hits"]["hits"]:
-        s = h["_source"]
-        rterms = set(s.get("terms", []))
-        if not rterms:
-            if s["value_key"] == _key(terms):
-                return s
-            continue
-        overlap = len(terms & rterms) / len(rterms)
-        if overlap >= 0.8:
-            return s
+    key = _key(terms)
+    sorted_terms = sorted(terms)
+    chunks = [sorted_terms[i:i + TERMS_CHUNK]
+              for i in range(0, len(sorted_terms), TERMS_CHUNK)] or [[]]
+    for chunk in chunks:
+        should = [{"term": {"value_key": key}}]
+        if chunk:
+            should.append({"terms": {"terms": chunk}})
+        body = {"size": PAGE, "sort": [{"value_key": "asc"}],
+                "query": {"bool": {"filter": [{"term": {"owner_id": owner_id}}],
+                                   "should": should, "minimum_should_match": 1}}}
+        while True:
+            hits = es("POST", f"/{PREFIX}am_rejected/_search", body)["hits"]["hits"]
+            for h in hits:
+                s = h["_source"]
+                rterms = set(s.get("terms", []))
+                if s["value_key"] == key:
+                    return s
+                if len(rterms) >= MIN_FUZZY_TERMS and len(terms & rterms) / len(rterms) >= 0.8:
+                    return s
+            if len(hits) < PAGE:
+                break
+            body["search_after"] = hits[-1]["sort"]
     return None
