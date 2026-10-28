@@ -4,7 +4,7 @@ import os
 from typing import Optional
 
 from fastapi import Depends, FastAPI, Header, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from . import auth, memory, pages as pages_mod, mental_models as mm_mod, reranker, tagfilter, facts
 from .store import KINDS, ensure_indices
@@ -60,6 +60,7 @@ class RecallIn(BaseModel):
     per_doc: Optional[int] = None   # max passages per source doc_group (default 3)
     rerank: Optional[bool] = None   # ES cross-encoder rerank of the fused top-50 (opt-in: AMES_RERANK, default off)
     rerank_depth: Optional[int] = None  # candidates sent to the reranker (clamped 2..50; default AMES_RERANK_DEPTH)
+    min_similarity: Optional[float] = Field(None, ge=-1.0, le=1.0)  # kNN cosine floor (default: AMES_KNN_MIN_SIMILARITY, off)
     filter: Optional[dict] = None   # {all, any, none, narrow_any}: tag filter applied inside ES;
                                     # a filter that matches nothing abstains (results [])
 
@@ -176,7 +177,8 @@ def delete_memory(kind: str, doc_id: str, who: dict = Depends(caller)):
 def recall(body: RecallIn, who: dict = Depends(caller)):
     try:
         return memory.recall(who["owner_id"], body.query, body.kinds, body.size,
-                             body.min_score, body.as_of, body.per_doc, body.rerank, body.filter, body.rerank_depth)
+                             body.min_score, body.as_of, body.per_doc, body.rerank, body.filter,
+                             rerank_depth=body.rerank_depth, min_similarity=body.min_similarity)
     except tagfilter.FilterError as e:
         raise HTTPException(422, str(e))
 
@@ -328,7 +330,8 @@ def mcp_tool(tool: str, body: dict, who: dict = Depends(caller)):
         "recall": lambda b: memory.recall(who["owner_id"], b["query"], b.get("kinds"),
                                           b.get("size", 8), b.get("min_score"),
                                           b.get("as_of"), b.get("per_doc"), b.get("rerank"),
-                                          None, b.get("rerank_depth")),
+                                          rerank_depth=b.get("rerank_depth"),
+                                          min_similarity=b.get("min_similarity")),
         "reflect": lambda b: memory.reflect(who["owner_id"], b["question"]),
         "promote": lambda b: memory.promote(who["owner_id"], b["kind"], b["doc_id"], b["to_visibility"]),
         "update": lambda b: memory.update(who["owner_id"], b["kind"], b["doc_id"],

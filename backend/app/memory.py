@@ -32,6 +32,27 @@ PER_DOC_BUDGET = int(os.environ.get("AMES_PER_DOC_BUDGET", "3"))
 RECALL_FETCH_FACTOR = 4         # candidates fetched per arm = size * factor (capped)
 RECALL_FETCH_CAP = 50
 
+# The kNN arm always returns `k` hits, so a nonsense query still gets a rank-1 hit in every
+# kind and the cross-kind RRF hands each kind's #1 the same 1/(RANK_CONSTANT+1). An optional
+# absolute cosine floor drops hits below it. Default OFF: E5-family cosines are compressed into
+# a narrow band, so a floor must be calibrated against an eval run before it is enabled.
+def _parse_similarity(raw):
+    if raw is None or raw == "":
+        return None
+    # bool is an int subclass: float(True) == 1.0 would silently become a maximal floor
+    if isinstance(raw, bool) or not isinstance(raw, (int, float, str)):
+        raise ValueError(f"min_similarity must be a number, got {raw!r}")
+    try:
+        v = float(raw)
+    except ValueError:
+        raise ValueError(f"min_similarity must be a number, got {raw!r}") from None
+    if not -1.0 <= v <= 1.0:
+        raise ValueError(f"min_similarity must be within [-1, 1], got {v}")
+    return v
+
+
+KNN_MIN_SIMILARITY = _parse_similarity(os.environ.get("AMES_KNN_MIN_SIMILARITY"))
+
 # Round 5: ES-native cross-encoder rerank (_inference/rerank) over the fused top-RERANK_DEPTH,
 # applied BEFORE the per-doc budget and the size cut (the output budget is unchanged: still
 # `size` passages). Default on; AMES_RERANK=0 or per-request rerank=false disables it. If the
@@ -654,7 +675,8 @@ def recall(owner_id: str, query: str, kinds=None, size: int = 8,
            per_doc: Optional[int] = None,
            rerank: Optional[bool] = None,
            filter: Optional[dict] = None,
-           rerank_depth: Optional[int] = None) -> dict:
+           rerank_depth: Optional[int] = None,
+           min_similarity: Optional[float] = None) -> dict:
     """Hybrid recall: BM25 + kNN fused per-kind, visibility isolation, RRF across kinds.
 
     Returns a single flat `results` list (RRF + recency fused, score-ordered) with
@@ -706,6 +728,7 @@ def recall(owner_id: str, query: str, kinds=None, size: int = 8,
     if as_of:
         now = _parse_as_of(as_of)
     kinds = kinds or list(KINDS)
+    sim_floor = KNN_MIN_SIMILARITY if min_similarity is None else _parse_similarity(min_similarity)
     qvec = None
     t_embed = time.perf_counter()
     try:
@@ -739,6 +762,7 @@ def recall(owner_id: str, query: str, kinds=None, size: int = 8,
                             **({"must_not": flt_not} if flt_not else {}),
                         }}}},
                         {"knn": {"field": "embedding", "query_vector": qvec, "num_candidates": max(100, fetch * 2), "k": fetch,
+                                 **({"similarity": sim_floor} if sim_floor is not None else {}),
                                  "filter": {"bool": {"filter": [{"term": {"active": True}}, _visibility_filter(owner_id)] + flt_extra + validity,
                                                      "must_not": flt_not}} if flt_not else
                                            [{"term": {"active": True}}, _visibility_filter(owner_id)] + flt_extra + validity}},
