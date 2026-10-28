@@ -7,6 +7,7 @@ cheap enough to check on every write. Embedding-similarity rejection is future w
 """
 import hashlib
 import json
+import logging
 import os
 import re
 import time
@@ -77,7 +78,30 @@ PAGE = 500
 MAX_PAGES = 20        # candidate-scan cap per call; hitting it fails closed
 # terms_set expands to one clause per term and ES caps clauses at indices.query.bool.max_clause_count
 # (4096 by default on ES 9.x, scaled down/up with heap); texts above this use the paged scan path.
-TERMS_CHUNK = int(os.environ.get("AMES_TOMBSTONE_TERMS_CHUNK", "1024"))
+TERMS_CHUNK_DEFAULT, TERMS_CHUNK_MIN, TERMS_CHUNK_MAX = 1024, 64, 2048
+_log = logging.getLogger(__name__)
+
+
+def _terms_chunk_from_env() -> int:
+    """AMES_TOMBSTONE_TERMS_CHUNK, validated: garbage -> default, out of range -> clamped
+    (too small forces every write onto the paged scan, too large can exceed max_clause_count)."""
+    raw = os.environ.get("AMES_TOMBSTONE_TERMS_CHUNK")
+    if raw is None:
+        return TERMS_CHUNK_DEFAULT
+    try:
+        value = int(raw)
+    except ValueError:
+        _log.warning("AMES_TOMBSTONE_TERMS_CHUNK=%r is not an integer; using %d",
+                     raw, TERMS_CHUNK_DEFAULT)
+        return TERMS_CHUNK_DEFAULT
+    clamped = max(TERMS_CHUNK_MIN, min(TERMS_CHUNK_MAX, value))
+    if clamped != value:
+        _log.warning("AMES_TOMBSTONE_TERMS_CHUNK=%d outside [%d, %d]; using %d",
+                     value, TERMS_CHUNK_MIN, TERMS_CHUNK_MAX, clamped)
+    return clamped
+
+
+TERMS_CHUNK = _terms_chunk_from_env()
 # ceil(0.8 * n) in int math for tombstones with >= MIN_FUZZY_TERMS terms; thinner ones get an
 # unreachable n + 1 so only the value_key clause (exact term set) can match them
 _MIN_MATCH = "int n = doc['terms'].size(); return n >= 3 ? (4 * n + 4) / 5 : n + 1;"

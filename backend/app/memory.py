@@ -393,8 +393,9 @@ def retain(owner_id: str, kind: str, text: str, visibility: str = "private",
     if kind == "semantic":
         rej = tombstone.is_rejected(owner_id, text)
         if rej and rej.get("capacity"):
-            raise ValueError("text too long for tombstone check "
-                             "(owner has too many candidate tombstones)")
+            raise ValueError(
+                f"text has more than {tombstone.TERMS_CHUNK} key terms and owner has more than "
+                f"{tombstone.MAX_PAGES * tombstone.PAGE} candidate tombstones; shorten the text")
         if rej:
             raise ValueError(f"rejected value: {rej['reason']}")
     h = text_hash(text)

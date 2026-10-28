@@ -101,7 +101,8 @@ def test_page_cap_fails_closed_with_distinct_capacity_error(owners, patched):
     with pytest.raises(ValueError) as ei:
         memory.retain(o, "semantic", text)
     msg = str(ei.value)
-    assert "too many candidate tombstones" in msg and "rejected value" not in msg, msg
+    assert "candidate tombstones; shorten the text" in msg and "rejected value" not in msg, msg
+    assert str(tombstone.TERMS_CHUNK) in msg and str(tombstone.MAX_PAGES * tombstone.PAGE) in msg
 
 
 def test_capacity_error_is_a_4xx_over_rest(owners, patched):
@@ -114,7 +115,7 @@ def test_capacity_error_is_a_4xx_over_rest(owners, patched):
                              json={"kind": "semantic", "text": "banana smoothie recipe probe",
                                    "extract_facts": False})
     assert 400 <= r.status_code < 500, (r.status_code, r.text)
-    assert "too many candidate tombstones" in r.json()["detail"]
+    assert "shorten the text" in r.json()["detail"]
 
 
 def test_shared_term_tombstones_cost_one_es_call(owners, patched):
@@ -186,3 +187,27 @@ def test_index_readiness_cached_and_create_race_is_success(monkeypatch):
     with _CountEs() as c:
         tombstone._ensure_index()
         assert c.calls == 0, "ensure_index must not hit ES once ready"
+
+
+@pytest.mark.parametrize("raw", ["0", "-5", "abc", "99999", "", "1.5", "64", "2048"])
+def test_terms_chunk_env_is_validated_and_clamped(raw, monkeypatch):
+    monkeypatch.setenv("AMES_TOMBSTONE_TERMS_CHUNK", raw)
+    eff = tombstone._terms_chunk_from_env()   # same function the module runs at import
+    assert tombstone.TERMS_CHUNK_MIN <= eff <= tombstone.TERMS_CHUNK_MAX, eff
+    if raw in ("abc", "", "1.5"):
+        assert eff == tombstone.TERMS_CHUNK_DEFAULT
+    if raw in ("64", "2048"):
+        assert eff == int(raw)
+
+
+def test_terms_chunk_module_reload_is_in_bounds(monkeypatch):
+    import importlib
+    try:
+        for raw in ("0", "-5", "abc", "99999"):
+            monkeypatch.setenv("AMES_TOMBSTONE_TERMS_CHUNK", raw)
+            importlib.reload(tombstone)
+            assert tombstone.TERMS_CHUNK_MIN <= tombstone.TERMS_CHUNK <= tombstone.TERMS_CHUNK_MAX, raw
+    finally:
+        monkeypatch.delenv("AMES_TOMBSTONE_TERMS_CHUNK")
+        importlib.reload(tombstone)
+    assert tombstone.TERMS_CHUNK == tombstone.TERMS_CHUNK_DEFAULT

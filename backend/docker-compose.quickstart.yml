@@ -54,9 +54,9 @@ services:
       # Without the backend's key store known_owners() is empty and every
       # consolidation pass is a silent no-op.
       AMES_API_KEYS_FILE: /data/ames_keys.json
-      AMES_CONSOLIDATE_INTERVAL: "600"
     volumes:
-      - ames-app-data:/data
+      # read-only: the worker only reads owners; the backend is the sole key-file writer
+      - ames-app-data:/data:ro
     command: python -m app.worker
 
 volumes:

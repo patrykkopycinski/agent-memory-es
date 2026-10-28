@@ -20,7 +20,7 @@ _DRAFT_MAX_ENTITY_DF = float(os.environ.get("AMES_DRAFT_MAX_ENTITY_DF", "0.3"))
 
 
 def known_owners() -> list:
-    keys = auth._load()
+    keys = auth.load_readonly()  # the key volume is mounted :ro here; never migrate-write
     # digest entries only — the file also keeps name-keyed plaintext copies
     # (legacy migration) which would blow up v["owner_id"].
     return sorted({v["owner_id"] for v in keys.values()
