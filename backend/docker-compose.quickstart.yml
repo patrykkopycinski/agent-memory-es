@@ -22,7 +22,7 @@ services:
       retries: 12
 
   ames-backend:
-    build: ..
+    build: .
        # or: image: ghcr.io/patrykkopycinski/agent-memory-es:latest
     container_name: ames-backend
     restart: unless-stopped
@@ -42,7 +42,7 @@ services:
     command: uvicorn app.main:app --host 0.0.0.0 --port 8123
 
   ames-worker:
-    build: ..
+    build: .
     container_name: ames-worker
     restart: unless-stopped
     depends_on:
