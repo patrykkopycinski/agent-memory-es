@@ -10,7 +10,7 @@ import time
 import uuid
 from typing import Any, Optional
 
-from .store import KINDS, es, idx, ensure_indices
+from .store import KINDS, es, idx, ensure_indices, ensure_indices_once
 from . import embeddings
 from . import tagfilter as _tf
 from . import tombstone
@@ -332,6 +332,7 @@ def retain(owner_id: str, kind: str, text: str, visibility: str = "private",
         raise ValueError(f"kind must be one of {KINDS}")
     if visibility not in VISIBILITIES:
         raise ValueError(f"visibility must be one of {VISIBILITIES}")
+    ensure_indices_once()
     # Tag filtering (decision record): both inputs are optional; absent => nothing below runs.
     write_tags = _tf.norm_tags(tags)              # FilterError (a ValueError) -> HTTP 422
     label_groups = _tf.validate_labels(labels)
@@ -677,6 +678,7 @@ def recall(owner_id: str, query: str, kinds=None, size: int = 8,
     top-k. With no filter this function is unchanged.
     """
     t_start = time.perf_counter()
+    ensure_indices_once()
     parsed = _tf.parse_filter(filter)             # FilterError (a ValueError) -> HTTP 422
     flt_extra, flt_not, narrow_tags, resolved, vocab_truncated = [], [], None, {}, False
     timings = {}

@@ -120,7 +120,11 @@ def es(method: str, path: str, body: Optional[dict] = None) -> dict:
         raise RuntimeError(f"ES {method} {path} -> {e.code}: {detail}") from e
 
 
+_indices_ready = False
+
+
 def ensure_indices() -> None:
+    global _indices_ready
     for kind in KINDS:
         try:
             es("GET", f"/{idx(kind)}")
@@ -143,6 +147,15 @@ def ensure_indices() -> None:
                                "valid_to": {"type": "date"}}})
         except RuntimeError:
             pass  # older cluster / no permission: exact-hash dedup degrades to kNN
+    _indices_ready = True
+
+
+def ensure_indices_once() -> None:
+    """ensure_indices() unless it already ran in this process, for library entry
+    points (memory.retain/recall) used without the API's startup hook. An index
+    deleted later in the same process is not recreated."""
+    if not _indices_ready:
+        ensure_indices()
 
 
 def idx(kind: str) -> str:
