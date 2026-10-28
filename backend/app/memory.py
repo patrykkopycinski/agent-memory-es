@@ -53,6 +53,25 @@ def _parse_similarity(raw):
 
 KNN_MIN_SIMILARITY = _parse_similarity(os.environ.get("AMES_KNN_MIN_SIMILARITY"))
 
+# `text` uses the standard analyzer (no stopword filter), so "what is the capital of france"
+# matches any long English doc on the/of/is, and cross-kind fusion hands that hit a top slot
+# the kNN floor cannot remove. Opt-in: strip Lucene's English stop set (ES `_english_`) from
+# the BM25 `text` clause only; `entities` keeps the raw query (exact keyword match). Default
+# off until an anchor run measures it. An all-stopword query leaves the lexical arm empty.
+LEXICAL_STOPWORDS = os.environ.get("AMES_LEXICAL_STOPWORDS", "").lower() in ("1", "true")
+_EN_STOP = ("a an and are as at be but by for if in into is it no not of on or such that the "
+            "their then there these they this to was will with").split()
+_STOP_RE = re.compile(r"(?<![\w'])(?:%s)(?![\w'])" % "|".join(_EN_STOP), re.IGNORECASE)
+
+
+def _lexical_clause(query: str) -> dict:
+    if not LEXICAL_STOPWORDS:
+        return {"multi_match": {"query": query, "fields": ["text^3", "entities"], "type": "most_fields"}}
+    content = " ".join(_STOP_RE.sub(" ", query).split())
+    return {"bool": {"should": [{"match": {"text": {"query": content, "boost": 3}}},
+                                {"match": {"entities": query}}],
+                     "minimum_should_match": 1}}
+
 # Round 5: ES-native cross-encoder rerank (_inference/rerank) over the fused top-RERANK_DEPTH,
 # applied BEFORE the per-doc budget and the size cut (the output budget is unchanged: still
 # `size` passages). Default on; AMES_RERANK=0 or per-request rerank=false disables it. If the
@@ -743,7 +762,7 @@ def recall(owner_id: str, query: str, kinds=None, size: int = 8,
     # back under-filled whenever a group hits its cap.
     fetch = max(size, min(RECALL_FETCH_CAP, size * RECALL_FETCH_FACTOR))
     for kind in kinds:
-        must = [{"multi_match": {"query": query, "fields": ["text^3", "entities"], "type": "most_fields"}}]
+        must = [_lexical_clause(query)]
         validity = []
         if now is not None:
             instant = now.isoformat()

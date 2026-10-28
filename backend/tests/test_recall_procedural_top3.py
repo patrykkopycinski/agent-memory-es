@@ -8,7 +8,8 @@ it there:
     Fixed by `min_similarity`; pinned below with nonsense queries.
   * lexical: the `text` field has no stopword filtering, so "what is the capital of
     france" matches a long English doc on "the"/"of"/"is". The kNN floor cannot remove
-    that, so the natural-language case is a strict xfail until the lexical arm is fixed.
+    that; AMES_LEXICAL_STOPWORDS (memory.LEXICAL_STOPWORDS) strips stopwords from the
+    BM25 text clause.
 
 FLOOR is calibrated for multilingual-e5-small (the suite's embedding endpoint). On 30
 labelled query->doc pairs, the lowest relevant cosine is 0.840 and the highest nonsense
@@ -98,8 +99,34 @@ def test_floor_keeps_long_procedural_doc_for_on_topic_query():
     assert _in_top3(ON_TOPIC, FLOOR)
 
 
-@pytest.mark.xfail(strict=True, reason="lexical arm matches stopwords; kNN floor cannot "
-                                        "remove it (issue #1, cross-kind fusion)")
-def test_floor_keeps_long_procedural_doc_out_of_top3_for_unrelated_questions():
+def test_floor_alone_leaves_long_procedural_doc_top3_for_unrelated_questions():
+    # Control for the next test: without stopword stripping the lexical arm matches
+    # the/of/is, so the kNN floor cannot keep the doc out.
+    assert any(_in_top3(q, FLOOR) for q in UNRELATED)
+
+
+def test_stopword_lexical_keeps_long_procedural_doc_out_of_top3_for_unrelated_questions(monkeypatch):
+    monkeypatch.setattr(memory, "LEXICAL_STOPWORDS", True)
     leaked = [q for q in UNRELATED if _in_top3(q, FLOOR)]
     assert leaked == []
+    assert _in_top3(ON_TOPIC, FLOOR)
+
+
+# ------------------------------------------------------------------ query shape (no ES)
+def test_default_lexical_clause_is_unchanged(monkeypatch):
+    monkeypatch.setattr(memory, "LEXICAL_STOPWORDS", False)
+    assert memory._lexical_clause("what is the plan") == {"multi_match": {
+        "query": "what is the plan", "fields": ["text^3", "entities"], "type": "most_fields"}}
+
+
+def test_stopword_clause_strips_text_query_and_keeps_entities_raw(monkeypatch):
+    monkeypatch.setattr(memory, "LEXICAL_STOPWORDS", True)
+    q = "What is THE capital of France? isn't it Bank of America"
+    text_q, ent_q = memory._lexical_clause(q)["bool"]["should"]
+    assert text_q == {"match": {"text": {"query": "What capital France? isn't Bank America", "boost": 3}}}
+    assert ent_q == {"match": {"entities": q}}
+
+
+def test_all_stopword_query_matches_no_text(monkeypatch):
+    monkeypatch.setattr(memory, "LEXICAL_STOPWORDS", True)
+    assert memory._lexical_clause("the of is")["bool"]["should"][0]["match"]["text"]["query"] == ""
