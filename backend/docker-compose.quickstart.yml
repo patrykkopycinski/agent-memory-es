@@ -11,6 +11,12 @@ services:
       discovery.type: single-node
       xpack.security.enabled: "false"
       ES_JAVA_OPTS: -Xms512m -Xmx512m
+    # Hard cap 2g (steady RSS ~0.9g, JVM heap pinned to 512m): bounds bursts so
+    # it cannot crowd out omniroute-local inside the shared 12 GiB OrbStack VM.
+    deploy:
+      resources:
+        limits: {memory: 2g}
+        reservations: {memory: 1g}
     ports:
       - "127.0.0.1:19200:9200"
     volumes:
