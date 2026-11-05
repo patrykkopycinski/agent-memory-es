@@ -259,6 +259,10 @@ def test_confidence_math_units():
     assert memory._confidence(0.0, 0.0, True) == 0.0
     assert memory._confidence(8.0, None, False) == round(8.0 / (8.0 + memory.CONF_BM25_K), 4)
     assert memory._confidence(None, 0.95, True) == 1.0     # es_rrf: vector term only
+    # blend: both arms contribute, in the configured proportion (neither may be dropped)
+    assert memory._confidence(0.0, 0.95, True) == 0.6               # pinned defaults, not read back
+    assert memory._confidence(1e9, 0.0, True) == 0.4
+    assert (memory.CONF_COS_LO, memory.CONF_COS_HI, memory.CONF_BM25_K) == (0.80, 0.90, 10.0)
 
 
 # ── exists ───────────────────────────────────────────────────────────────────────────────────
@@ -367,7 +371,8 @@ def test_superseded_cycle_does_not_hang_and_reports_no_live_id(n):
 
 
 def test_chain_longer_than_the_hop_bound_reports_no_live_id_and_exactly_at_the_bound_resolves():
-    n = memory.MAX_SUPERSEDE_HOPS
+    assert memory.MAX_SUPERSEDE_HOPS == 10      # literal on purpose: the test must not move with the constant
+    n = 10
     ids = [_retain(f"long chain probe - the tram stop number {i} is closed")["_id"] for i in range(n + 2)]
     _link(ids)                                                    # ids[-1] is the live doc
     over = client.post("/memory/delete", headers=H, json={"kind": "semantic", "doc_id": ids[0]})
