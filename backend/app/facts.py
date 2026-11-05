@@ -36,6 +36,14 @@ class SourceGone(Exception):
 
 
 SKIP_MESSAGE = "skipped: source inactive, missing, or owner mismatch"
+_DOC_MISS = re.compile(r'"found"\s*:\s*false')
+
+
+def _is_doc_miss(exc) -> bool:
+    """A document-level 404 (`{"found": false}`). An index-level 404 (`index_not_found_exception`)
+    is an infrastructure fault, not a gone source: skipping it would silently complete every job."""
+    text = str(exc)
+    return "-> 404" in text and bool(_DOC_MISS.search(text))
 
 LEASE_SECONDS = 3600  # generic-worker lease; upstream calls have bounded retry budgets
 # Backfill claims use short leases for both scope and job; the heartbeat renews
@@ -361,7 +369,7 @@ def process(source_id, owner_id, abort=None):
     try:
         source = es("GET", f"/{idx('episodic')}/_doc/{source_id}")["_source"]
     except RuntimeError as exc:
-        if "-> 404" in str(exc):
+        if _is_doc_miss(exc):
             raise SourceGone(SKIP_MESSAGE) from exc
         raise
     if source["owner_id"] != owner_id or not source.get("active", True):

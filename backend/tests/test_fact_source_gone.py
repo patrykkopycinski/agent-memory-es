@@ -29,7 +29,7 @@ def _fake_es(source):
 @pytest.mark.parametrize("source", [
     {"owner_id": "alice", "active": False, "occurred_at": "2024-01-01T00:00:00Z"},
     {"owner_id": "bob", "active": True, "occurred_at": "2024-01-01T00:00:00Z"},
-    RuntimeError("ES GET /am_episodic/_doc/src -> 404: not found"),
+    RuntimeError('ES GET /am_episodic/_doc/src -> 404: {"_index":"am_episodic","_id":"src","found":false}'),
 ], ids=["soft-deleted", "owner-mismatch", "missing-404"])
 def test_gone_source_completes_as_skipped_without_charging_an_attempt(monkeypatch, captured, source):
     monkeypatch.setattr(facts, "claim", lambda: _job(attempts=2))
@@ -57,6 +57,17 @@ def test_non_404_source_read_error_still_consumes_an_attempt(monkeypatch, captur
 def test_genuine_extraction_error_still_consumes_an_attempt(monkeypatch, captured):
     monkeypatch.setattr(facts, "claim", lambda: _job(attempts=1))
     monkeypatch.setattr(facts, "process", lambda *a: (_ for _ in ()).throw(ValueError("bad response")))
+    facts.run_once()
+    assert captured["args"][2] == "pending" and captured["attempts"] == 2
+    assert "skipped" not in captured["error"]
+
+
+def test_index_level_404_is_a_charged_failure_not_a_skip(monkeypatch, captured):
+    """index_not_found_exception means the store is broken: every job would silently 'complete'."""
+    monkeypatch.setattr(facts, "claim", lambda: _job(attempts=1))
+    monkeypatch.setattr(facts, "es", _fake_es(RuntimeError(
+        'ES GET /am_episodic/_doc/src -> 404: {"error":{"root_cause":[{"type":"index_not_found_exception",'
+        '"reason":"no such index [am_episodic]"}],"type":"index_not_found_exception"},"status":404}')))
     facts.run_once()
     assert captured["args"][2] == "pending" and captured["attempts"] == 2
     assert "skipped" not in captured["error"]
