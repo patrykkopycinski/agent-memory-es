@@ -3,12 +3,15 @@ import hmac
 import logging
 import os
 import re
+import threading
+import time
 from typing import Optional
 
 from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-from . import auth, memory, pages as pages_mod, mental_models as mm_mod, reranker, tagfilter, facts
+from . import auth, embeddings, memory, pages as pages_mod, mental_models as mm_mod, reranker, tagfilter, facts
 from .store import KINDS, ensure_indices
 
 app = FastAPI(title="agent-memory-es", version="0.2.0")
@@ -317,6 +320,7 @@ def memory_stats(who: dict = Depends(caller)):
     for m in models:
         m["stale"] = mm_mod.staleness(owner, m)
     return {"owner_id": owner, "counts": counts, "recent_semantic": recent,
+            "embed_failures": dict(embeddings.FAILURES),
             "models": models, "drafts": drafts,
             "pages": pages_mod.list_pages(owner)}
 
@@ -362,6 +366,61 @@ def mcp_tool(tool: str, body: dict, who: dict = Depends(caller)):
         return {"error": str(e)}
 
 
+HEALTH_EMBED_TTL_S = 60
+_embed_probe = {"at": 0.0, "ok": True, "error": None}
+_embed_probe_lock = threading.Lock()
+
+
+def _embed_probe_cached() -> dict:
+    """Live embed of "probe", at most once per HEALTH_EMBED_TTL_S."""
+    with _embed_probe_lock:
+        now = time.monotonic()
+        if _embed_probe["at"] and now - _embed_probe["at"] < HEALTH_EMBED_TTL_S:
+            return dict(_embed_probe)
+        try:
+            embeddings.embed(["probe"])
+            _embed_probe.update(ok=True, error=None)
+        except Exception as exc:
+            _embed_probe.update(ok=False, error=embeddings.describe_error(exc))
+        _embed_probe["at"] = now
+        return dict(_embed_probe)
+
+
+def _license_status() -> Optional[str]:
+    from .store import es
+    try:
+        return es("GET", "/_license").get("license", {}).get("status")
+    except Exception:
+        return None
+
+
+def _docs_without_vector_24h() -> Optional[int]:
+    """Active docs written in the last 24h that have no embedding, across all kinds."""
+    from .store import es, idx
+    try:
+        total = 0
+        for kind in KINDS:
+            r = es("POST", f"/{idx(kind)}/_count", {"query": {"bool": {
+                "filter": [{"term": {"active": True}},
+                           {"range": {"occurred_at": {"gte": "now-24h"}}}],
+                "must_not": [{"exists": {"field": "embedding"}}]}}})
+            total += r.get("count", 0)
+        return total
+    except Exception:
+        return None
+
+
 @app.get("/health")
 def health():
-    return {"ok": True, "kinds": list(KINDS)}
+    """Liveness plus embed/fusion truth. 503 when the live embed probe fails: a service that
+    silently writes vector-less docs is not healthy (the 2026-10-31 license expiry did that
+    for five days behind a green /health)."""
+    probe = _embed_probe_cached()
+    body = {"ok": probe["ok"], "kinds": list(KINDS), "embed_ok": probe["ok"],
+            "fusion": memory.fusion_mode(), "license_status": _license_status(),
+            "docs_without_vector_24h": _docs_without_vector_24h(),
+            "embed_failures": dict(embeddings.FAILURES)}
+    if not probe["ok"]:
+        body["embed_error"] = probe["error"]
+        return JSONResponse(body, status_code=503)
+    return body

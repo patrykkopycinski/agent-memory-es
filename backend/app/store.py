@@ -68,7 +68,7 @@ MAPPINGS = {
 # refused (bulk APIs like _bulk/_reindex/_aliases/_mget/_delete_by_query can
 # hit any index and are not needed under the guard).
 _ALLOWED_CLUSTER_APIS = (
-    "_cat", "_cluster", "_inference",
+    "_cat", "_cluster", "_inference", "_license",
     # read-only cross-index ops used by tools/diagnostics:
     "_stats", "_nodes",
 )

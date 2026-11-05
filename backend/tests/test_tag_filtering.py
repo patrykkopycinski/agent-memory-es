@@ -357,7 +357,7 @@ def test_retain_without_tags_or_labels_stores_the_same_fields_as_before():
     assert set(src) == {"kind", "owner_id", "visibility", "text", "text_hash", "doc_group", "passage_index",
                         "passages_total", "entities", "occurred_at", "active"}   # == main@615dde0, probed
     assert set(r) == {"_id", "ids", "doc_group", "passages", "deduped", "dedup_reason", "owner_id",
-                      "visibility", "occurred_at", "text_hash"}
+                      "visibility", "occurred_at", "text_hash", "embedded"}   # `embedded` is additive (P0-3)
 
 
 # ── the BM25-only fallback (embedder unavailable) honours the filter too ─────

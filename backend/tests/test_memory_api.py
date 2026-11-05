@@ -25,7 +25,8 @@ def _retain(key, kind="semantic", text="x", visibility="private"):
 
 
 def test_health():
-    assert client.get("/health").json()["ok"]
+    r = client.get("/health")
+    assert r.status_code == 200 and r.json()["ok"]
 
 
 def test_auth_reject():

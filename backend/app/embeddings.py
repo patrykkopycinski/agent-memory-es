@@ -5,11 +5,16 @@ gateway). AMES_EMBED_BACKEND=es|omniroute pins one. Dims differ per backend — 
 be rebuilt when switching backends.
 """
 import json
+import logging
 import os
+import threading
+import time
 import urllib.request
 
 from . import http_retry
 from .store import _es_url
+
+log = logging.getLogger("ames.embed")
 ES_ENDPOINT = os.environ.get("AMES_ES_INFERENCE", ".multilingual-e5-small-elasticsearch")
 OR_BASE = os.environ.get("AMES_EMBED_BASE", "http://localhost:20128/v1")
 OR_MODEL = os.environ.get("AMES_EMBED_MODEL", "openrouter/google/gemini-embedding-2")
@@ -54,6 +59,34 @@ def backend() -> str:
 
 def embed(texts: list) -> list:
     return _es_embed(texts) if backend() == "es" else _or_embed(texts)
+
+
+# Process-wide embed failure counter. embed() failures on the retain/recall hot path used to be
+# swallowed silently (a license expiry left retain writing vector-less docs for 5 days); every
+# swallowed failure now lands here and is surfaced by /health and /memory/stats.
+FAILURES = {"count": 0, "last_error": None, "last_at": None}
+_failures_lock = threading.Lock()
+
+
+def describe_error(exc: BaseException) -> str:
+    """Short, single-line error string safe to return in an API response."""
+    return f"{type(exc).__name__}: {' '.join(str(exc).split())[:160]}"
+
+
+def embed_safe(texts: list) -> tuple:
+    """embed() that never raises: (vectors, None) on success, (None, error_string) on failure.
+    Failures are counted in FAILURES and logged. Looks up `embed` at call time so tests can
+    monkeypatch it."""
+    try:
+        return embed(texts), None
+    except Exception as exc:
+        err = describe_error(exc)
+        with _failures_lock:
+            FAILURES["count"] += 1
+            FAILURES["last_error"] = err
+            FAILURES["last_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        log.warning("ames.embed failed (writes land vector-less, recall loses its vector arm): %s", err)
+        return None, err
 
 
 def dim() -> int:

@@ -428,13 +428,12 @@ def retain(owner_id: str, kind: str, text: str, visibility: str = "private",
     passages = chunk_text(text)
     group = doc_group or ("dg_%s" % uuid.uuid4().hex)
     occurred = occurred_at or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    vec = None
-    try:
-        vec = embeddings.embed([passages[0]])[0]
-    except Exception:
-        pass  # embeddings optional: BM25-only degrade
+    # Embeddings stay optional (BM25-only degrade) but the degrade is reported, never silent.
+    vecs, embed_error = embeddings.embed_safe([passages[0]])
+    vec = vecs[0] if vecs else None
     near = _nearest_dup(owner_id, kind, visibility, vec)
     ids = []
+    unembedded = 1 if vec is None else 0   # passages written without a vector
     for i, passage in enumerate(passages):
         doc = {
             "kind": kind,
@@ -459,17 +458,24 @@ def retain(owner_id: str, kind: str, text: str, visibility: str = "private",
             if i == 0:
                 doc["embedding"] = vec
             else:
-                try:
-                    doc["embedding"] = embeddings.embed([passage])[0]
-                except Exception:
-                    pass
+                pvecs, perr = embeddings.embed_safe([passage])
+                if pvecs:
+                    doc["embedding"] = pvecs[0]
+                else:
+                    embed_error = embed_error or perr
+                    unembedded += 1
+        elif i > 0:
+            unembedded += 1
         r = es("POST", f"/{idx(kind)}/_doc?refresh=true", doc)
         ids.append(r["_id"])
     # `_id` stays a CONCRETE document id (first passage): promote/consolidate/supersede
     # and every existing caller key off a real doc id. The group is separate metadata.
     out = {"_id": ids[0], "ids": ids, "doc_group": group, "passages": len(passages),
            "deduped": False, "dedup_reason": "distinct", "owner_id": owner_id,
-           "visibility": visibility, "occurred_at": occurred, "text_hash": h}
+           "visibility": visibility, "occurred_at": occurred, "text_hash": h,
+           "embedded": unembedded == 0}
+    if unembedded:
+        out["embed_error"] = embed_error
     if write_tags:
         out["tags"] = list(write_tags)
     if extraction is not None:
@@ -720,6 +726,11 @@ def _tag_vocabulary(owner_id: str, kinds: list, keys: list) -> tuple:
     return out, truncated
 
 
+def fusion_mode() -> str:
+    """Which side fuses BM25 + kNN: Elasticsearch `retriever.rrf` (needs a paid license)."""
+    return "es_rrf"
+
+
 def _ms(t0: float) -> float:
     return round((time.perf_counter() - t0) * 1000.0, 3)
 
@@ -729,7 +740,8 @@ def _owner_hash(owner_id: str) -> str:
 
 
 def _log_recall(owner_id: str, size: int, rerank_requested: bool, filtered: bool,
-                abstained: bool, timings: dict, rerank_info: Optional[dict] = None) -> None:
+                abstained: bool, timings: dict, rerank_info: Optional[dict] = None,
+                embed_error: Optional[str] = None) -> None:
     """One structured line per recall. Carries a truncated owner hash and timings only: never
     the query text and never the owner id in clear."""
     line = {"owner": _owner_hash(owner_id), "k": size, "rerank": rerank_requested,
@@ -738,6 +750,8 @@ def _log_recall(owner_id: str, size: int, rerank_requested: bool, filtered: bool
         line["rerank_applied"] = rerank_info["applied"]
         if rerank_info["fallback_reason"]:
             line["rerank_fallback"] = rerank_info["fallback_reason"]
+    if embed_error:
+        line["embed_error"] = embed_error
     _recall_log.info("ames.recall %s", json.dumps(line, separators=(",", ":"), sort_keys=True))
 
 
@@ -809,12 +823,9 @@ def recall(owner_id: str, query: str, kinds=None, size: int = 8,
         now = _parse_as_of(as_of)
     kinds = kinds or list(KINDS)
     sim_floor = KNN_MIN_SIMILARITY if min_similarity is None else _parse_similarity(min_similarity)
-    qvec = None
     t_embed = time.perf_counter()
-    try:
-        qvec = embeddings.embed([query])[0]
-    except Exception:
-        pass
+    qvecs, embed_error = embeddings.embed_safe([query])
+    qvec = qvecs[0] if qvecs else None
     timings["embed"] = _ms(t_embed)
     results = {}
     search_by_kind, es_took = {}, 0
@@ -962,7 +973,11 @@ def recall(owner_id: str, query: str, kinds=None, size: int = 8,
         "abstained": bool(min_score is not None and not window),
         "doc_groups": len({it.get("doc_group") or it.get("id") for it in window}),
         "reranked": reranked,
+        "vector_arm": qvec is not None,
+        "degraded": [] if qvec is not None else ["vector_arm"],
     }
+    if embed_error:
+        out["embed_error"] = embed_error
     if rerank_info is not None:
         out["rerank"] = rerank_info     # additive: only present when a rerank was requested
     if parsed is not None:
@@ -984,7 +999,7 @@ def recall(owner_id: str, query: str, kinds=None, size: int = 8,
         out["temporal"] = temporal_meta
     timings["total"] = _ms(t_start)
     out["timings_ms"] = timings
-    _log_recall(owner_id, size, rerank_requested, parsed is not None, out["abstained"], timings, rerank_info)
+    _log_recall(owner_id, size, rerank_requested, parsed is not None, out["abstained"], timings, rerank_info, embed_error)
     return out
 
 
