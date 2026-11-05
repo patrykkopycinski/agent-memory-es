@@ -642,8 +642,13 @@ def update(owner_id: str, kind: str, doc_id: str, text=None, tags=None,
                {"query": _owned_group_query(owner_id, group)})
         r = retain(owner_id, kind, text, target_vis,
                    occurred_at=occurred, doc_group=group, tags=new_tags)
-        return {"_id": r["_id"], "doc_group": r.get("doc_group", group),
-                "passages": r.get("passages"), "updated": True}
+        out = {"_id": r["_id"], "doc_group": r.get("doc_group", group),
+               "passages": r.get("passages"), "updated": True}
+        if "embedded" in r:
+            out["embedded"] = r["embedded"]
+        if r.get("embed_error"):
+            out["embed_error"] = r["embed_error"]
+        return out
     patch = {}
     if new_tags is not None:
         patch[_tf.TAG_FIELD] = list(new_tags)
@@ -1124,6 +1129,14 @@ def reflect(owner_id: str, question: str, llm_answer_fn=None, rounds: int = 3) -
     from . import mental_models as _mm
     model = _mm.match_model(owner_id, question)
     evidence = recall(owner_id, question)
+    degraded = list(evidence.get("degraded") or [])
+    embed_error = evidence.get("embed_error")
+
+    def _flag(out):
+        out["degraded"] = degraded
+        if embed_error:
+            out["embed_error"] = embed_error
+        return out
     sources = evidence.get("evidence") or [h for h in evidence["fused"][:5]]
     has_facts = bool(evidence.get("fact_count"))
     queries_run = [question]
@@ -1138,6 +1151,10 @@ def reflect(owner_id: str, question: str, llm_answer_fn=None, rounds: int = 3) -
             for q in rewrites[:rounds - 1]:
                 queries_run.append(q)
                 more = recall(owner_id, q)
+                for d in more.get("degraded") or []:
+                    if d not in degraded:
+                        degraded.append(d)
+                embed_error = embed_error or more.get("embed_error")
                 seen = {s["id"] for s in sources}
                 for h in (more.get("evidence", more["fused"]) if has_facts else more["fused"]):
                     if h["id"] not in seen and len(sources) < (32 if has_facts else 5):
@@ -1145,15 +1162,15 @@ def reflect(owner_id: str, question: str, llm_answer_fn=None, rounds: int = 3) -
         except Exception:
             pass  # rewrite unavailable → single-pass reflect, never fake rounds
     if not sources and model is None:
-        return {"question": question, "answer": "INSUFFICIENT_EVIDENCE", "sources": [],
-                "synthesized": False, "queries": queries_run}
+        return _flag({"question": question, "answer": "INSUFFICIENT_EVIDENCE", "sources": [],
+                      "synthesized": False, "queries": queries_run})
     if model is not None:
         sources = [{"id": model["id"], "text": model["summary"],
                     "tier": "mental_model", **{k: v for k, v in model.items()
                                               if k in ("owner_id", "visibility", "updated_at")}}] + sources
     if llm_answer_fn is False:
-        return {"question": question, "sources": [s["id"] for s in sources],
-                "evidence": sources, "synthesized": False, "queries": queries_run}
+        return _flag({"question": question, "sources": [s["id"] for s in sources],
+                      "evidence": sources, "synthesized": False, "queries": queries_run})
     if llm_answer_fn is None:
         from . import llm as _llm
         fn = _llm.chat
@@ -1161,9 +1178,9 @@ def reflect(owner_id: str, question: str, llm_answer_fn=None, rounds: int = 3) -
         fn = llm_answer_fn
     answer = fn(question, sources)
     cited = [s["id"] for s in sources if s["id"] in (answer or "")]
-    return {"question": question, "answer": answer,
-            "sources": cited or [s["id"] for s in sources],
-            "synthesized": True, "queries": queries_run}
+    return _flag({"question": question, "answer": answer,
+                  "sources": cited or [s["id"] for s in sources],
+                  "synthesized": True, "queries": queries_run})
 
 
 def _delete_superseded_note():

@@ -177,3 +177,35 @@ def test_stale_health_is_served_while_one_refresher_runs(monkeypatch):
             break
         time.sleep(0.05)
     assert client.get("/health").json()["degraded"] is True  # refreshed value lands
+
+
+def test_update_reports_embed_failure_and_healthy_is_clean(monkeypatch):
+    doc = _retain("update degradation: ferry timetable for the north pier")
+    ok = client.post("/memory/update", headers=H, json={
+        "kind": "semantic", "doc_id": doc["_id"], "text": "update control: ferry timetable north pier v2 "
+                                                         + uuid.uuid4().hex})
+    assert ok.status_code == 200, ok.text
+    assert ok.json()["embedded"] is True and "embed_error" not in ok.json()
+    monkeypatch.setattr(embeddings, "embed", _boom)
+    bad = client.post("/memory/update", headers=H, json={
+        "kind": "semantic", "doc_id": ok.json()["_id"], "text": "update degraded: ferry timetable north pier v3 "
+                                                              + uuid.uuid4().hex})
+    assert bad.status_code == 200, bad.text
+    assert bad.json()["embedded"] is False and "403" in bad.json()["embed_error"]
+
+
+def _owner():
+    return "embed-degradation-owner"
+
+
+def test_reflect_passes_through_recall_degradation(monkeypatch):
+    _retain("reflect degradation: lighthouse keeper rota for the winter season")
+    monkeypatch.setattr(embeddings, "embed", _boom)
+    body = memory.reflect(_owner(), "lighthouse keeper rota", llm_answer_fn=False, rounds=1)
+    assert body["degraded"] == ["vector_arm"] and "403" in body["embed_error"]
+
+
+def test_reflect_healthy_is_clean():
+    _retain("reflect control: lighthouse keeper rota for the winter season")
+    body = memory.reflect(_owner(), "lighthouse keeper rota", llm_answer_fn=False, rounds=1)
+    assert body["degraded"] == [] and "embed_error" not in body
