@@ -37,7 +37,7 @@ services:
         condition: service_healthy
     environment:
       AMES_ES_URL: http://ames-es:9200
-      AMES_EMBED_BACKEND: es
+      AMES_EMBED_BACKEND: local
       AMES_ADMIN_TOKEN: ${AMES_ADMIN_TOKEN:?set AMES_ADMIN_TOKEN (no default; key minting is disabled without it)}
       AMES_API_KEYS_FILE: /data/ames_keys.json
       AMES_CONSOLIDATE_INTERVAL: "600"
@@ -56,7 +56,7 @@ services:
         condition: service_healthy
     environment:
       AMES_ES_URL: http://ames-es:9200
-      AMES_EMBED_BACKEND: es
+      AMES_EMBED_BACKEND: local
       # Without the backend's key store known_owners() is empty and every
       # consolidation pass is a silent no-op.
       AMES_API_KEYS_FILE: /data/ames_keys.json

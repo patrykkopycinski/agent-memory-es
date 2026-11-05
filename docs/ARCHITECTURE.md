@@ -34,7 +34,8 @@ Every document carries the same envelope (`store.py` MAPPINGS):
 | `POST /memory/reflect` | LLM answer over recalled evidence, with citations (`llm.py`) |
 | `POST /mcp/tools/{tool}` | thin MCP adapter over the same ops |
 | `POST /admin/keys` | mint API key (X-Admin-Token) |
-| `GET /health` | liveness + embed/fusion truth: `embed_ok` (live probe, cached 60 s), `fusion`, `license_status`, `docs_without_vector_24h`; **503** when the embed probe fails |
+| `GET /health` | liveness + embed/fusion truth, always **200** while the process serves: `degraded`, `embed_ok` (live probe, one attempt, 5 s cap, cached 60 s and refreshed in the background), `vector_arm`, `embed_error`, `fusion`, `license_status`, `docs_without_vector_occurred_24h` (docs with `occurred_at` in the last 24 h and no vector; counted by `occurred_at`, not by write time), `embed_failures` (per-process, backend only: it resets on restart and is not shared between the API and the worker) |
+| `GET /health/ready` | same body, **503** while degraded (embed probe failing). Use this for readiness gates and alerts; `/health` stays a liveness probe |
 
 ## Tenancy & isolation
 
@@ -60,7 +61,17 @@ Background loop (default every 600 s, `AMES_CONSOLIDATE_INTERVAL`): for every kn
 
 `ames-backend` (uvicorn :8123) + `ames-worker` + a Elasticsearch instance; `AMES_ADMIN_TOKEN` required. Env knobs: `AMES_ES_URL`, `AMES_EMBED_BACKEND`, `AMES_LLM_BASE` (OpenAI-compatible endpoint for reflect).
 
-Embedding/fusion knobs: `AMES_EMBED_BACKEND` also accepts `local` (in-process multilingual-e5-small via onnxruntime, license-independent; model baked at `AMES_LOCAL_MODEL_DIR`). `AMES_FUSION` is `app` (default: BM25 + kNN fused in Python, RRF k=60, window 50) or `es` (`retriever.rrf`, needs a paid/trial license).
+### Embedding backends and the license
+
+- `es` calls `_inference/text_embedding`, which **needs an Elasticsearch license** that includes inference: when a trial expires it returns 403 and writes land without vectors. `omniroute` calls an external OpenAI-compatible gateway (different dimensions, so it needs its own index).
+- `local` runs multilingual-e5-small in-process (onnxruntime + tokenizers) and is the **off-license setting**: it needs no `_inference`, and its vectors match the ES-hosted endpoint (cosine >= 0.9999 on the parity fixture). Both compose files set `AMES_EMBED_BACKEND: local`.
+- With `AMES_EMBED_BACKEND` unset, auto-detect prefers `local` when `onnxruntime` and `tokenizers` import and `AMES_LOCAL_MODEL_DIR` holds a valid model; otherwise it probes `es`, then falls back to `omniroute`. An explicit value always wins.
+- The model is never downloaded at runtime. The image build (`scripts/bake_e5_model.py`) fetches one pinned HF revision, verifies its sha256 and writes a `REVISION` marker; `embeddings.py` refuses a model dir whose marker differs from `LOCAL_MODEL_REVISION`, and `embed_error` names the missing path. `AMES_LOCAL_MODEL_ALLOW_FETCH=1` (default off) allows a download for dev checkouts and tests only.
+- Parity fixture: `backend/scripts/capture_e5_parity.py` records ES-hosted vectors (read-only) together with the model id and node architecture.
+
+### Fusion
+
+`AMES_FUSION` is `app` (default: BM25 + kNN fused in Python, RRF k=60, window 50) or `es` (`retriever.rrf`, needs a paid/trial license). The app-side tie-break is deterministic: on exactly equal RRF scores the better best-rank wins, then the lexical list, then the id. This differs from ES's `retriever.rrf` on exact ties only, which is accepted.
 
 ## Hermes integration
 

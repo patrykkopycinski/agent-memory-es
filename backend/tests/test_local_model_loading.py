@@ -213,3 +213,10 @@ def test_explicit_pin_beats_auto_detect(tmp_path, monkeypatch, unpinned):
     monkeypatch.setattr(embeddings, "LOCAL_MODEL_DIR", str(tmp_path))
     monkeypatch.setenv("AMES_EMBED_BACKEND", "omniroute")
     assert embeddings.backend() == "omniroute"
+
+
+@pytest.mark.parametrize("name", ["docker-compose.yml", "docker-compose.quickstart.yml"])
+def test_compose_services_use_the_off_license_backend(name):
+    with open(os.path.join(BACKEND, name)) as fh:
+        pinned = re.findall(r"^\s+AMES_EMBED_BACKEND:\s*(\S+)\s*$", fh.read(), re.M)
+    assert pinned and set(pinned) == {"local"}, pinned
