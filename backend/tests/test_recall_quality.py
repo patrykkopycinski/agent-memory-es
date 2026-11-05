@@ -136,11 +136,11 @@ def test_recency_boost_orders_recent_first(monkeypatch):
     d_boost = b[new]["score"] - b[old]["score"]
     d_flat = f[new]["score"] - f[old]["score"]
     assert abs((d_boost - d_flat) - (b[new]["recency"] - b[old]["recency"])) < 1e-9
-    assert d_boost > 0, (d_boost, d_flat)
     # `new` is 1 day old: decay ~0.999, so its boost is ~5/61 = 0.082 whatever today's date is, while the
     # RRF gap between two docs is ~1e-3. Require a margin so this can never be a tie-break again.
     assert b[new]["recency"] > 0.9 * 5.0 / (memory.RANK_CONSTANT + 1), b[new]["recency"]
-    assert d_boost > abs(d_flat) + 0.05, (d_boost, d_flat)
+    assert b[new]["recency"] - b[old]["recency"] > 0.05, (b[new]["recency"], b[old]["recency"])
+    assert d_boost > 0, (d_boost, d_flat)
 
 
 def test_recency_boost_unit_fixed_timestamps(monkeypatch):

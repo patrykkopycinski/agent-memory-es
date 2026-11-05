@@ -86,7 +86,7 @@ now=$(date +%s)
 take() { mkdir "$L" 2>/dev/null && echo "$ID $now" > "$L/owner"; }
 mtime() { stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || echo "$now"; }   # GNU first: BSD `stat -f` means something else on Linux
 # Is the lock stale? Decided by OWNER LIVENESS, never by age alone:
-#   - owner's driver is gone (driver.pid names no live driver.sh process), or
+#   - owner's driver is gone (driver.pid names no live process running ames-rv-<owner>/driver.sh), or
 #   - owner's run dir has been missing > 120 s (claim older than 120 s and no /tmp/ames-rv-<owner>), or
 #   - no owner file: the lock dir itself is older than 120 s.
 # A launcher that was killed before it started a driver leaves a run dir without driver.pid: that is
@@ -99,7 +99,7 @@ is_stale() {
   if [ ! -d "$rd" ]; then [ $((now - ots)) -gt 120 ]; return; fi
   if [ -f "$rd/driver.pid" ]; then
     p=$(cat "$rd/driver.pid" 2>/dev/null)
-    ps -p "$p" -o command= 2>/dev/null | grep -q 'driver.sh' && return 1
+    ps -p "$p" -o command= 2>/dev/null | grep -q "ames-rv-$oid/driver.sh" && return 1
     return 0
   fi
   [ $((now - $(mtime "$rd"))) -gt "$TTL" ]
@@ -114,7 +114,7 @@ if ! take; then
         if take; then echo "took over stale lock of run ${stale_oid:-?}"; else echo "lock $L taken by another run"; exit 75; fi
       else
         # we retired a lock that was replaced between the check and the mv: put it back
-        mv "$L.stale.$ID" "$L" 2>/dev/null || rm -rf "$L.stale.$ID"
+        if [ ! -e "$L" ]; then mv "$L.stale.$ID" "$L" 2>/dev/null || rm -r -f "$L.stale.$ID"; else rm -r -f "$L.stale.$ID"; fi
         echo "lock $L is held by a live run"; exit 75
       fi
     else
@@ -124,6 +124,8 @@ if ! take; then
     echo "lock $L held by run ${oid:-?}"; exit 75
   fi
 fi
+# whatever path we took, the lock must now name us; if another runner replaced it under us, we are not the holder
+if [ "$(cut -d' ' -f1 "$L/owner" 2>/dev/null)" != "$ID" ]; then echo "lock $L is not ours (taken over concurrently)"; exit 75; fi
 case "$CMD" in \~/*) CMD=$HOME/${CMD#\~/};; esac
 if [ -n "$CMD" ]; then
   if [ -x "$CMD" ]; then
@@ -180,56 +182,9 @@ elif mode == "skipinfo":   # id<TAB>reason (message + body, one line)
 PY
 }
 
-# Skip gate (junit in, one line per lost test out): "OK<TAB>id<TAB>reason" or "BAD<TAB>id<TAB>reason".
-# A test is LOST when it passed on base and is skipped on head. A whole-file skip (module-level pytest.skip,
-# importorskip, require_llm) is ONE junit entry with an empty classname and name="tests.test_x"; it is
-# expanded to every base-passing test of that module. A lost test is excused only when the skip is the
-# shared LLM-gateway probe ("... (AMES_LLM_BASE) is unreachable (Exc); this test needs a live LLM") AND base
-# shows the same gateway-down skip/failure for that test or its module; anything else is a head regression.
-skipgate() { # head.xml base.xml
-  python3 - "$1" "$2" <<'PY'
-import re, sys, xml.etree.ElementTree as ET
-def load(path):
-    try: return list(ET.parse(path).getroot().iter("testcase"))
-    except Exception: return []
-head, base = load(sys.argv[1]), load(sys.argv[2])
-GW = re.compile(r"LLM gateway \S+ \(AMES_LLM_BASE\) is unreachable \(\w+\); this test needs a live LLM")
-def text(el): return " ".join(((el.get("message") or "") + " " + (el.text or "")).split())
-def module(tc):
-    cn = tc.get("classname")
-    if not cn: return tc.get("name")                       # whole-file entry: name is the dotted module
-    return re.sub(r"\.[A-Z]\w*$", "", cn)                  # drop a Test class segment
-tid = lambda tc: f'{tc.get("classname")}::{tc.get("name")}'
-def kind(tc):
-    for k in ("skipped", "failure", "error"):
-        if tc.find(k) is not None: return k
-    return "pass"
-base_pass = [tc for tc in base if tc.get("classname") and kind(tc) == "pass"]
-# base evidence of "gateway down" per test id and per module (a gateway skip, or a failure/collection error saying so)
-gw_ids, gw_mods = set(), set()
-for tc in base:
-    k = kind(tc)
-    if k == "pass": continue
-    el = tc.find(k)
-    if GW.search(text(el)) or "URLError" in text(el):
-        gw_ids.add(tid(tc)); gw_mods.add(module(tc))
-for tc in head:
-    sk = tc.find("skipped")
-    if sk is None: continue
-    reason = text(sk)
-    if tc.get("classname"):
-        lost = [tid(tc)] if tid(tc) in {tid(b) for b in base_pass} else []
-    else:
-        m = tc.get("name")
-        lost = [tid(b) for b in base_pass if b.get("classname") == m or b.get("classname").startswith(m + ".")]
-        if not lost: continue
-    for t in lost:
-        mod = t.split("::")[0]
-        mod = re.sub(r"\.[A-Z]\w*$", "", mod)
-        excused = GW.search(reason) and (t in gw_ids or mod in gw_mods)
-        print(("OK" if excused else "BAD") + "\t" + t + "\t" + reason[:160])
-PY
-}
+# Skip gate: scripts/skipgate.py (junit in, one "OK|BAD<TAB>id<TAB>reason" line per test that passed on base and is
+# skipped on head; rules and offline fixture tests live there: `python3 scripts/skipgate.py --self-test`).
+skipgate() { python3 "$HERE/skipgate.py" "$1" "$2"; }
 
 # ---------- abort / collect modes: re-attach by run id ----------
 if [ "$MODE" != run ]; then
@@ -353,7 +308,7 @@ fi
 # ---------- poll with short ssh calls ----------
 # One call reads driver liveness FIRST, then the status (a driver that exits writes its final status
 # before it dies, so "dead + non-terminal status" can only mean it was killed: SIGKILL / OOM / host reboot).
-POLLQ="a=1; if [ -f $RUN/driver.pid ]; then p=\$(cat $RUN/driver.pid); ps -p \$p -o command= 2>/dev/null | grep -q 'driver.sh' || a=0; fi; echo alive=\$a; echo status=\$(cat $RUN/status 2>/dev/null)"
+POLLQ="a=1; if [ -f $RUN/driver.pid ]; then p=\$(cat $RUN/driver.pid); ps -p \$p -o command= 2>/dev/null | grep -q 'ames-rv-$ID/driver.sh' || a=0; fi; echo alive=\$a; echo status=\$(cat $RUN/status 2>/dev/null)"
 last="" fails=0 shown=0
 while :; do
   if out=$(hr "$POLLQ"); then
