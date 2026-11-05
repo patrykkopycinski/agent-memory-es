@@ -10,8 +10,8 @@ from typing import Optional
 # key-ish word, separator, optional scheme word, 8+ char value (redact.ts KEYWORD_RE).
 # Deliberately stricter than redact.ts, which only masks: a 422 on prose like "auth migration"
 # or "token estimator" would reject ordinary facts. Here the separator must contain ':' or '=',
-# and the value must pass _keyword_value_is_secret (16+ chars, letters and digits, not a slug,
-# path, version or commit hash).
+# and the value must pass _keyword_value_is_secret (16+ chars, letters and digits, not a lowercase
+# slug or a commit hash).
 # Keywords: `api key` with a space or `_`/`-`, and any `<name>_KEY` / `<name>-key` suffix form
 # (SERVICE_KEY=...). The suffix alternative is one alnum char plus `_key`: no nested quantifier,
 # so it cannot backtrack. The other quantifiers are on single character classes.
@@ -35,86 +35,23 @@ SHAPE_RES = (
 )
 
 KEYWORD_MIN_VALUE_CHARS = 16
-_SLUG_SEP = re.compile(r"[-_+=]+")
-# One slug part: dot-joined pieces, each a lowercase word with a short numeric suffix
-# ("client2", "a3b", "35b"), or a version number ("v3", "3.8", "9.6.0"). A part that is purely
-# alphabetic may also be Capitalized or UPPER ("SNAPSHOT", "Users"); a part with digits must be
-# lowercase, so random mixed-case/digit runs ("Zx81QwQw") never qualify.
-_SLUG_PIECE = re.compile(r"^(?:[a-z]{1,}[0-9]{0,4}[a-z]{0,2}|v?[0-9]{1,8}[a-z]{0,2})$")
+_SLUG_SEP = re.compile(r"[-_.+/=]+")
+# A lowercase word with an optional short numeric suffix ("client2", "oauth2"), or a version
+# token ("v3", "2024", "4o", "08").
+_SLUG_WORD = re.compile(r"^(?:[a-z]{2,}[0-9]{0,4}[a-z]?|v?[0-9]{1,8}[a-z]?)$")
 # Hash exemption: 7-12 hex or exactly 40 (a git SHA-1). 32-hex values (Datadog, Sentry, npm keys)
 # and 64-hex values are never exempt, and neither are upper-case hex strings.
 _HEX_HASH = re.compile(r"^(?:[0-9a-f]{7,12}|[0-9a-f]{40})$")
 _COMMIT_WORDS = frozenset({"commit", "sha", "rev", "hash"})
-# Path pieces. A lone path segment ("Hqlmx7", "xk9mq") is an ordinary word, a number, or a word plus
-# a 1-2 digit suffix ("plugins2"); mixed letter/digit chunks are accepted only INSIDE a '-'/'_'
-# joined segment, where model ids live ("Qwen3-Coder-30B-A3B-Instruct", "Mixtral-8x7B-v0.1"), so
-# short random chunks joined by '/' never qualify.
-_PATH_NUM = re.compile(r"^(?:[0-9]{8}T[0-9]{6}|[0-9]{1,12})$")        # id, GCP project number, timestamp
-_WORD_NUM = re.compile(r"^[a-z]{3,}[0-9]{1,2}$")                      # "plugins2", "weekly2"
-_JOINED_PIECE = re.compile(
-    r"^(?:[a-z]{1,2}[0-9]{1,4}[a-z]{1,2}[0-9]{1,4}"                   # short git-style id "b400b54"
-    r"|[A-Z][a-z]{2,}[0-9]{0,2}|(?:[A-Z][a-z]{2,}){2,3}"             # "Qwen3", "DeepSeek"
-    r"|V[0-9]{1,2}|[0-9]{1,3}[A-Z]|[A-Z][0-9]{1,2}[A-Z]|[0-9]{1,2}x[0-9]{1,3}[A-Z])$")  # "V3", "70B", "A3B", "8x7B"
-_PATH_ROOT = re.compile(r"^(?:~|\.{1,2})?/")
-_ALNUM_RUN = re.compile(r"[A-Za-z0-9]{12,}")
-
-
-def _is_slug_piece(piece: str) -> bool:
-    if piece.isalpha() and (piece.islower() or piece.isupper() or piece == piece.capitalize()):
-        return True
-    return _SLUG_PIECE.match(piece) is not None
+# There is deliberately NO path / model-id exemption: a value with a '/' is judged like any other
+# (only the lowercase slug above is exempt). Such values ("meta-llama/Llama-3.3-70B-Instruct",
+# "src/plugins2/auth/README.md") are rejected as false positives (see KNOWN_FALSE_POSITIVES in
+# the tests); every path exemption tried was bypassable with random chunks shaped like it.
 
 
 def _is_slug(value: str) -> bool:
     parts = [p for p in _SLUG_SEP.split(value) if p]
-    if len(parts) < 2:
-        return False
-    return all(all(_is_slug_piece(x) for x in p.split(".") if x) for p in parts)
-
-
-def _has_random_run(value: str) -> bool:
-    """A 12+ char alphanumeric run mixing upper case, lower case and digits is key material."""
-    return any(re.search(r"[a-z]", r) and re.search(r"[A-Z]", r) and re.search(r"[0-9]", r)
-               for r in _ALNUM_RUN.findall(value))
-
-
-def _dot_pieces(part: str) -> list:
-    return [x for x in part.split(".") if x]
-
-
-def _is_path_segment(seg: str) -> bool:
-    parts = [p for p in _SLUG_SEP.split(seg) if p]
-    if not parts:
-        return False
-    if len(parts) > 1:
-        return all(_is_slug_piece(x) or _PATH_NUM.match(x) is not None or _JOINED_PIECE.match(x) is not None
-                   for p in parts for x in _dot_pieces(p))
-    return all((x.isalpha() and _is_slug_piece(x)) or _PATH_NUM.match(x) is not None
-               or _WORD_NUM.match(x) is not None or re.match(r"^v?[0-9]{1,8}$", x) is not None
-               for x in _dot_pieces(parts[0]))
-
-
-def _path_pieces_look_random(segs: list) -> bool:
-    """No real word (4+ letters with a vowel) anywhere, or most pieces mixing letters and digits."""
-    pieces = [x for seg in segs for p in _SLUG_SEP.split(seg) for x in _dot_pieces(p)]
-    if not any(x.isalpha() and len(x) >= 4 and re.search(r"[aeiouAEIOU]", x) for x in pieces):
-        return True
-    mixed = [x for x in pieces if re.search(r"[A-Za-z]", x) and re.search(r"[0-9]", x) and not re.match(r"^v?[0-9]+$", x)]
-    return len(mixed) * 2 > len(pieces)
-
-
-def _is_path(value: str) -> bool:
-    """A filesystem path, owner/repo, model id or resource name, not a credential: 2+ '/'-segments
-    (after an optional '/', '~/', './' or '../' root), every one made of ordinary words, ids or
-    sizes, at least one real word, fewer than half the pieces mixing letters and digits, and no
-    12+ char mixed-case-and-digit run anywhere. Rooted values get no special treatment:
-    '~/Xk9mQ2pL7vR4tN8w/B3zH' fails on its first segment like a relative path would.
-    Base64 secrets that merely contain '/' (AWS-style) have mixed-case/digit segments."""
-    if "/" not in value or _has_random_run(value):
-        return False
-    segs = [x for x in _PATH_ROOT.sub("", value).split("/") if x]
-    return (len(segs) >= 2 and all(_is_path_segment(x) for x in segs)
-            and not _path_pieces_look_random(segs))
+    return len(parts) >= 2 and all(_SLUG_WORD.match(p) for p in parts)
 
 
 def _is_commit_hash(value: str, scheme_word: str) -> bool:
@@ -128,7 +65,6 @@ def _keyword_value_is_secret(value: str, scheme_word: str = "") -> bool:
             and re.search(r"[A-Za-z]", value) is not None
             and re.search(r"[0-9]", value) is not None
             and not _is_slug(value)
-            and not _is_path(value)
             and not _is_commit_hash(value, scheme_word))
 
 

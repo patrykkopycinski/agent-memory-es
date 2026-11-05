@@ -112,25 +112,15 @@ MUST_ACCEPT = [
     "commit: 1470bfd8b2fc1",
     "token path: owner/repo/token-file",
     "token: owner/repo/token-file2",
-    "secret: /Users/someone/ames-data/ROLLBACK-b400b54-20261105T091828.txt",
     "auth: commit 1470bfd8b2fc1a2b3c4d5e6f7a8b9c0d1e2f3a4b",
     "credentials: elastic/kibana-evals/weekly2",
     "SERVICE_KEY=deepseek-v3.2-flash",
     "api key: gpt-4o-2024-08-06",
     "model: meta-llama/Llama-3.3-70B-Instruct",
-    "token: Qwen/Qwen3-Coder-30B-A3B-Instruct",
     "token file: src/plugins/auth/README.md",
-    "token: src/plugins2/auth/README.md",             # same path where the keyword rule really fires
-    "secret: projects/123456789/secrets/my-api/versions/3",   # the path is the secret's NAME, not its value
-    "token: ~/src/plugins2/auth/README.md",
-    "token: ./src/plugins2/auth/README.md",
-    "token: ../src/plugins2/auth/README.md",
     "secret: /srv/app2/config/keys.json",
-    "token: mistralai/Mixtral-8x7B-Instruct-v0.1",    # "model:" is not a keyword; use one that fires
-    "token: deepseek-ai/DeepSeek-V3.2-Exp",
     "model: mistralai/Mixtral-8x7B-Instruct-v0.1",
     "model: deepseek-ai/DeepSeek-V3.2-Exp",
-    "token: src/abcdefghij12/README.md",              # 12-char lower+digit run: only 3 classes are key material (M13)
 ]
 
 
@@ -284,6 +274,7 @@ def test_slug_exemption_is_narrow_secret_like_values_are_not_slugs():
     # each is 16+ chars, letters+digits, joined by separators -- and must NOT be treated as a slug
     for v in ("Zx81-QwQw-Ab12-Cd34-Ef56",          # digits inside UPPER/mixed-case parts
               "qwertyuiopasdfgh1234zz",            # single part: a slug needs 2+ parts
+              "qwertyuiopasdfgh1234z",             # single part that matches the word pattern exactly
               "abc12def-ghi34jkl-mno56pqr",        # digit runs in the middle of parts
               "k9k9k9k9-x1x1x1x1-z7z7z7z7",        # repeating letter+digit blocks
               "AbCdEf12-GhIjKl34"):
@@ -340,12 +331,11 @@ MUST_REJECT = [
     "token: owner/repo/k9x2m7q1p4z8",
     "token: owner/repo/k9x2m7q1-p4z8w3n6-owner",
     "secret: ./k9x2m7q1/p4z8w3n6/r5t1y8u2",
-    # a Capitalized word is a path piece, but a 12+ char mixed-case-and-digit run never is
     "token: owner/Abcdefghijkl9/repo",
     # hex chunks joined by '/' are not a path
     "secret: 3f9a8c7b/6d5e4f3a/2b1c0d9e/8f7a6b5c",
     "token: 3f9a8c7b6d5e/4f3a2b1c0d9e",
-    # review round 3: short random chunks joined by '/' are not a path
+    # review rounds 2-3: path / model-id lookalikes built from random chunks (no path exemption)
     "token: Xkqz9/Mzpw7/Wqtr3/Hjkl2/Pvbn8",
     "secret: Qwerty7/Asdfgh3/Zxcvbn9",
     "token: Hqlmx7/Prtvw8/Zbnck3",
@@ -353,16 +343,51 @@ MUST_REJECT = [
     "password: ../ab3cd/ef5gh/ij7kl/mn2op",
     "auth: ./Abc12/Def34/Ghi56/Jkl78.json",
     "token: xk9mq/pl7vr/tn8wb/zh5k2",
-    "token: owner/repo-Qwen3-KxZqPw2/readme",         # M8: a Capitalized piece is not any-case
-    "token: owner/repo-Qwen123456-readme",            # M9: at most 2 digits after a Capitalized word
-    "secret: owner/repo/12345678901234567890",        # M10: a numeric piece is capped at 12 digits
-    "token: owner/readme/abcdef1234",                 # a word takes a 1-2 digit suffix, not 4
-    "token: owner/repo-Abcdefghijkl9-readme",         # a 12+ char upper/lower/digit run, even inside a model-id segment
-    "token: a1b2-c3d4-e5f6/readme",                   # most pieces mix letters and digits
-    "token: abc1/ab/cd/ef/12345678",                  # no real word (4+ letters) anywhere
-    "token: xkqz/mzpw/wqtr/12345678",                 # 4+ letters but no vowel is not a word
-    "token: ab/cd/ef/12345678",                       # 2 letters is not a word
+    "secret: owner/Qwer-Asdf-Zxcv-Tyui_Ghjk+Bnmq=Wert7",
+    "token: models/Xkq-Mzp-Wqt-Hjk-Pvb-Nmr-Tyu-Ghj-Bnm-Wer-8x7B",
+    "token: owner/Hqlm-Prtv-Zbnc_Wqtr+Pvbn=Mzpw-70B",
+    "secret: config/Hqlmxpr/Zbnckwq/Prtvwml/7",
+    "secret: backup/482913374651-938271645382-112233445566",
+    "token: owner/repo/20261105T091828-482913374651",
+    "secret: data/739182736451/827364519283/918273645123/key",
 ]
+
+
+# Accepted before this change and rejected now, on purpose: there is no path / model-id exemption,
+# because every one tried was bypassable by random chunks shaped like it (rounds 2-3), and a 422
+# on a note costs far less than a stored credential. Corpus scan: ~16 hits in 116k paragraphs,
+# nearly all doc placeholders. Add an exemption back only deliberately, with a fuzz table.
+KNOWN_FALSE_POSITIVES = [
+    "token: Qwen/Qwen3-Coder-30B-A3B-Instruct",
+    "token: mistralai/Mixtral-8x7B-Instruct-v0.1",
+    "token: deepseek-ai/DeepSeek-V3.2-Exp",
+    "token: src/plugins2/auth/README.md",
+    "token: ~/src/plugins2/auth/README.md",
+    "secret: projects/123456789/secrets/my-api/versions/3",
+    "secret: /Users/someone/ames-data/ROLLBACK-b400b54-20261105T091828.txt",
+]
+
+
+@pytest.mark.parametrize("text", KNOWN_FALSE_POSITIVES)
+def test_known_false_positives_stay_rejected_until_an_exemption_is_added_deliberately(text):
+    assert secrets_guard.find_secret(text) == "keyword_value", text
+
+
+def test_values_with_a_slash_are_judged_like_any_other_keyword_value():
+    assert not hasattr(secrets_guard, "_is_path") and not hasattr(secrets_guard, "_PATH_PIECE")
+
+
+# b400b54 also accepted these (all-lowercase chunks, so the lowercase slug rule covers them); the
+# change keeps that behaviour exactly rather than tightening it.
+STILL_ACCEPTED_AS_AT_B400B54 = [
+    "token: config/xkqzmpwqhjkl/prtvwmlzbnq/42",
+    "token: owner/repo/token-file2",
+]
+
+
+@pytest.mark.parametrize("text", STILL_ACCEPTED_AS_AT_B400B54)
+def test_lowercase_slug_values_with_slashes_stay_accepted_as_before(text):
+    assert secrets_guard.find_secret(text) is None, text
 
 
 @pytest.mark.parametrize("text", MUST_REJECT)
@@ -404,12 +429,6 @@ def test_every_slug_part_and_dot_piece_must_pass_N10():
     for v in ("deepseek-Xk9mQ2pL7vR4tN8w", "gpt-4o.Xk9mQ2pL7vR4tN8w-flash", "Xk9mQ2pL7vR4tN8w-flash-v3"):
         assert secrets_guard.find_secret("token: " + v) == "keyword_value", v
     assert secrets_guard.find_secret("token: owner/Xk9mQ2pL7vR4tN8w3/repo") == "keyword_value"
-
-
-def test_slash_is_not_a_slug_separator_and_a_lone_segment_is_not_a_path_N11():
-    assert not secrets_guard._is_slug("abcdefghijk1/m")
-    assert not secrets_guard._is_path("abcdefghijklmnop1/")                                   # one segment only
-    assert not secrets_guard._is_path("Xk9mQ2pL7vR4tN8w3zH")                                  # no slash at all
 
 
 def test_scheme_word_group_is_linear_time_N12b():
