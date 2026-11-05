@@ -71,3 +71,49 @@ def test_index_level_404_is_a_charged_failure_not_a_skip(monkeypatch, captured):
     facts.run_once()
     assert captured["args"][2] == "pending" and captured["attempts"] == 2
     assert "skipped" not in captured["error"]
+
+
+INDEX_MISSING = RuntimeError(
+    'ES GET /am_semantic/_doc/k -> 404: {"error":{"root_cause":[{"type":"index_not_found_exception",'
+    '"reason":"no such index [am_semantic]"}],"type":"index_not_found_exception"},"status":404}')
+
+
+def test_missing_semantic_index_is_an_error_not_no_existing_fact(monkeypatch):
+    """process() reads the semantic fact doc to find 'existing'. A missing INDEX must raise (charged
+    failure) and not read as 'no such fact', which would go on to write into a broken store."""
+    source = {"owner_id": "alice", "active": True, "occurred_at": "2024-01-01T00:00:00Z", "doc_group": "src"}
+    writes = []
+
+    def es(method, path, body=None):
+        if "/_doc/src" in path:
+            return {"_source": source}
+        if f"/{facts.idx('semantic')}/_doc/" in path:
+            raise INDEX_MISSING
+        writes.append((method, path))
+        return {}
+    monkeypatch.setattr(facts, "es", es)
+    monkeypatch.setattr(facts, "_passages", lambda *a: [("p", "Alice lives in Paris.")])
+    monkeypatch.setattr(facts, "_document_facts", lambda *a: ["Alice lives in Paris."])
+    with pytest.raises(RuntimeError, match="index_not_found_exception"):
+        facts.process("src", "alice")
+    assert not writes
+
+
+def test_missing_extraction_cache_index_is_an_error_not_a_cache_miss(monkeypatch):
+    monkeypatch.setattr(facts, "es", lambda *a, **k: (_ for _ in ()).throw(INDEX_MISSING))
+    monkeypatch.setattr(facts, "_extract", lambda *a: pytest.fail("extracted (and would cache) into a missing index"))
+    with pytest.raises(RuntimeError, match="index_not_found_exception"):
+        facts._document_facts([("p", "Alice lives in Paris.")], "2024-01-01")
+
+
+def test_missing_backfill_index_is_an_error_not_no_backfill(monkeypatch):
+    """backfill_status() returning None makes /memory/facts/drain report 'drained'."""
+    monkeypatch.setattr(facts, "es", lambda *a, **k: (_ for _ in ()).throw(INDEX_MISSING))
+    with pytest.raises(RuntimeError, match="index_not_found_exception"):
+        facts.backfill_status("alice", "private")
+
+
+def test_missing_backfill_doc_is_still_none(monkeypatch):
+    miss = RuntimeError('ES GET /am_backfills/_doc/k -> 404: {"_index":"am_backfills","_id":"k","found":false}')
+    monkeypatch.setattr(facts, "es", lambda *a, **k: (_ for _ in ()).throw(miss))
+    assert facts.backfill_status("alice", "private") is None

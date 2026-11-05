@@ -74,7 +74,7 @@ def test_abort_before_semantic_create(monkeypatch, setup):
                                 "visibility": "private", "occurred_at": "2024-01-01T00:00:00Z",
                                 "doc_group": "src"}}
         if method == "GET" and path.startswith("/" + semantic + "/_doc/"):
-            raise RuntimeError("-> 404: absent")
+            raise RuntimeError('-> 404: {"_index":"s","_id":"k","found":false}')
         if method == "PUT" and path.startswith("/" + semantic + "/_create/"):
             puts.append(path)
             return {}

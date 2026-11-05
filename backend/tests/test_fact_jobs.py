@@ -88,7 +88,7 @@ def test_document_cache_and_window_extraction():
     def fake_es(method, path, body=None):
         if method == "GET":
             if path not in seen:
-                raise RuntimeError("ES GET -> 404: not found")
+                raise RuntimeError('ES GET -> 404: {"_index":"c","_id":"k","found":false}')
             return {"_source": seen[path]}
         key = path.split("/_create/")[1]
         seen[f"/{facts.CACHE}/_doc/{key}"] = body
@@ -161,7 +161,7 @@ def test_process_retry_uses_cached_facts_and_best_passage():
             return {"_source": source}
         if method == "GET":
             if path not in docs:
-                raise RuntimeError("ES GET -> 404: missing")
+                raise RuntimeError('ES GET -> 404: {"_index":"s","_id":"k","found":false}')
             return {"_source": docs[path]}
         if "/_create/" in path:
             key = path.split("/_create/")[1].split("?")[0]

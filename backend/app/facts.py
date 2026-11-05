@@ -336,7 +336,7 @@ def _document_facts(passages, date):
         try:
             cached = es("GET", f"/{CACHE}/_doc/{key}")["_source"]["facts"]
         except RuntimeError as exc:
-            if "-> 404:" not in str(exc):
+            if not _is_doc_miss(exc):
                 raise
             cached = _extract(window, date)
             try:
@@ -384,7 +384,7 @@ def process(source_id, owner_id, abort=None):
         try:
             existing = es("GET", f"/{idx('semantic')}/_doc/{fact_id}")["_source"]
         except RuntimeError as exc:
-            if "-> 404:" not in str(exc):
+            if not _is_doc_miss(exc):
                 raise
         if existing is not None:
             replacements = existing.get("supersedes", [])
@@ -510,7 +510,7 @@ def backfill_status(owner_id, visibility):
     try:
         doc = es("GET", f"/{BACKFILLS}/_doc/{_backfill_id(owner_id, visibility)}")["_source"]
     except RuntimeError as exc:
-        if "-> 404:" not in str(exc):
+        if not _is_doc_miss(exc):
             raise
         return None
     return {field: doc.get(field) for field in
