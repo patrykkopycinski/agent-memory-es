@@ -114,7 +114,8 @@ def test_similarity_gate_skips_judge():
         assert facts._replacement_ids("alice", "private", [0.1], "Alice moved", "2021-01-01") == []
 
 
-def test_recall_validity_filters_both_retrievers():
+def test_recall_validity_filters_both_retrievers(monkeypatch):
+    monkeypatch.setenv("AMES_FUSION", "es")
     bodies = []
     def search(method, path, body=None):
         bodies.append(body)

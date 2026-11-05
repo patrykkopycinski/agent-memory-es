@@ -726,9 +726,48 @@ def _tag_vocabulary(owner_id: str, kinds: list, keys: list) -> tuple:
     return out, truncated
 
 
+RRF_RANK_WINDOW = 50            # per-arm window, same as the ES rrf retriever's rank_window_size
+
+
 def fusion_mode() -> str:
-    """Which side fuses BM25 + kNN: Elasticsearch `retriever.rrf` (needs a paid license)."""
-    return "es_rrf"
+    """Where BM25 + kNN are fused. `app` (default): two plain searches fused in Python, which
+    works on any license (retriever.rrf is paid-tier and 403s once the trial lapses).
+    `es`: the single retriever.rrf search. Read per call so it can be flipped without a restart."""
+    return "es_rrf" if os.environ.get("AMES_FUSION", "app").strip().lower() == "es" else "app_rrf"
+
+
+def rrf_fuse(ranked_lists: list, rank_constant: int = RANK_CONSTANT,
+             window: int = RRF_RANK_WINDOW) -> list:
+    """Reciprocal rank fusion with ES `retriever.rrf` semantics: each input is a best-first list
+    of ids; only its top `window` entries count; a doc scores sum(1 / (rank_constant + rank))
+    over the lists it appears in, rank being 1-based. Returns [(id, score)] best-first. Ties
+    break on the best rank in any list, then on the earlier list, then id (deterministic)."""
+    score, best, first_list = {}, {}, {}
+    for li, ids in enumerate(ranked_lists):
+        for rank, doc_id in enumerate(ids[:window], start=1):
+            score[doc_id] = score.get(doc_id, 0.0) + 1.0 / (rank_constant + rank)
+            if rank < best.get(doc_id, window + 1):
+                best[doc_id] = rank
+            first_list.setdefault(doc_id, li)
+    order = sorted(score, key=lambda d: (-score[d], best[d], first_list[d], d))
+    return [(d, score[d]) for d in order]
+
+
+def _hybrid_app_fusion(kind: str, lexical_query: dict, knn: dict, fetch: int) -> tuple:
+    """BM25 search + kNN search (identical filters), fused here with RRF instead of by
+    `retriever.rrf`. Returns (hits, es_took) shaped like an ES hit list whose `_score` is the
+    RRF score, best-first, at most `fetch` long."""
+    no_vec = {"excludes": ["embedding"]}
+    lex = es("POST", f"/{idx(kind)}/_search",
+             {"size": RRF_RANK_WINDOW, "query": lexical_query, "_source": no_vec})
+    vec = es("POST", f"/{idx(kind)}/_search", {"size": fetch, "knn": knn, "_source": no_vec})
+    by_id = {}
+    for h in vec["hits"]["hits"] + lex["hits"]["hits"]:   # lexical wins on _source: identical docs
+        by_id[h["_id"]] = h
+    fused = rrf_fuse([[h["_id"] for h in lex["hits"]["hits"]],
+                      [h["_id"] for h in vec["hits"]["hits"]]])
+    hits = [{**by_id[d], "_score": sc} for d, sc in fused[:fetch]]
+    return hits, (lex.get("took") or 0) + (vec.get("took") or 0)
 
 
 def _ms(t0: float) -> float:
@@ -842,45 +881,43 @@ def recall(owner_id: str, query: str, kinds=None, size: int = 8,
                           {"range": {"valid_from": {"lte": instant}}}], "minimum_should_match": 1}},
                         {"bool": {"should": [{"bool": {"must_not": {"exists": {"field": "valid_to"}}}},
                           {"range": {"valid_to": {"gt": instant}}}], "minimum_should_match": 1}}]
+        base_filter = [{"term": {"active": True}}, _visibility_filter(owner_id)] + flt_extra + validity
+        lexical_query = {"bool": {"must": must, "filter": base_filter,
+                                  **({"must_not": flt_not} if flt_not else {})}}
         if qvec is not None:
+            knn = {"field": "embedding", "query_vector": qvec, "num_candidates": max(100, fetch * 2), "k": fetch,
+                   **({"similarity": sim_floor} if sim_floor is not None else {}),
+                   "filter": {"bool": {"filter": base_filter, "must_not": flt_not}} if flt_not else base_filter}
+        if qvec is not None and fusion_mode() == "es_rrf":
             body = {
                 "size": fetch,
                 "retriever": {"rrf": {
-                    "retrievers": [
-                        {"standard": {"query": {"bool": {
-                            "must": must,
-                            "filter": [{"term": {"active": True}}, _visibility_filter(owner_id)] + flt_extra + validity,
-                            **({"must_not": flt_not} if flt_not else {}),
-                        }}}},
-                        {"knn": {"field": "embedding", "query_vector": qvec, "num_candidates": max(100, fetch * 2), "k": fetch,
-                                 **({"similarity": sim_floor} if sim_floor is not None else {}),
-                                 "filter": {"bool": {"filter": [{"term": {"active": True}}, _visibility_filter(owner_id)] + flt_extra + validity,
-                                                     "must_not": flt_not}} if flt_not else
-                                           [{"term": {"active": True}}, _visibility_filter(owner_id)] + flt_extra + validity}},
-                    ],
-                    "rank_constant": 60,
-                    "rank_window_size": 50,
+                    "retrievers": [{"standard": {"query": lexical_query}}, {"knn": knn}],
+                    "rank_constant": RANK_CONSTANT,
+                    "rank_window_size": RRF_RANK_WINDOW,
                 }},
             }
+        elif qvec is not None:
+            body = None   # app-side fusion: two searches below
         else:
             body = {
                 "size": fetch,
-                "query": {"bool": {
-                    "must": must,
-                    "filter": [{"term": {"active": True}}, _visibility_filter(owner_id)] + flt_extra + validity,
-                    **({"must_not": flt_not} if flt_not else {}),
-                }},
+                "query": lexical_query,
                 "sort": [{"_score": {"order": "desc"}}, {"occurred_at": {"order": "desc"}}],
             }
         t_search = time.perf_counter()
-        r = es("POST", f"/{idx(kind)}/_search", body)
+        if body is None:
+            raw, took = _hybrid_app_fusion(kind, lexical_query, knn, fetch)
+        else:
+            r = es("POST", f"/{idx(kind)}/_search", body)
+            raw, took = r["hits"]["hits"], r.get("took") or 0
         search_by_kind[kind] = _ms(t_search)
-        es_took += r.get("took") or 0
+        es_took += took
         results[kind] = [
             {"id": h["_id"], "kind": kind, "score": h["_score"],
              **{k: v for k, v in h["_source"].items()
                 if k not in ("kind", "embedding")}}
-            for h in r["hits"]["hits"]
+            for h in raw
         ]
     timings["search"] = round(sum(search_by_kind.values()), 3)
     timings["by_kind"] = search_by_kind

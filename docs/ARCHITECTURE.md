@@ -34,7 +34,7 @@ Every document carries the same envelope (`store.py` MAPPINGS):
 | `POST /memory/reflect` | LLM answer over recalled evidence, with citations (`llm.py`) |
 | `POST /mcp/tools/{tool}` | thin MCP adapter over the same ops |
 | `POST /admin/keys` | mint API key (X-Admin-Token) |
-| `GET /health` | liveness |
+| `GET /health` | liveness + embed/fusion truth: `embed_ok` (live probe, cached 60 s), `fusion`, `license_status`, `docs_without_vector_24h`; **503** when the embed probe fails |
 
 ## Tenancy & isolation
 
@@ -59,6 +59,8 @@ Background loop (default every 600 s, `AMES_CONSOLIDATE_INTERVAL`): for every kn
 ## Deployment (`backend/docker-compose.yml`)
 
 `ames-backend` (uvicorn :8123) + `ames-worker` + a Elasticsearch instance; `AMES_ADMIN_TOKEN` required. Env knobs: `AMES_ES_URL`, `AMES_EMBED_BACKEND`, `AMES_LLM_BASE` (OpenAI-compatible endpoint for reflect).
+
+Embedding/fusion knobs: `AMES_EMBED_BACKEND` also accepts `local` (in-process multilingual-e5-small via onnxruntime, license-independent; model baked at `AMES_LOCAL_MODEL_DIR`). `AMES_FUSION` is `app` (default: BM25 + kNN fused in Python, RRF k=60, window 50) or `es` (`retriever.rrf`, needs a paid/trial license).
 
 ## Hermes integration
 

@@ -1,7 +1,9 @@
 """Embeddings: ES-native inference first (`_inference/text_embedding`), OmniRoute fallback.
 
 Default endpoint .multilingual-e5-small-elasticsearch (384-dim, cluster-side, no external
-gateway). AMES_EMBED_BACKEND=es|omniroute pins one. Dims differ per backend — indices must
+gateway). AMES_EMBED_BACKEND=es|omniroute|local pins one. `local` runs intfloat/multilingual-e5-small
+in-process (onnxruntime + tokenizers, no `_inference`, so it works off-license) and produces the
+same vectors as the ES-hosted `.multilingual-e5-small-elasticsearch` endpoint. Dims differ per backend — indices must
 be rebuilt when switching backends.
 """
 import json
@@ -41,12 +43,96 @@ def _or_embed(texts):
     return [d["embedding"] for d in out["data"]]
 
 
+# ---- local backend: multilingual-e5-small, ONNX, loaded once per process ----------------------
+# Recipe verified against ES `_inference` output (cosine 1.0000): NO "query:"/"passage:" prefix,
+# mean pooling over the attention mask, L2 normalise, 384 dims, max 512 tokens.
+LOCAL_MODEL_DIR = os.environ.get("AMES_LOCAL_MODEL_DIR", "/opt/models/multilingual-e5-small")
+LOCAL_MODEL_REPO = os.environ.get("AMES_LOCAL_MODEL_REPO", "intfloat/multilingual-e5-small")
+# Pinned HF revision of intfloat/multilingual-e5-small: the weights are the model identity, so a
+# floating `main` could silently change every stored vector's geometry.
+LOCAL_MODEL_REVISION = os.environ.get("AMES_LOCAL_MODEL_REVISION", "614241f622f53c4eeff9890bdc4f31cfecc418b3")
+MODEL_FILES = ("onnx/model.onnx", "tokenizer.json")
+LOCAL_MAX_TOKENS = 512
+LOCAL_BATCH = 16
+_local = None
+_local_lock = threading.Lock()
+
+
+def fetch_model(dest: str, repo: str = None, revision: str = None) -> tuple:
+    """Return (onnx_path, tokenizer_path) under `dest`, downloading any missing file from the HF
+    hub at a pinned revision (stdlib only). The Docker image bakes `dest` at build time so prod
+    never needs the network; tests and dev checkouts fetch once into a cache dir."""
+    repo, revision = repo or LOCAL_MODEL_REPO, revision or LOCAL_MODEL_REVISION
+    paths = []
+    for rel in MODEL_FILES:
+        path = os.path.join(dest, rel)
+        if not os.path.exists(path):
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            url = f"https://huggingface.co/{repo}/resolve/{revision}/{rel}"
+            tmp = path + ".part"
+            with urllib.request.urlopen(url, timeout=300) as resp, open(tmp, "wb") as fh:
+                while chunk := resp.read(1 << 20):
+                    fh.write(chunk)
+            os.replace(tmp, path)
+        paths.append(path)
+    return tuple(paths)
+
+
+def load_local(model_dir=None, repo=None, revision=None) -> tuple:
+    """Build an (onnxruntime session, tokenizer) pair. Not cached: see _local_model()."""
+    import onnxruntime as ort
+    from tokenizers import Tokenizer
+    onnx, tok_path = fetch_model(model_dir or LOCAL_MODEL_DIR, repo, revision)
+    opts = ort.SessionOptions()
+    opts.log_severity_level = 3
+    session = ort.InferenceSession(onnx, sess_options=opts, providers=["CPUExecutionProvider"])
+    tok = Tokenizer.from_file(tok_path)
+    tok.enable_truncation(max_length=LOCAL_MAX_TOKENS)
+    tok.enable_padding()   # pad to the longest in the batch (pad id/token come from tokenizer.json)
+    return session, tok
+
+
+def _local_model():
+    global _local
+    if _local is None:
+        with _local_lock:
+            if _local is None:
+                _local = load_local()
+    return _local
+
+
+def local_embed_with(session, tok, texts: list) -> list:
+    """Embed `texts` with an already-loaded (session, tokenizer). Model-agnostic pooling so the
+    parity test can run a wrong model through the same code path as a negative control."""
+    import numpy as np
+    wanted = {i.name for i in session.get_inputs()}
+    out = []
+    for start in range(0, len(texts), LOCAL_BATCH):
+        enc = tok.encode_batch(texts[start:start + LOCAL_BATCH])
+        ids = np.array([e.ids for e in enc], dtype=np.int64)
+        mask = np.array([e.attention_mask for e in enc], dtype=np.int64)
+        feeds = {"input_ids": ids, "attention_mask": mask}
+        if "token_type_ids" in wanted:
+            feeds["token_type_ids"] = np.zeros_like(ids)
+        hidden = session.run(None, {k: v for k, v in feeds.items() if k in wanted})[0]
+        m = mask[:, :, None].astype(hidden.dtype)
+        pooled = (hidden * m).sum(axis=1) / np.clip(m.sum(axis=1), 1e-9, None)
+        pooled /= np.clip(np.linalg.norm(pooled, axis=1, keepdims=True), 1e-12, None)
+        out.extend(pooled.astype(float).tolist())
+    return out
+
+
+def _local_embed(texts):
+    session, tok = _local_model()
+    return local_embed_with(session, tok, texts)
+
+
 def backend() -> str:
     global _backend
     if _backend:
         return _backend
     pinned = os.environ.get("AMES_EMBED_BACKEND", "")
-    if pinned in ("es", "omniroute"):
+    if pinned in ("es", "omniroute", "local"):
         _backend = pinned
     else:
         try:
@@ -58,7 +144,10 @@ def backend() -> str:
 
 
 def embed(texts: list) -> list:
-    return _es_embed(texts) if backend() == "es" else _or_embed(texts)
+    b = backend()
+    if b == "local":
+        return _local_embed(texts)
+    return _es_embed(texts) if b == "es" else _or_embed(texts)
 
 
 # Process-wide embed failure counter. embed() failures on the retain/recall hot path used to be

@@ -317,6 +317,7 @@ def _capture(monkeypatch):
 
 
 def test_recall_without_a_filter_sends_the_exact_pre_change_es_bodies(monkeypatch):
+    monkeypatch.setenv("AMES_FUSION", "es")   # the pre-change body is the retriever.rrf one
     _corpus()
     bodies = _capture(monkeypatch)
     memory.recall(OWNER, "pears", size=8)

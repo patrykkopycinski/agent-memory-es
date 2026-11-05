@@ -66,6 +66,7 @@ class _Capture:
 
 def _knn_bodies(monkeypatch, **kw):
     cap = _Capture()
+    monkeypatch.setenv("AMES_FUSION", "es")   # these assert the retriever.rrf body shape
     monkeypatch.setattr(memory.embeddings, "embed", lambda texts: [[0.1] * 384 for _ in texts])
     monkeypatch.setattr(memory, "es", cap)
     memory.recall(OWNER, QUERY, kinds=["semantic"], size=3, rerank=False, **kw)
