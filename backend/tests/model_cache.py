@@ -1,7 +1,9 @@
 """Test-side access to the local embedding models. The app never downloads at runtime; tests that
 need a model call model_or_skip(), which (1) accepts a cache dir whose files match pinned sha256s
 (writing the REVISION marker), (2) fetches only when AMES_LOCAL_MODEL_ALLOW_FETCH=1, and
-(3) otherwise skips the test with the reason."""
+(3) otherwise skips the test with the reason. With AMES_REQUIRE_MODEL=1 (set by CI runners that
+have the cache) a missing model or runtime is a FAILURE, so the parity tests cannot go quietly
+green by skipping."""
 import hashlib
 import os
 
@@ -33,15 +35,31 @@ def _files_match(dest, pins):
         os.path.isfile(os.path.join(dest, rel)) for rel in embeddings.MODEL_FILES)
 
 
+def require_model() -> bool:
+    return os.environ.get("AMES_REQUIRE_MODEL", "") == "1"
+
+
+def _unavailable(reason):
+    if require_model():
+        pytest.fail(f"AMES_REQUIRE_MODEL=1 but {reason}", pytrace=False)
+    pytest.skip(reason)
+
+
 def model_or_skip(spec):
-    """Return (session, tokenizer) for `spec`, or skip the calling test cleanly."""
-    pytest.importorskip("onnxruntime")
-    pytest.importorskip("tokenizers")
+    """Return (session, tokenizer) for `spec`, or skip (fail under AMES_REQUIRE_MODEL=1)."""
+    for module in ("onnxruntime", "tokenizers"):
+        if require_model():
+            try:
+                __import__(module)
+            except ImportError:
+                _unavailable(f"{module} is not installed")
+        else:
+            pytest.importorskip(module)
     dest = os.path.join(CACHE, spec["name"])
     if embeddings.model_problem(dest, spec["revision"]):
         if _files_match(dest, spec["sha256"]):
             with open(os.path.join(dest, embeddings.REVISION_FILE), "w") as fh:
                 fh.write(spec["revision"] + "\n")
         elif not embeddings.fetch_allowed():
-            pytest.skip(f"{spec['name']} not in {CACHE}; set AMES_LOCAL_MODEL_ALLOW_FETCH=1 to download")
+            _unavailable(f"{spec['name']} not in {CACHE}; set AMES_LOCAL_MODEL_ALLOW_FETCH=1 to download")
     return embeddings.load_local(dest, repo=spec["repo"], revision=spec["revision"])

@@ -97,5 +97,6 @@ def test_committed_fixture_covers_long_inputs():
         items = json.load(fh)["items"]
     long_items = sum(1 for n in _token_counts([i["text"] for i in items]) if n > 512)
     if long_items < 2:
-        pytest.skip("fixture has no >512-token items yet: run scripts/capture_e5_parity.py against "
-                    "the reference ES and commit the output")
+        from model_cache import _unavailable
+        _unavailable("fixture has no >512-token items yet: run scripts/capture_e5_parity.py against "
+                     "the reference ES and commit the output")
