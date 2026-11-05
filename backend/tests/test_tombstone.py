@@ -264,12 +264,52 @@ def test_ensure_index_adds_reason_keyword_to_legacy_index(monkeypatch, restore_i
     assert _reason_fields()["keyword"]["type"] == "keyword"
 
 
+def _reason_buckets(owner):
+    return es("POST", f"/{PREFIX}am_rejected/_search", {
+        "size": 0, "query": {"term": {"owner_id": owner}},
+        "aggs": {"r": {"terms": {"field": "reason.keyword"}}}})["aggregations"]["r"]["buckets"]
+
+
 def test_reason_terms_agg_covers_docs_written_after_upgrade(monkeypatch, restore_index):
     o = "tomb-agg-owner"
     _recreate_index(monkeypatch, _OLD_MAPPING)
+    # Written on the OLD mapping, before the upgrade: the sub-field is not backfilled
+    # (documented limitation; no reindex), so this doc must NOT show up in the buckets.
+    tombstone.reject(o, "the moon is cheese today", "pre-upgrade reason")
     tombstone._ensure_index()
     tombstone.reject(o, "the sky is green today", "factually wrong claim")
-    buckets = es("POST", f"/{PREFIX}am_rejected/_search", {
-        "size": 0, "query": {"term": {"owner_id": o}},
-        "aggs": {"r": {"terms": {"field": "reason.keyword"}}}})["aggregations"]["r"]["buckets"]
-    assert [(b["key"], b["doc_count"]) for b in buckets] == [("factually wrong claim", 1)]
+    assert [(b["key"], b["doc_count"]) for b in _reason_buckets(o)] == [("factually wrong claim", 1)]
+
+
+def test_failed_mapping_upgrade_does_not_break_writes_or_retry(monkeypatch, restore_index):
+    o = "tomb-noperm-owner"
+    _recreate_index(monkeypatch, _OLD_MAPPING)
+    orig = tombstone.es
+    puts = []
+
+    def no_manage(method, path, body=None):
+        if method == "PUT" and path.endswith("/_mapping"):
+            puts.append(path)
+            raise RuntimeError("ES PUT %s -> 403: security_exception" % path)
+        return orig(method, path, body)
+
+    monkeypatch.setattr(tombstone, "es", no_manage)
+    assert tombstone.reject(o, "the sky is green today", "wrong") is not None
+    assert tombstone.is_rejected(o, "the sky is green today") is not None
+    assert tombstone.is_rejected(o, "is_rejected called again") is None
+    assert tombstone._index_ready is True
+    assert len(puts) == 1, "a failed upgrade must not be retried on every call"
+
+
+def test_non_404_get_error_neither_creates_nor_marks_ready(monkeypatch):
+    monkeypatch.setattr(tombstone, "_index_ready", False)
+    calls = []
+
+    def flaky(method, path, body=None):
+        calls.append(method)
+        raise RuntimeError("ES GET %s -> 503: cluster_block_exception" % path)
+
+    monkeypatch.setattr(tombstone, "es", flaky)
+    tombstone._ensure_index()
+    assert calls == ["GET"], "no PUT (create or mapping) after a non-404 GET failure"
+    assert tombstone._index_ready is False, "must re-check next call, not claim the upgrade happened"

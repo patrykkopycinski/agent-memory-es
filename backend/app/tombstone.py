@@ -32,14 +32,24 @@ _index_ready = False
 REASON_KEYWORD = {"keyword": {"type": "keyword", "ignore_above": 512}}
 
 
+def _is_missing_index(exc: RuntimeError) -> bool:
+    msg = str(exc)
+    return "-> 404" in msg or "index_not_found_exception" in msg
+
+
 def _ensure_index():
     global _index_ready
     if _index_ready:
         return
+    existing = None
     try:
         existing = es("GET", f"/{PREFIX}am_rejected")
-    except RuntimeError:
-        existing = None
+    except RuntimeError as e:
+        if not _is_missing_index(e):
+            # Not "missing" (ES down, 403, ...): don't create over it and don't claim the
+            # upgrade happened. _index_ready stays False so the next call re-checks.
+            _log.warning("am_rejected GET failed (%s); skipping reason.keyword upgrade", e)
+            return
     if existing is not None:
         # Index predates reason.keyword: add the multi-field. ES allows adding a
         # multi-field to an existing text field, but it only indexes docs written
@@ -47,8 +57,13 @@ def _ensure_index():
         mappings = next(iter(existing.values()), {}).get("mappings", {})
         reason = mappings.get("properties", {}).get("reason", {})
         if "keyword" not in reason.get("fields", {}):
-            es("PUT", f"/{PREFIX}am_rejected/_mapping",
-               {"properties": {"reason": {"type": "text", "fields": REASON_KEYWORD}}})
+            try:
+                es("PUT", f"/{PREFIX}am_rejected/_mapping",
+                   {"properties": {"reason": {"type": "text", "fields": REASON_KEYWORD}}})
+            except RuntimeError as e:
+                # Best-effort (as store.ensure_indices): a key without manage privileges must not
+                # break every semantic write, and _index_ready below stops per-call retries.
+                _log.warning("am_rejected reason.keyword mapping upgrade failed: %s", e)
     else:
         try:
             es("PUT", f"/{PREFIX}am_rejected", {
