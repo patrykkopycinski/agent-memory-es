@@ -11,7 +11,7 @@ import threading
 
 from . import embeddings, llm
 from . import http_retry
-from .store import es, idx, PREFIX
+from .store import es, idx, PREFIX, knn_num_candidates
 
 log = logging.getLogger(__name__)
 QUEUE = f"{PREFIX}am_fact_jobs"
@@ -269,7 +269,7 @@ def _replacement_ids(owner, visibility, vector, text, date):
     if vector is None:
         return []
     response = es("POST", f"/{idx('semantic')}/_search", {"size": 5,
-        "knn": {"field": "embedding", "query_vector": vector, "k": 5, "num_candidates": 50,
+        "knn": {"field": "embedding", "query_vector": vector, "k": 5, "num_candidates": knn_num_candidates(5),
                 "filter": [{"term": {"owner_id": owner}}, {"term": {"visibility": visibility}},
                            {"term": {"active": True}}, {"exists": {"field": "source_id"}}]}})
     candidates = [h for h in response["hits"]["hits"] if not h["_source"].get("valid_to")]

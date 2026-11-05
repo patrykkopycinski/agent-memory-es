@@ -162,3 +162,19 @@ def idx(kind: str) -> str:
     if kind not in KINDS:
         raise ValueError(f"unknown kind {kind}")
     return f"{PREFIX}am_{kind}"
+
+
+ES_MAX_NUM_CANDIDATES = 10000   # hard Elasticsearch limit on knn.num_candidates
+
+
+def knn_num_candidates(k: int) -> int:
+    """HNSW candidates examined per kNN search. With a filter (active + visibility + tags) on a
+    bbq_hnsw index, a small value silently misses true top hits: a prod probe lost the two exact
+    top-ranked docs at 100 and found them at 200-500. AMES_KNN_NUM_CANDIDATES overrides; the
+    default is max(500, 10*k). Read per call; always >= k and capped at the ES maximum."""
+    raw = os.environ.get("AMES_KNN_NUM_CANDIDATES", "").strip()
+    try:
+        n = int(raw) if raw else max(500, k * 10)
+    except ValueError:
+        n = max(500, k * 10)
+    return max(k, min(n, ES_MAX_NUM_CANDIDATES))

@@ -11,7 +11,7 @@ import urllib.parse
 import uuid
 from typing import Any, Optional
 
-from .store import KINDS, es, idx, ensure_indices, ensure_indices_once
+from .store import KINDS, es, idx, ensure_indices, ensure_indices_once, knn_num_candidates
 from . import embeddings
 from . import tagfilter as _tf
 from . import tombstone
@@ -362,7 +362,7 @@ def _nearest_dup(owner_id: str, kind: str, visibility: str, vec):
     r = es("POST", f"/{idx(kind)}/_search", {
         "size": 1,
         "knn": {"field": "embedding", "query_vector": vec, "k": 1,
-                "num_candidates": 50,
+                "num_candidates": knn_num_candidates(1),
                 "filter": _scope_filter(owner_id, kind, visibility)["bool"]["filter"]},
     })
     hits = r["hits"]["hits"]
@@ -885,7 +885,7 @@ def recall(owner_id: str, query: str, kinds=None, size: int = 8,
         lexical_query = {"bool": {"must": must, "filter": base_filter,
                                   **({"must_not": flt_not} if flt_not else {})}}
         if qvec is not None:
-            knn = {"field": "embedding", "query_vector": qvec, "num_candidates": max(100, fetch * 2), "k": fetch,
+            knn = {"field": "embedding", "query_vector": qvec, "num_candidates": knn_num_candidates(fetch), "k": fetch,
                    **({"similarity": sim_floor} if sim_floor is not None else {}),
                    "filter": {"bool": {"filter": base_filter, "must_not": flt_not}} if flt_not else base_filter}
         if qvec is not None and fusion_mode() == "es_rrf":
