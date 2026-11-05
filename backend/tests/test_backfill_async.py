@@ -21,7 +21,7 @@ class FakeES:
         if f"/{facts.BACKFILLS}/_doc/" in path:
             key = path.rsplit("/", 1)[-1]
             if key not in self.docs:
-                raise RuntimeError("-> 404: missing")
+                raise RuntimeError('-> 404: {"_index":"b","_id":"k","found":false}')
             return {"_source": copy.deepcopy(self.docs[key]), "_seq_no": self.docs[key].get("_seq", 0), "_primary_term": 1}
         if f"/{facts.BACKFILLS}/_update/" in path:
             key = path.split("/_update/")[1].split("?")[0]
