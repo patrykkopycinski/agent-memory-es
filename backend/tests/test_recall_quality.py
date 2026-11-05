@@ -118,18 +118,35 @@ def test_recency_boost_orders_recent_first(monkeypatch):
     # the recency arm only orders the FUSED list; the (default-on) cross-encoder rerank replaces
     # that order by relevance, so this contract is tested on the fused path (rerank=False).
     boosted = memory.recall(OWNER, "shard rebalance targets", size=8, rerank=False)["results"]
-    recent_first = next(h for h in boosted if h["text"] == new)
-    old_second = next(h for h in boosted if h["text"] == old)
-    assert boosted.index(recent_first) < boosted.index(old_second), [h["text"] for h in boosted]
-
     monkeypatch.setattr(memory, "RECENCY_WEIGHT", 0.0)
-    # With the weight at 0 the recency arm must contribute nothing. Asserting a relative order
-    # of the two docs here was flaky: their lexical/kNN RRF scores are near-tied, so which one
-    # leads depends on embedding/rerank tie-breaks, not on recency.
     flat = memory.recall(OWNER, "shard rebalance targets", size=8, rerank=False)["results"]
-    pair = [h for h in flat if h["text"] in (old, new)]
-    assert len(pair) == 2, [h["text"] for h in flat]
-    assert all(h["recency"] == 0.0 and h["score"] == h["rrf"] for h in pair), pair
+
+    # The two docs' RRF scores nearly tie, so list ORDER can follow a tie-break. Assert the score
+    # arithmetic instead: the weight-5 vs weight-0 score gap between the docs is exactly the
+    # recency gap, and that gap favours the recent doc.
+    b = {h["text"]: h for h in boosted}
+    f = {h["text"]: h for h in flat}
+    assert old in b and new in b and old in f and new in f, [h["text"] for h in boosted]
+    assert f[new]["recency"] == 0.0 and f[old]["recency"] == 0.0
+    assert b[new]["recency"] > b[old]["recency"] >= 0.0
+    d_boost = b[new]["score"] - b[old]["score"]
+    d_flat = f[new]["score"] - f[old]["score"]
+    assert abs((d_boost - d_flat) - (b[new]["recency"] - b[old]["recency"])) < 1e-9
+    assert d_boost > 0, (d_boost, d_flat)
+
+
+def test_recency_boost_unit_fixed_timestamps(monkeypatch):
+    now = dt.datetime(2026, 11, 1, tzinfo=dt.timezone.utc)
+    monkeypatch.setattr(memory, "RECENCY_WEIGHT", 5.0)
+    top = 5.0 / (memory.RANK_CONSTANT + 1)
+    assert abs(memory._recency_boost("2026-11-01T00:00:00Z", now) - top) < 1e-12   # age 0 -> full weight
+    half = memory._recency_boost("2026-10-02T00:00:00Z", now)                      # 30 d = half-life
+    assert abs(half - top * 0.5) < 1e-9
+    assert memory._recency_boost("2024-01-01T00:00:00Z", now) < 1e-6               # ~2 y old -> ~0
+    assert memory._recency_boost(None, now) == 0.0                                 # missing -> 0
+    assert memory._recency_boost("2027-01-01T00:00:00Z", now) == top               # future clamps to age 0
+    monkeypatch.setattr(memory, "RECENCY_WEIGHT", 0.0)
+    assert memory._recency_boost("2026-11-01T00:00:00Z", now) == 0.0
 
 
 # ----------------------------------------------------------------- min_score
