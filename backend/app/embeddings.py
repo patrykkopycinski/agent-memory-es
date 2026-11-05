@@ -248,7 +248,9 @@ def _ensure_background_load() -> None:
         if _load_failure is not None:
             exc, at = _load_failure
             if time.monotonic() - at < LOAD_RETRY_S:
-                raise exc
+                # a fresh exception per probe: re-raising the stored one appends a frame to its
+                # __traceback__ on every call
+                raise ModelUnavailable(f"local model load failed: {describe_error(exc)}") from exc
             _load_failure = None
         _loader = threading.Thread(target=_background_load, daemon=True, name="embed-probe-load")
         _loader.start()

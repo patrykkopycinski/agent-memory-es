@@ -411,3 +411,52 @@ def test_probe_reports_a_failed_background_load_instead_of_loading_forever(monke
         time.sleep(0.05)
     body = client.get("/health").json()
     assert "ModelUnavailable" in body["embed_error"] and "/nowhere" in body["embed_error"]
+
+
+def test_failed_background_load_is_retried_after_the_retry_window(monkeypatch):
+    """error reported -> (window passes) -> 'loading' while the second load runs -> embed_ok."""
+    import threading
+    import time
+    gate, loaded_in = threading.Event(), []
+    _fake_local(monkeypatch, gate, loaded_in)
+    attempts = []
+
+    def flaky(*a, **kw):
+        attempts.append(1)
+        if len(attempts) == 1:
+            raise embeddings.ModelUnavailable("model files missing at /nowhere")
+        gate.wait(10)
+        return ("session", "tokenizer")
+    monkeypatch.setattr(embeddings, "load_local", flaky)
+    def health():
+        main._health_reset()                  # the 60 s health cache would hide the transitions
+        return client.get("/health").json()
+    try:
+        assert health()["embed_error"] == "loading"                            # first load starts, fails
+        for _ in range(100):
+            if embeddings._load_failure is not None:
+                break
+            time.sleep(0.05)
+        assert "/nowhere" in health()["embed_error"]      # 1: the error is reported
+        exc, at = embeddings._load_failure
+        before = len(exc.__traceback__ and list(_frames(exc.__traceback__)) or [])
+        for _ in range(5):
+            health()
+        assert len(list(_frames(exc.__traceback__))) == before, "stored exception's traceback grew per probe"
+        monkeypatch.setattr(embeddings, "_load_failure", (exc, at - 31))      # the 30 s window has passed
+        assert health()["embed_error"] == "loading"                            # 2: the retry is running
+        assert health()["embed_error"] == "loading"
+    finally:
+        gate.set()
+    for _ in range(100):
+        if embeddings._local is not None:
+            break
+        time.sleep(0.05)
+    assert len(attempts) == 2
+    assert health()["embed_ok"] is True                   # 3: recovered
+
+
+def _frames(tb):
+    while tb is not None:
+        yield tb
+        tb = tb.tb_next
