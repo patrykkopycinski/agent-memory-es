@@ -1231,8 +1231,9 @@ def promote(owner_id: str, kind: str, doc_id: str, to_visibility: str) -> dict:
     """Copy-on-promote: private -> team/common creates a promoted copy; original stays private."""
     if to_visibility not in ("team", "common"):
         raise ValueError("promotion target must be team or common")
-    src = es("GET", f"/{idx(kind)}/_doc/{_q(doc_id)}")
-    s = src["_source"]
+    if kind not in KINDS:
+        raise ValueError(f"kind must be one of {KINDS}")
+    s = _get_source(kind, doc_id)       # LookupError -> 404 at the edge, not a bare ES 404 -> 500
     if s["owner_id"] != owner_id:
         raise PermissionError("only the creator can promote their memory")
     if s["visibility"] != "private":

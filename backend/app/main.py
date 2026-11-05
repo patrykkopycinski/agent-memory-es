@@ -246,6 +246,8 @@ def exists(body: ExistsIn, who: dict = Depends(caller)):
 def promote(body: PromoteIn, who: dict = Depends(caller)):
     try:
         return memory.promote(who["owner_id"], body.kind, body.doc_id, body.to_visibility)
+    except LookupError as e:
+        raise HTTPException(404, str(e))
     except (ValueError, PermissionError) as e:
         raise HTTPException(422 if isinstance(e, ValueError) else 403, str(e))
 

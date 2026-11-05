@@ -10,11 +10,14 @@ from typing import Optional
 # key-ish word, separator, optional scheme word, 8+ char value (redact.ts KEYWORD_RE).
 # Deliberately stricter than redact.ts, which only masks: a 422 on prose like "auth migration"
 # or "token estimator" would reject ordinary facts. Here the separator must contain ':' or '=',
-# the value must be 16+ chars mixing letters and digits, and it must not be a lowercase slug
-# (model ids, version strings, flow names such as "gpt-4o-2024-08-06" or "deepseek-v3.2-flash").
+# and the value must pass _keyword_value_is_secret (16+ chars, letters and digits, not a slug,
+# path, version or commit hash).
+# Keywords: `api key` with a space or `_`/`-`, and any `<name>_KEY` / `<name>-key` suffix form
+# (SERVICE_KEY=...). The suffix alternative is one alnum char plus `_key`: no nested quantifier,
+# so it cannot backtrack. The other quantifiers are on single character classes.
 KEYWORD_RE = re.compile(
-    r"(api[_-]?key|token|secret|password|passwd|authorization|credentials?|auth)"
-    r"([\"'\s]*[:=][\"'\s:=]*)([A-Za-z]+\s+)?([A-Za-z0-9_\-/.+=]{8,})", re.IGNORECASE)
+    r"(api[_\- ]?key|[A-Za-z0-9][_-]key|token|secret|password|passwd|authorization|credentials?|auth)"
+    r"([\"'\s]*[:=][\"'\s:=]*)([A-Za-z]+\s+)?([A-Za-z0-9_\-/.+=~]{8,})", re.IGNORECASE)
 
 # Well-known token shapes that appear without a keyword in front of them (redact.ts SHAPE_RES).
 SHAPE_RES = (
@@ -32,22 +35,58 @@ SHAPE_RES = (
 )
 
 KEYWORD_MIN_VALUE_CHARS = 16
-_SLUG_SEP = re.compile(r"[-_.+/=]+")
-# A lowercase word with an optional short numeric suffix ("client2", "oauth2"), or a version
-# token ("v3", "2024", "4o", "08").
-_SLUG_WORD = re.compile(r"^(?:[a-z]{2,}[0-9]{0,4}[a-z]?|v?[0-9]{1,8}[a-z]?)$")
+_SLUG_SEP = re.compile(r"[-_+=]+")
+# One slug part: dot-joined pieces, each a lowercase word with a short numeric suffix
+# ("client2", "a3b", "35b"), or a version number ("v3", "3.8", "9.6.0"). A part that is purely
+# alphabetic may also be Capitalized or UPPER ("SNAPSHOT", "Users"); a part with digits must be
+# lowercase, so random mixed-case/digit runs ("Zx81QwQw") never qualify.
+_SLUG_PIECE = re.compile(r"^(?:[a-z]{1,}[0-9]{0,4}[a-z]{0,2}|v?[0-9]{1,8}[a-z]{0,2})$")
+_HEX_HASH = re.compile(r"^[0-9a-f]{7,40}$")
+_COMMIT_WORDS = {"commit", "sha", "rev", "revision", "hash", "ref", "merge", "merged", "at", "pr", "head"}
+_COMMIT_CONTEXT = re.compile(r"\b(?:commit|sha1?|rev|revision|hash|merge[d]?|cherry-pick|head)\b[^\n]{0,24}$",
+                             re.IGNORECASE)
+
+
+def _is_slug_piece(piece: str) -> bool:
+    if piece.isalpha() and (piece.islower() or piece.isupper() or piece == piece.capitalize()):
+        return True
+    return _SLUG_PIECE.match(piece) is not None
 
 
 def _is_slug(value: str) -> bool:
     parts = [p for p in _SLUG_SEP.split(value) if p]
-    return len(parts) >= 2 and all(_SLUG_WORD.match(p) for p in parts)
+    if len(parts) < 2:
+        return False
+    return all(all(_is_slug_piece(x) for x in p.split(".") if x) for p in parts)
 
 
-def _keyword_value_is_secret(value: str) -> bool:
+def _is_path(value: str) -> bool:
+    """A filesystem path or owner/repo reference, not a credential: either rooted ('/', '~/',
+    './') with 2+ slashes, or every '/'-segment is itself a slug. Base64 secrets that merely
+    contain '/' (AWS-style) have mixed-case/digit segments, so they stay rejected."""
+    if "/" not in value:
+        return False
+    if re.match(r"^(?:~|\.{1,2})?/", value) and value.count("/") >= 2:
+        return True
+    segs = [x for x in value.split("/") if x]
+    return len(segs) >= 2 and all(_is_slug(x) or _is_slug_piece(x) for x in segs)
+
+
+def _is_commit_hash(value: str, scheme_word: str, before: str) -> bool:
+    """7-40 hex chars is also the shape of a hex API key, so it is exempt only with commit
+    context: a commit-ish scheme word ("auth: commit 1470bfd…") or one just before the keyword."""
+    if not _HEX_HASH.match(value):
+        return False
+    return scheme_word.strip().lower() in _COMMIT_WORDS or bool(_COMMIT_CONTEXT.search(before))
+
+
+def _keyword_value_is_secret(value: str, scheme_word: str = "", before: str = "") -> bool:
     return (len(value) >= KEYWORD_MIN_VALUE_CHARS
             and re.search(r"[A-Za-z]", value) is not None
             and re.search(r"[0-9]", value) is not None
-            and not _is_slug(value))
+            and not _is_slug(value)
+            and not _is_path(value)
+            and not _is_commit_hash(value, scheme_word, before))
 
 
 def find_secret(text: Optional[str]) -> Optional[str]:
@@ -58,20 +97,21 @@ def find_secret(text: Optional[str]) -> Optional[str]:
         if rx.search(text):
             return name
     for m in KEYWORD_RE.finditer(text):
-        if _keyword_value_is_secret(m.group(4)):
+        if _keyword_value_is_secret(m.group(4), m.group(3) or "", text[max(0, m.start() - 40):m.start()]):
             return "keyword_value"
     return None
 
 
 def find_secret_in_tags(tags) -> Optional[str]:
     """Like find_secret over each caller-supplied tag, on the RAW strings: norm_tags lowercases
-    and turns '_'/'-' into spaces, which would hide a token shape. Non-strings are left for
-    norm_tags to reject."""
+    and turns '_'/'-' into spaces, which would hide a token shape. Also tries the lowercased tag,
+    since the shapes are case-sensitive and an UPPER-cased `GHP_...` tag is still a secret
+    attempt. Non-strings are left for norm_tags to reject."""
     if not isinstance(tags, (list, tuple)):
         return None
     for t in tags:
         if isinstance(t, str):
-            hit = find_secret(t)
+            hit = find_secret(t) or find_secret(t.lower())
             if hit:
                 return hit
     return None

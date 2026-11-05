@@ -107,6 +107,16 @@ MUST_ACCEPT = [
     "judge combo uses model token: deepseek-v3.2-flash",
     "auth: v2-oauth2-flow",
     "oauth: client2-credentials flow",
+    "model: qwen3.8-35b-a3b-instruct",
+    "version=9.6.0-SNAPSHOT",
+    "commit: 1470bfd8b2fc1",
+    "token path: owner/repo/token-file",
+    "token: owner/repo/token-file2",
+    "secret: /Users/someone/ames-data/ROLLBACK-b400b54-20261105T091828.txt",
+    "auth: commit 1470bfd8b2fc1a2b3c4d5e6f7a8b9c0d1e2f3a4b",
+    "credentials: elastic/kibana-evals/weekly2",
+    "SERVICE_KEY=deepseek-v3.2-flash",
+    "api key: gpt-4o-2024-08-06",
 ]
 
 
@@ -210,3 +220,78 @@ def test_keyword_value_shorter_than_16_chars_is_accepted():
     for t in ("token: ab12cd34ef", "password: Passw0rd123", "api_key = abc123def4"):   # 10-12 chars
         assert secrets_guard.find_secret(t) is None, t
     assert secrets_guard.find_secret("token: " + "aB3" * 5 + "x") == "keyword_value"     # 16 chars
+
+
+REAL_LOOKING = [
+    "token: 1470bfd8b2fc1a2b3c4d5e6f7a8b9c0d1e2f3a4b",    # 40 hex with no commit context
+    "api_key = " + "Xk9mQ2" * 4,
+    "secret=" + "a1b2c3d4" * 3,
+    "credentials: " + "Ab3" * 7,
+    "password: hunter2" + "Zq8" * 3,
+    "secret: wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",   # AWS-style: '/' inside, mixed-case segments
+    "token: Qw8rT2yU5i/O9pA3sD6fG7hJ",
+    "auth: 3f9a8c7b6d5e4f3a2b1c0d9e8f7a6b5c",
+    "token: ABCD1234-EFGH5678-IJKL9012",
+    "OPENAI_" + "API_KEY=Qw8rT2yU5iO9pA3sD6fG",
+    "SERVICE" + "_KEY=Qw8rT2yU5iO9pA3sD6fG",
+    "my-key: Qw8rT2yU5iO9pA3sD6fG",
+    "api key: Qw8rT2yU5iO9pA3sD6fG",
+    "API KEY = Qw8rT2yU5iO9pA3sD6fG",
+]
+
+
+@pytest.mark.parametrize("text", REAL_LOOKING)
+def test_real_looking_keyword_secrets_are_rejected_incl_suffix_and_spaced_forms(text):
+    assert secrets_guard.find_secret(text) == "keyword_value", text
+
+
+def test_key_words_in_prose_are_not_a_keyword_match():
+    for t in ("the primary key and the foreign-key index", "an api key rotation policy is due",
+              "monkey: Qw8rT2yU5iO9pA3sD6fG is not a thing"):   # `monkey:` ends in 'key' but not '_key'
+        assert secrets_guard.find_secret(t) is None, t
+
+
+def test_keyword_regex_is_linear_on_adversarial_input():
+    import time
+    t0 = time.time()
+    for t in ("a_key " * 20000, "x" + "_key" * 20000, "api" + " " * 50000 + "key",
+              "token:" + "-" * 50000, "token: " + "a/" * 30000, "SERVICE_KEY=" + "Ab1" * 30000):
+        secrets_guard.find_secret(t)
+    assert time.time() - t0 < 2.0
+
+
+# --- slug exemption (kills "slug removed" and "slug widened") ---
+def test_slug_exemption_exists_lowercase_multi_part_ids_pass():
+    for v in ("gpt-4o-2024-08-06", "deepseek-v3.2-flash", "claude-opus-4-5-20251101", "qwen3.8-35b-a3b-instruct"):
+        assert secrets_guard.find_secret("model: " + v) is None, v
+
+
+def test_slug_exemption_is_narrow_secret_like_values_are_not_slugs():
+    # each is 16+ chars, letters+digits, joined by separators -- and must NOT be treated as a slug
+    for v in ("Zx81-QwQw-Ab12-Cd34-Ef56",          # digits inside UPPER/mixed-case parts
+              "qwertyuiopasdfgh1234zz",            # single part: a slug needs 2+ parts
+              "abc12def-ghi34jkl-mno56pqr",        # digit runs in the middle of parts
+              "k9k9k9k9-x1x1x1x1-z7z7z7z7",        # repeating letter+digit blocks
+              "AbCdEf12-GhIjKl34"):
+        assert secrets_guard.find_secret("token: " + v) == "keyword_value", v
+
+
+def test_uppercase_secret_shaped_tags_are_rejected_on_retain_and_update():
+    doc = _post("/memory/retain", text="upper tag probe: the quay is closed on sundays").json()["_id"]
+    for tag in ("NOTE:" + FAKE_GH.upper(), "NOTE:" + FAKE_SK.upper(), "API_KEY:" + ("XK9MQ2" * 4),
+                "NOTE:AK" + "IAABCDEFGH12345678"):
+        r = _post("/memory/retain", text="upper tag retain " + tag[:8], tags=[tag])
+        assert r.status_code == 422 and "tag" in r.json()["detail"], (tag, r.text)
+        u = _post("/memory/update", doc_id=doc, tags=[tag])
+        assert u.status_code == 422 and "tag" in u.json()["detail"], (tag, u.text)
+    got = es("GET", f"/{idx('semantic')}/_doc/{doc}")["_source"]
+    assert "XK9MQ2" not in str(got).upper()
+
+
+def test_promote_of_a_missing_doc_is_404_not_500_on_both_surfaces():
+    r = _post("/memory/promote", doc_id="no-such-doc-zzz", to_visibility="team")
+    assert r.status_code == 404, r.text
+    r2 = _post("/mcp/tools/promote", doc_id="no-such-doc-zzz", to_visibility="team")
+    assert r2.status_code == 404, r2.text
+    mine = _post("/memory/retain", text="promote control: a real private fact").json()["_id"]
+    assert _post("/memory/promote", doc_id=mine, to_visibility="team").status_code == 200
