@@ -111,21 +111,32 @@ def test_recency_boost_orders_recent_first(monkeypatch):
     _wipe()
     old = "The nightly capacity report lists shard rebalance targets for the cluster"
     new = "Capacity planning notes: shard rebalance target moved after the incident review"
-    memory.retain(OWNER, "semantic", old, occurred_at="2024-01-01T00:00:00Z")
-    memory.retain(OWNER, "semantic", new, occurred_at="2026-10-03T00:00:00Z")
+    # relative to now: the recency gap decays with wall-clock time, so fixed dates would
+    # eventually leave both docs with ~0 recency and an unordered tie
+    now = dt.datetime.now(dt.timezone.utc)
+    stamp = lambda days: (now - dt.timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")  # noqa: E731
+    memory.retain(OWNER, "semantic", old, occurred_at=stamp(730))
+    memory.retain(OWNER, "semantic", new, occurred_at=stamp(1))
 
     monkeypatch.setattr(memory, "RECENCY_WEIGHT", 5.0)
-    # the recency arm only orders the FUSED list; the (default-on) cross-encoder rerank replaces
-    # that order by relevance, so this contract is tested on the fused path (rerank=False).
+    # rerank=False: the recency arm only orders the FUSED list; a cross-encoder rerank replaces
+    # that order by relevance, so this contract is tested on the fused path.
     boosted = memory.recall(OWNER, "shard rebalance targets", size=8, rerank=False)["results"]
-    recent_first = next(h for h in boosted if h["text"] == new)
-    old_second = next(h for h in boosted if h["text"] == old)
-    assert boosted.index(recent_first) < boosted.index(old_second), [h["text"] for h in boosted]
-
     monkeypatch.setattr(memory, "RECENCY_WEIGHT", 0.0)
-    flat = memory.recall(OWNER, "shard rebalance targets", size=8)["results"]
-    assert flat.index(next(h for h in flat if h["text"] == old)) < \
-        flat.index(next(h for h in flat if h["text"] == new)), [h["text"] for h in flat]
+    flat = memory.recall(OWNER, "shard rebalance targets", size=8, rerank=False)["results"]
+
+    b = {h["text"]: h for h in boosted}
+    f = {h["text"]: h for h in flat}
+    assert old in b and new in b and old in f and new in f, [h["text"] for h in boosted]
+    # weight 5: the recent doc leads, by a margin far above the 1-rank RRF gap
+    assert [h["text"] for h in boosted if h["text"] in (old, new)] == [new, old], [h["text"] for h in boosted]
+    # weight 0: the per-arm RRF scores tie exactly in _hybrid_app_fusion (BM25 favours one doc, kNN
+    # the other), so the flat order is decided by the random ES doc id. Assert the deterministic part.
+    assert all(f[t]["recency"] == 0.0 and f[t]["score"] == f[t]["rrf"] for t in (old, new)), f
+    assert b[new]["recency"] > b[old]["recency"] >= 0.0
+    d_boost = b[new]["score"] - b[old]["score"]
+    d_flat = f[new]["score"] - f[old]["score"]
+    assert abs((d_boost - d_flat) - (b[new]["recency"] - b[old]["recency"])) < 1e-9, (d_boost, d_flat)
 
 
 # ----------------------------------------------------------------- min_score

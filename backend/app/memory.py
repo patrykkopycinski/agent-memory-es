@@ -897,7 +897,8 @@ def rrf_fuse(ranked_lists: list, rank_constant: int = RANK_CONSTANT,
     """Reciprocal rank fusion with ES `retriever.rrf` semantics: each input is a best-first list
     of ids; only its top `window` entries count; a doc scores sum(1 / (rank_constant + rank))
     over the lists it appears in, rank being 1-based. Returns [(id, score)] best-first. Ties
-    break on the best rank in any list, then on the earlier list, then id (deterministic)."""
+    break on the best rank in any list, then on the earlier list, then id. The id step is stable
+    only within one index: ES assigns random ids, so it is not a reproducible order across runs."""
     score, best, first_list = {}, {}, {}
     for li, ids in enumerate(ranked_lists):
         for rank, doc_id in enumerate(ids[:window], start=1):
