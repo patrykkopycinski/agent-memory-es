@@ -156,6 +156,7 @@ MAX_TEXT_CHARS = int(os.environ.get("AMES_MAX_TEXT_CHARS", "100000"))
 MAX_PASSAGES = 100              # group lookups read at most this many passages
 MAX_RECALL_SIZE = 50
 MAX_PER_DOC = 50
+MAX_ID_CHARS = 512            # caller-supplied ids (unreject source_id); no earlier bound existed, 512 = ES's _id limit
 
 import re as _re
 _PRIVATE_MARKERS = _re.compile(
@@ -780,7 +781,8 @@ def unreject(owner_id: str, text: Optional[str] = None, source_id: Optional[str]
     """Lift this owner's tombstones so the value can be retained again: every tombstone that
     would block `text` (the same rule as retain's is_rejected check), or those recorded for
     `source_id` (the doc id a retracting delete came from). Exactly one selector. Intent is
-    logged to am_mutations BEFORE the lift; lifting nothing is a success with lifted=0."""
+    logged to am_mutations BEFORE the lift, with the lifted tombstones' source_ids; lifting
+    nothing is a success with lifted=0."""
     if (text is None) == (source_id is None):
         raise ValueError("unreject needs exactly one of text or source_id")
     if text is not None:
@@ -788,16 +790,21 @@ def unreject(owner_id: str, text: Optional[str] = None, source_id: Optional[str]
             raise ValueError("text must be a non-empty string")
         _check_text_size(text)
         found = tombstone.blockers(owner_id, text)
-        ids = [t["_id"] for t in found]
-        detail = {"text": text, "matched": len(ids)}
     else:
         if not isinstance(source_id, str) or not source_id.strip():
             raise ValueError("source_id must be a non-empty string")
-        ids = None
-        detail = {"source_id": source_id}
+        if len(source_id) > MAX_ID_CHARS:
+            raise ValueError(f"source_id too long: {len(source_id)} chars (max {MAX_ID_CHARS})")
+        found = tombstone.by_source(owner_id, source_id)
+    # value_key stands in for tombstones written without a source_id
+    lifted_ids = [t.get("source_id") or t["value_key"] for t in found]
+    detail = {"by": "text" if text is not None else "source_id", "matched": len(found),
+              "source_ids": lifted_ids}
+    if text is not None:
+        detail["text"] = text
     _log_mutation("unreject", owner_id, "semantic", source_id or "", detail)
-    return {"lifted": tombstone.lift(owner_id, ids=ids, source_id=source_id),
-            "by": "text" if text is not None else "source_id"}
+    return {"lifted": tombstone.lift(owner_id, [t["_id"] for t in found]),
+            "source_ids": lifted_ids, "by": detail["by"]}
 
 
 MAX_EXISTS_TAGS = 16

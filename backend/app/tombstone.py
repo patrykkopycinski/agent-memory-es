@@ -218,16 +218,37 @@ def blockers(owner_id: str, text: str) -> list:
     return [{"_id": h["_id"], **h["_source"]} for h in found]
 
 
-def lift(owner_id: str, ids: list | None = None, source_id: str | None = None) -> int:
-    """Delete this owner's tombstones by ES id, or by source_id. The owner term is always part
-    of the query, so another owner's tombstone is never touched. Returns the number deleted
-    (0 when am_rejected does not exist)."""
-    if ids is not None and not ids:
+def by_source(owner_id: str, source_id: str) -> list:
+    """Ids and sources of this owner's tombstones recorded for source_id. Same fail-closed cap
+    as blockers(); [] when am_rejected does not exist."""
+    body = {"size": PAGE, "sort": [{"value_key": "asc"}, {"_doc": "asc"}],
+            "query": {"bool": {"filter": [{"term": {"owner_id": owner_id}},
+                                          {"term": {"source_id": source_id}}]}}}
+    found = []
+    for _ in range(MAX_PAGES):
+        try:
+            hits = es("POST", f"/{PREFIX}am_rejected/_search", body)["hits"]["hits"]
+        except RuntimeError as e:
+            if _is_missing_index(e):
+                return []
+            raise
+        found += [{"_id": h["_id"], **h["_source"]} for h in hits]
+        if len(hits) < PAGE:
+            return found
+        body["search_after"] = hits[-1]["sort"]
+    raise ValueError(f"owner has more than {MAX_PAGES * PAGE} tombstones for this source_id")
+
+
+def lift(owner_id: str, ids: list) -> int:
+    """Delete this owner's tombstones by ES id. The owner term is always part of the query, so
+    another owner's tombstone is never touched. Returns the number deleted (0 when am_rejected
+    does not exist)."""
+    if not ids:
         return 0
-    match = {"ids": {"values": ids}} if ids is not None else {"term": {"source_id": source_id}}
     try:
         r = es("POST", f"/{PREFIX}am_rejected/_delete_by_query?refresh=true&conflicts=proceed",
-               {"query": {"bool": {"filter": [{"term": {"owner_id": owner_id}}, match]}}})
+               {"query": {"bool": {"filter": [{"term": {"owner_id": owner_id}},
+                                              {"ids": {"values": ids}}]}}})
     except RuntimeError as e:
         if _is_missing_index(e):
             return 0

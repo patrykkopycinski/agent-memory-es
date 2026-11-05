@@ -56,21 +56,23 @@ def _tombstone_count(owner):
 
 def test_unreject_exact_text_then_retain_succeeds():
     text = "unreject exact text unique ur1 alpha"
-    _retract(ALICE, text)
+    doc_id = _retract(ALICE, text)
     assert _retain(ALICE, text).status_code == 422
     r = _unreject(ALICE, text=text)
     assert r.status_code == 200 and r.json()["lifted"] == 1, r.text
+    assert r.json()["source_ids"] == [doc_id]
     assert _retain(ALICE, text).status_code == 200
 
 
 def test_unreject_fuzzy_reworded_text_lifts_the_matching_tombstone():
     original = "ur2 deploys release pipeline staging cluster weekly"
-    _retract(ALICE, original)
+    doc_id = _retract(ALICE, original)
     reworded = "weekly ur2 release pipeline deploys staging cluster nightly"
     assert tombstone.is_rejected(OWNERS[0], reworded) is not None
     assert _retain(ALICE, reworded).status_code == 422
     r = _unreject(ALICE, text=reworded)
     assert r.status_code == 200 and r.json()["lifted"] == 1, r.text
+    assert r.json()["source_ids"] == [doc_id]
     assert tombstone.is_rejected(OWNERS[0], reworded) is None
     assert _retain(ALICE, original).status_code == 200
 
@@ -80,6 +82,7 @@ def test_unreject_by_source_id_lifts_only_that_docs_tombstone():
     lift = _retract(ALICE, "ur3 loses its tombstone delta epsilon")
     r = _unreject(ALICE, source_id=lift)
     assert r.status_code == 200 and r.json()["lifted"] == 1, r.text
+    assert r.json()["source_ids"] == [lift]
     assert _retain(ALICE, "ur3 loses its tombstone delta epsilon").status_code == 200
     assert _retain(ALICE, "ur3 keeps its tombstone beta gamma").status_code == 422
     assert keep != lift
@@ -90,6 +93,7 @@ def test_unreject_nothing_to_lift_is_200_with_zero():
                  {"source_id": "no-such-doc-id"}):
         r = _unreject(ALICE, **body)
         assert r.status_code == 200 and r.json()["lifted"] == 0, (body, r.text)
+        assert r.json()["source_ids"] == []
 
 
 @pytest.mark.parametrize("body", [
@@ -97,6 +101,19 @@ def test_unreject_nothing_to_lift_is_200_with_zero():
 ])
 def test_unreject_needs_exactly_one_selector(body):
     assert _unreject(ALICE, **body).status_code == 422
+
+
+def test_unreject_source_id_is_length_bounded():
+    ok = "s" * memory.MAX_ID_CHARS
+    assert _unreject(ALICE, source_id=ok).status_code == 200
+    over = "s" * (memory.MAX_ID_CHARS + 1)
+    r = _unreject(ALICE, source_id=over)
+    assert r.status_code == 422 and "source_id too long" in r.json()["detail"], r.text
+    r = client.post("/mcp/tools/unreject", headers=H(ALICE), json={"source_id": over})
+    assert r.status_code == 422 and "source_id too long" in r.json()["detail"], r.text
+    logged = es("POST", f"/{PREFIX}am_mutations/_search",
+                {"query": {"term": {"doc_id": over}}})["hits"]["total"]["value"]
+    assert logged == 0, "an over-limit source_id must not reach the mutation log"
 
 
 def test_unreject_text_is_size_bounded():
@@ -118,12 +135,21 @@ def test_unreject_never_touches_another_owners_tombstone():
 
 def test_unreject_logs_intent_before_lifting():
     text = "ur7 mutation log entry unique eta theta"
-    _retract(ALICE, text)
+    doc_id = _retract(ALICE, text)
     assert _unreject(ALICE, text=text).status_code == 200
     hits = es("POST", f"/{PREFIX}am_mutations/_search",
               {"query": {"bool": {"filter": [{"term": {"intent": "unreject"}},
                                               {"term": {"owner_id": OWNERS[0]}}]}}})["hits"]["hits"]
-    assert any(h["_source"]["detail"].get("text") == text for h in hits), hits
+    mine = [h["_source"]["detail"] for h in hits if h["_source"]["detail"].get("text") == text]
+    assert mine and mine[0]["source_ids"] == [doc_id] and mine[0]["matched"] == 1, hits
+
+
+def test_unreject_lists_value_key_for_tombstone_without_source_id():
+    text = "ur10 tombstone without source unique lambda mu"
+    tombstone.reject(OWNERS[0], text, "written directly")
+    r = _unreject(ALICE, text=text)
+    assert r.status_code == 200 and r.json()["lifted"] == 1, r.text
+    assert r.json()["source_ids"] == [tombstone._key(tombstone._terms(text))]
 
 
 def test_unreject_tools_dispatcher():
@@ -151,4 +177,5 @@ def test_unreject_without_rejected_index_lifts_zero(monkeypatch):
     def missing(method, path, body=None):
         raise RuntimeError(f"ES {method} {path} -> 404: index_not_found_exception")
     monkeypatch.setattr(tombstone, "es", missing)
-    assert tombstone.lift("ur_alice", source_id="x") == 0
+    assert tombstone.lift("ur_alice", ["x"]) == 0
+    assert tombstone.by_source("ur_alice", "x") == []

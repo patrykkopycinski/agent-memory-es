@@ -110,6 +110,33 @@ def test_retract_flag_on_every_entry_point():
         assert _tombstones_for(m["_id"]) == 0, text
 
 
+@pytest.mark.parametrize("value", ["yes", 1, "true", None, "on"])
+def test_post_delete_rejects_non_strict_bool_retract(value):
+    m = _retain(ALICE, text=f"strict retract post {value!r} unique qz9h")
+    r = client.post("/memory/delete", headers=H(ALICE),
+                    json={"kind": "semantic", "doc_id": m["_id"], "retract": value})
+    assert r.status_code == 422, r.text
+    assert client.delete(f"/memory/semantic/{m['_id']}", headers=H(ALICE)).status_code == 200
+
+
+@pytest.mark.parametrize("value", ["yes", "1", "on", "TRUE", "t", "", "maybe"])
+def test_delete_query_retract_accepts_only_true_or_false(value):
+    m = _retain(ALICE, text=f"strict retract query {value!r} unique qz9i")
+    r = client.delete(f"/memory/semantic/{m['_id']}?retract={value}", headers=H(ALICE))
+    assert r.status_code == 422, r.text
+    assert _tombstones_for(m["_id"]) == 0
+    assert client.delete(f"/memory/semantic/{m['_id']}", headers=H(ALICE)).status_code == 200
+
+
+def test_delete_query_retract_true_and_false():
+    t = _retain(ALICE, text="query retract true unique qz9j")
+    r = client.delete(f"/memory/semantic/{t['_id']}?retract=true", headers=H(ALICE))
+    assert r.status_code == 200 and r.json()["tombstoned"] is True
+    f = _retain(ALICE, text="query retract false unique qz9k")
+    r = client.delete(f"/memory/semantic/{f['_id']}?retract=false", headers=H(ALICE))
+    assert r.status_code == 200 and r.json()["tombstoned"] is False
+
+
 def test_tools_delete_rejects_non_bool_retract():
     m = _retain(ALICE, text="non bool retract unique qz9f")
     r = client.post("/mcp/tools/delete", headers=H(ALICE),

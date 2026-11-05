@@ -5,11 +5,11 @@ import os
 import re
 import threading
 import time
-from typing import Optional
+from typing import Literal, Optional
 
 from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, StrictBool
 
 from . import auth, embeddings, memory, pages as pages_mod, mental_models as mm_mod, reranker, tagfilter, facts
 from .store import KINDS, ensure_indices, is_doc_miss
@@ -108,7 +108,7 @@ class UpdateIn(BaseModel):
 class DeleteIn(BaseModel):
     kind: str
     doc_id: str
-    retract: bool = False               # also tombstone the semantic text ("wrong, never record again")
+    retract: StrictBool = False         # also tombstone the semantic text ("wrong, never record again")
 
 
 class UnrejectIn(BaseModel):
@@ -213,9 +213,12 @@ def _superseded_409(e: "memory.SupersededError") -> HTTPException:
 
 
 @app.delete("/memory/{kind}/{doc_id}")
-def delete_memory(kind: str, doc_id: str, retract: bool = False, who: dict = Depends(caller)):
+def delete_memory(kind: str, doc_id: str, retract: Literal["true", "false"] = "false",
+                  who: dict = Depends(caller)):
+    # Literal, not bool: FastAPI's lax bool would read ?retract=yes/1/on as true, and a
+    # misread flag here silently decides whether the text is blocked forever
     try:
-        return memory.delete(who["owner_id"], kind, doc_id, retract)
+        return memory.delete(who["owner_id"], kind, doc_id, retract == "true")
     except ValueError as e:
         raise HTTPException(422, str(e))
     except PermissionError:
