@@ -29,13 +29,27 @@ def _key(terms) -> str:
 _index_ready = False
 
 
+REASON_KEYWORD = {"keyword": {"type": "keyword", "ignore_above": 512}}
+
+
 def _ensure_index():
     global _index_ready
     if _index_ready:
         return
     try:
-        es("GET", f"/{PREFIX}am_rejected")
+        existing = es("GET", f"/{PREFIX}am_rejected")
     except RuntimeError:
+        existing = None
+    if existing is not None:
+        # Index predates reason.keyword: add the multi-field. ES allows adding a
+        # multi-field to an existing text field, but it only indexes docs written
+        # AFTER this call — older rows stay un-aggregatable (deliberately no reindex).
+        mappings = next(iter(existing.values()), {}).get("mappings", {})
+        reason = mappings.get("properties", {}).get("reason", {})
+        if "keyword" not in reason.get("fields", {}):
+            es("PUT", f"/{PREFIX}am_rejected/_mapping",
+               {"properties": {"reason": {"type": "text", "fields": REASON_KEYWORD}}})
+    else:
         try:
             es("PUT", f"/{PREFIX}am_rejected", {
                 "settings": {"number_of_shards": 1, "number_of_replicas": 0},
@@ -45,7 +59,7 @@ def _ensure_index():
                         "value_key": {"type": "keyword"},
                         "terms": {"type": "keyword"},
                         "owner_id": {"type": "keyword"},
-                        "reason": {"type": "text"},
+                        "reason": {"type": "text", "fields": REASON_KEYWORD},
                         "source_id": {"type": "keyword"},
                         "rejected_at": {"type": "date"},
                     },

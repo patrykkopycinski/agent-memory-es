@@ -211,3 +211,65 @@ def test_terms_chunk_module_reload_is_in_bounds(monkeypatch):
         monkeypatch.delenv("AMES_TOMBSTONE_TERMS_CHUNK")
         importlib.reload(tombstone)
     assert tombstone.TERMS_CHUNK == tombstone.TERMS_CHUNK_DEFAULT
+
+
+# ---- am_rejected.reason is aggregatable via reason.keyword ----
+
+_OLD_MAPPING = {
+    "settings": {"number_of_shards": 1, "number_of_replicas": 0},
+    "mappings": {"dynamic": "strict", "properties": {
+        "value_key": {"type": "keyword"}, "terms": {"type": "keyword"},
+        "owner_id": {"type": "keyword"}, "reason": {"type": "text"},
+        "source_id": {"type": "keyword"}, "rejected_at": {"type": "date"}}},
+}
+
+
+def _reason_fields():
+    got = es("GET", f"/{PREFIX}am_rejected")
+    return next(iter(got.values()))["mappings"]["properties"]["reason"].get("fields", {})
+
+
+def _recreate_index(monkeypatch, body):
+    """Drop am_rejected and recreate it from `body` (None = let _ensure_index create it)."""
+    try:
+        es("DELETE", f"/{PREFIX}am_rejected")
+    except RuntimeError:
+        pass
+    if body is not None:
+        es("PUT", f"/{PREFIX}am_rejected", body)
+    monkeypatch.setattr(tombstone, "_index_ready", False)
+
+
+@pytest.fixture
+def restore_index(monkeypatch):
+    yield
+    _recreate_index(monkeypatch, None)
+    tombstone._ensure_index()   # leave the shared test index in its current-code shape
+
+
+def test_fresh_index_has_reason_keyword(monkeypatch, restore_index):
+    _recreate_index(monkeypatch, None)
+    tombstone._ensure_index()
+    assert _reason_fields()["keyword"]["type"] == "keyword"
+
+
+def test_ensure_index_adds_reason_keyword_to_legacy_index(monkeypatch, restore_index):
+    _recreate_index(monkeypatch, _OLD_MAPPING)
+    assert _reason_fields() == {}
+    tombstone._ensure_index()
+    assert _reason_fields()["keyword"]["type"] == "keyword"
+    # second pass is a no-op (idempotent), even with the cache cleared
+    monkeypatch.setattr(tombstone, "_index_ready", False)
+    tombstone._ensure_index()
+    assert _reason_fields()["keyword"]["type"] == "keyword"
+
+
+def test_reason_terms_agg_covers_docs_written_after_upgrade(monkeypatch, restore_index):
+    o = "tomb-agg-owner"
+    _recreate_index(monkeypatch, _OLD_MAPPING)
+    tombstone._ensure_index()
+    tombstone.reject(o, "the sky is green today", "factually wrong claim")
+    buckets = es("POST", f"/{PREFIX}am_rejected/_search", {
+        "size": 0, "query": {"term": {"owner_id": o}},
+        "aggs": {"r": {"terms": {"field": "reason.keyword"}}}})["aggregations"]["r"]["buckets"]
+    assert [(b["key"], b["doc_count"]) for b in buckets] == [("factually wrong claim", 1)]
