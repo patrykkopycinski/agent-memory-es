@@ -4,7 +4,8 @@ Default endpoint .multilingual-e5-small-elasticsearch (384-dim, cluster-side, no
 gateway). AMES_EMBED_BACKEND=es|omniroute|local pins one. `local` runs intfloat/multilingual-e5-small
 in-process (onnxruntime + tokenizers, no `_inference`, so it works off-license) and produces the
 same vectors as the ES-hosted `.multilingual-e5-small-elasticsearch` endpoint. Dims differ per backend — indices must
-be rebuilt when switching backends.
+be rebuilt when switching backends. With AMES_EMBED_BACKEND unset, a valid baked local model is preferred
+over `_inference` (which needs an ES license) and over OmniRoute.
 """
 import json
 import logging
@@ -12,6 +13,7 @@ import os
 import threading
 import time
 import urllib.request
+from typing import Optional
 
 from . import http_retry
 from .store import _es_url
@@ -59,37 +61,81 @@ LOCAL_MODEL_REPO = os.environ.get("AMES_LOCAL_MODEL_REPO", "intfloat/multilingua
 # floating `main` could silently change every stored vector's geometry.
 LOCAL_MODEL_REVISION = os.environ.get("AMES_LOCAL_MODEL_REVISION", "614241f622f53c4eeff9890bdc4f31cfecc418b3")
 MODEL_FILES = ("onnx/model.onnx", "tokenizer.json")
+REVISION_FILE = "REVISION"       # written next to the model by the image build (scripts/bake_e5_model.py)
+HF_BASE = "https://huggingface.co"
 LOCAL_MAX_TOKENS = 512
 LOCAL_BATCH = 16
 _local = None
 _local_lock = threading.Lock()
 
 
+class ModelUnavailable(RuntimeError):
+    """The local embedding model is missing or is not the pinned revision. Never auto-fetched."""
+
+
+def fetch_allowed() -> bool:
+    """Runtime downloads are opt-in (AMES_LOCAL_MODEL_ALLOW_FETCH=1), for tests and dev checkouts
+    only. Production bakes the model into the image and never reaches for the network."""
+    return os.environ.get("AMES_LOCAL_MODEL_ALLOW_FETCH", "") == "1"
+
+
+def model_problem(dest: str, revision: str = None) -> Optional[str]:
+    """Why `dest` is not a usable model dir (names the offending path), or None when it is."""
+    revision = revision or LOCAL_MODEL_REVISION
+    for rel in MODEL_FILES:
+        path = os.path.join(dest, rel)
+        if not os.path.isfile(path):
+            return f"model file missing: {path}"
+    marker = os.path.join(dest, REVISION_FILE)
+    try:
+        with open(marker) as fh:
+            have = fh.read().strip()
+    except OSError:
+        return f"model REVISION marker missing: {marker}"
+    if have != revision:
+        return f"model revision {have[:12]} != pinned {revision[:12]}: {marker}"
+    return None
+
+
 def fetch_model(dest: str, repo: str = None, revision: str = None) -> tuple:
-    """Return (onnx_path, tokenizer_path) under `dest`, downloading any missing file from the HF
-    hub at a pinned revision (stdlib only). The Docker image bakes `dest` at build time so prod
-    never needs the network; tests and dev checkouts fetch once into a cache dir."""
+    """Download the model files from the HF hub at a pinned revision (stdlib only) into `dest` and
+    write the REVISION marker. Only reachable through load_local with
+    AMES_LOCAL_MODEL_ALLOW_FETCH=1. Files already under a different or missing marker are
+    re-downloaded: unmarked bytes are never trusted."""
     repo, revision = repo or LOCAL_MODEL_REPO, revision or LOCAL_MODEL_REVISION
+    marker = os.path.join(dest, REVISION_FILE)
+    trusted = model_problem(dest, revision) is None
     paths = []
     for rel in MODEL_FILES:
         path = os.path.join(dest, rel)
-        if not os.path.exists(path):
+        if not trusted or not os.path.exists(path):
             os.makedirs(os.path.dirname(path), exist_ok=True)
-            url = f"https://huggingface.co/{repo}/resolve/{revision}/{rel}"
+            url = f"{HF_BASE}/{repo}/resolve/{revision}/{rel}"
             tmp = path + ".part"
             with urllib.request.urlopen(url, timeout=300) as resp, open(tmp, "wb") as fh:
                 while chunk := resp.read(1 << 20):
                     fh.write(chunk)
             os.replace(tmp, path)
         paths.append(path)
+    with open(marker, "w") as fh:
+        fh.write(revision + "\n")
     return tuple(paths)
 
 
 def load_local(model_dir=None, repo=None, revision=None) -> tuple:
-    """Build an (onnxruntime session, tokenizer) pair. Not cached: see _local_model()."""
+    """Build an (onnxruntime session, tokenizer) pair. Not cached: see _local_model().
+    Raises ModelUnavailable (naming the path) when the files are absent or the REVISION marker
+    does not match; downloads only when AMES_LOCAL_MODEL_ALLOW_FETCH=1."""
+    dest, revision = model_dir or LOCAL_MODEL_DIR, revision or LOCAL_MODEL_REVISION
+    problem = model_problem(dest, revision)
+    if problem and fetch_allowed():
+        fetch_model(dest, repo, revision)
+        problem = model_problem(dest, revision)
+    if problem:
+        raise ModelUnavailable(problem)
     import onnxruntime as ort
     from tokenizers import Tokenizer
-    onnx, tok_path = fetch_model(model_dir or LOCAL_MODEL_DIR, repo, revision)
+    onnx, tok_path = (os.path.join(dest, rel) for rel in MODEL_FILES)
     opts = ort.SessionOptions()
     opts.log_severity_level = 3
     session = ort.InferenceSession(onnx, sess_options=opts, providers=["CPUExecutionProvider"])
@@ -134,6 +180,14 @@ def _local_embed(texts):
     return local_embed_with(session, tok, texts)
 
 
+def _local_ready() -> bool:
+    """Auto-detect: the baked model dir is valid and the runtime deps import. No I/O beyond stat."""
+    import importlib.util
+    return (importlib.util.find_spec("onnxruntime") is not None
+            and importlib.util.find_spec("tokenizers") is not None
+            and model_problem(LOCAL_MODEL_DIR) is None)
+
+
 def backend() -> str:
     global _backend
     if _backend:
@@ -141,6 +195,8 @@ def backend() -> str:
     pinned = os.environ.get("AMES_EMBED_BACKEND", "")
     if pinned in ("es", "omniroute", "local"):
         _backend = pinned
+    elif _local_ready():
+        _backend = "local"      # a valid baked model beats a license-gated or dims-mismatched backend
     else:
         try:
             _es_embed(["probe"])

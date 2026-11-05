@@ -2,8 +2,9 @@
 
 Parity: the in-process multilingual-e5-small must reproduce the vectors ES `_inference` returns
 (fixtures captured from `.multilingual-e5-small-elasticsearch`), with a wrong-model negative
-control proving the threshold actually discriminates. Model files are fetched once into
-AMES_TEST_MODEL_CACHE (default ~/.cache/ames-test-models)."""
+control proving the threshold actually discriminates. Model files come from AMES_TEST_MODEL_CACHE
+(default ~/.cache/ames-test-models); without them these tests skip, and download only with
+AMES_LOCAL_MODEL_ALLOW_FETCH=1 (see model_cache.py)."""
 import json
 import math
 import os
@@ -16,11 +17,10 @@ import _safety  # noqa: F401
 import pytest
 
 from app import embeddings, memory  # noqa: E402
+from model_cache import BGE, E5, model_or_skip  # noqa: E402
 
-CACHE = os.environ.get("AMES_TEST_MODEL_CACHE", os.path.expanduser("~/.cache/ames-test-models"))
 FIXTURE = os.path.join(os.path.dirname(__file__), "fixtures", "e5_parity.json")
 PARITY_THRESHOLD = 0.9999
-BGE_REPO, BGE_REV = "BAAI/bge-small-en-v1.5", "5c38ec7c405ec4b44b94cc5a9bb96e735b38267a"
 
 
 def _cos(a, b):
@@ -35,7 +35,7 @@ def fixture():
 
 @pytest.fixture(scope="module")
 def e5():
-    return embeddings.load_local(os.path.join(CACHE, "multilingual-e5-small"))
+    return model_or_skip(E5)
 
 
 # ------------------------------------------------------------------ parity
@@ -60,8 +60,7 @@ def test_local_embedding_is_unit_norm_and_batch_independent(e5, fixture):
 
 def test_negative_control_wrong_model_fails_the_parity_threshold(fixture):
     """bge-small-en-v1.5 is also 384-dim: only the cosine check can tell it apart from E5."""
-    session, tok = embeddings.load_local(os.path.join(CACHE, "bge-small-en-v1.5"),
-                                         repo=BGE_REPO, revision=BGE_REV)
+    session, tok = model_or_skip(BGE)
     got = embeddings.local_embed_with(session, tok, [i["text"] for i in fixture])
     cosines = [_cos(g, i["vector"]) for g, i in zip(got, fixture)]
     print("bge negative-control cosines:", [round(c, 6) for c in cosines])
