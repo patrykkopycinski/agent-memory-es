@@ -470,9 +470,12 @@ def _health_cached() -> dict:
         if _health_refresh_lock.acquire(blocking=False):
             try:
                 threading.Thread(target=_refresh_health_in_background, daemon=True).start()
-            except BaseException:
+            except BaseException as exc:
                 _health_refresh_lock.release()
-                raise
+                if not isinstance(exc, Exception):
+                    raise                    # KeyboardInterrupt / SystemExit are not ours to swallow
+                logging.getLogger("ames.health").warning(
+                    "health refresher thread could not start; serving the stale body", exc_info=True)
         return dict(body)
     with _health_refresh_lock:
         with _health_state_lock:

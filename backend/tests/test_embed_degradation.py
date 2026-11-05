@@ -222,19 +222,30 @@ def test_idle_gap_past_two_ttls_computes_inline_not_stale(monkeypatch):
     assert client.get("/health/ready").status_code == 503
 
 
-def test_refresh_lock_is_released_when_the_refresher_thread_cannot_start(monkeypatch):
+def test_refresher_thread_failure_serves_the_stale_body_and_releases_the_lock(monkeypatch):
+    """Thread.start() can raise under thread exhaustion. /health must stay 200 with the stale body
+    (not 500), and the lock must not leak or no refresh would ever run again."""
     import threading
     import time
-    client.get("/health")
+    first = client.get("/health").json()
     main._health["at"] = time.monotonic() - main.HEALTH_TTL_S - 1     # stale but < 2*TTL
 
     def no_start(self):
         raise RuntimeError("can't start new thread")
     monkeypatch.setattr(threading.Thread, "start", no_start)
-    with pytest.raises(RuntimeError, match="can't start"):
-        main._health_cached()
-    assert main._health_refresh_lock.acquire(blocking=False), "lock leaked"
-    main._health_refresh_lock.release()
+    # call the cached builder directly: TestClient itself needs Thread.start
+    assert main._health_cached() == first                            # no exception: the handler stays 200
+    leaked = not main._health_refresh_lock.acquire(blocking=False)
+    main._health_refresh_lock.release()           # held either by us or by the leak: free it so later tests run
+    assert not leaked, "lock leaked"
+    main._health["at"] = time.monotonic() - main.HEALTH_TTL_S - 1
+    assert main._health_cached() == first                            # and it keeps working next time
+
+
+def test_refresher_thread_failure_with_no_cached_body_computes_inline(monkeypatch):
+    import threading
+    monkeypatch.setattr(threading.Thread, "start", lambda self: (_ for _ in ()).throw(RuntimeError("no threads")))
+    assert main._health_cached()["ok"] is True                        # nothing cached: inline, no thread needed
 
 
 def test_startup_warms_the_local_model_and_health_cache_without_blocking(monkeypatch):
