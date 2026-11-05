@@ -84,17 +84,45 @@ host_claim() {
 ID=$1 L=$2 RES=$3 ACTOR=$4 CMD=$5 INTENT=$6 TTL=7200
 now=$(date +%s)
 take() { mkdir "$L" 2>/dev/null && echo "$ID $now" > "$L/owner"; }
-if ! take; then
+mtime() { stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || echo "$now"; }   # GNU first: BSD `stat -f` means something else on Linux
+# Is the lock stale? Decided by OWNER LIVENESS, never by age alone:
+#   - owner's driver is gone (driver.pid names no live driver.sh process), or
+#   - owner's run dir has been missing > 120 s (claim older than 120 s and no /tmp/ames-rv-<owner>), or
+#   - no owner file: the lock dir itself is older than 120 s.
+# A launcher that was killed before it started a driver leaves a run dir without driver.pid: that is
+# only stale once the run dir has been idle for the whole TTL.
+is_stale() {
   oid="" ots=0
   read -r oid ots < "$L/owner" 2>/dev/null
-  stale=0
-  if [ -n "$oid" ]; then
-    age=$((now - ots))
-    if [ "$age" -gt "$TTL" ]; then stale=1
-    elif [ "$age" -gt 120 ] && [ ! -d "/tmp/ames-rv-$oid" ]; then stale=1; fi   # owner never shipped / already gone
+  if [ -z "$oid" ]; then [ $((now - $(mtime "$L"))) -gt 120 ]; return; fi
+  rd=/tmp/ames-rv-$oid
+  if [ ! -d "$rd" ]; then [ $((now - ots)) -gt 120 ]; return; fi
+  if [ -f "$rd/driver.pid" ]; then
+    p=$(cat "$rd/driver.pid" 2>/dev/null)
+    ps -p "$p" -o command= 2>/dev/null | grep -q 'driver.sh' && return 1
+    return 0
   fi
-  if [ "$stale" = 1 ] && rm -rf "$L" && take; then echo "took over stale lock of run $oid"
-  else echo "lock $L held by run ${oid:-?}"; exit 75; fi
+  [ $((now - $(mtime "$rd"))) -gt "$TTL" ]
+}
+if ! take; then
+  if is_stale; then
+    stale_oid=$oid
+    # atomic retire: only the winner of the mv proceeds; the loser re-checks (and finds a fresh lock)
+    if mv "$L" "$L.stale.$ID" 2>/dev/null; then
+      if [ "$(cut -d' ' -f1 "$L.stale.$ID/owner" 2>/dev/null)" = "$stale_oid" ]; then
+        rm -rf "$L.stale.$ID"
+        if take; then echo "took over stale lock of run ${stale_oid:-?}"; else echo "lock $L taken by another run"; exit 75; fi
+      else
+        # we retired a lock that was replaced between the check and the mv: put it back
+        mv "$L.stale.$ID" "$L" 2>/dev/null || rm -rf "$L.stale.$ID"
+        echo "lock $L is held by a live run"; exit 75
+      fi
+    else
+      echo "lock $L held by run ${oid:-?} (another runner is retiring it)"; exit 75
+    fi
+  else
+    echo "lock $L held by run ${oid:-?}"; exit 75
+  fi
 fi
 case "$CMD" in \~/*) CMD=$HOME/${CMD#\~/};; esac
 if [ -n "$CMD" ]; then
@@ -149,6 +177,57 @@ elif mode == "skipinfo":   # id<TAB>reason (message + body, one line)
         sk = tc.find("skipped")
         if sk is not None:
             print(tid(tc) + "\t" + " ".join(((sk.get("message") or "") + " " + (sk.text or "")).split()))
+PY
+}
+
+# Skip gate (junit in, one line per lost test out): "OK<TAB>id<TAB>reason" or "BAD<TAB>id<TAB>reason".
+# A test is LOST when it passed on base and is skipped on head. A whole-file skip (module-level pytest.skip,
+# importorskip, require_llm) is ONE junit entry with an empty classname and name="tests.test_x"; it is
+# expanded to every base-passing test of that module. A lost test is excused only when the skip is the
+# shared LLM-gateway probe ("... (AMES_LLM_BASE) is unreachable (Exc); this test needs a live LLM") AND base
+# shows the same gateway-down skip/failure for that test or its module; anything else is a head regression.
+skipgate() { # head.xml base.xml
+  python3 - "$1" "$2" <<'PY'
+import re, sys, xml.etree.ElementTree as ET
+def load(path):
+    try: return list(ET.parse(path).getroot().iter("testcase"))
+    except Exception: return []
+head, base = load(sys.argv[1]), load(sys.argv[2])
+GW = re.compile(r"LLM gateway \S+ \(AMES_LLM_BASE\) is unreachable \(\w+\); this test needs a live LLM")
+def text(el): return " ".join(((el.get("message") or "") + " " + (el.text or "")).split())
+def module(tc):
+    cn = tc.get("classname")
+    if not cn: return tc.get("name")                       # whole-file entry: name is the dotted module
+    return re.sub(r"\.[A-Z]\w*$", "", cn)                  # drop a Test class segment
+tid = lambda tc: f'{tc.get("classname")}::{tc.get("name")}'
+def kind(tc):
+    for k in ("skipped", "failure", "error"):
+        if tc.find(k) is not None: return k
+    return "pass"
+base_pass = [tc for tc in base if tc.get("classname") and kind(tc) == "pass"]
+# base evidence of "gateway down" per test id and per module (a gateway skip, or a failure/collection error saying so)
+gw_ids, gw_mods = set(), set()
+for tc in base:
+    k = kind(tc)
+    if k == "pass": continue
+    el = tc.find(k)
+    if GW.search(text(el)) or "URLError" in text(el):
+        gw_ids.add(tid(tc)); gw_mods.add(module(tc))
+for tc in head:
+    sk = tc.find("skipped")
+    if sk is None: continue
+    reason = text(sk)
+    if tc.get("classname"):
+        lost = [tid(tc)] if tid(tc) in {tid(b) for b in base_pass} else []
+    else:
+        m = tc.get("name")
+        lost = [tid(b) for b in base_pass if b.get("classname") == m or b.get("classname").startswith(m + ".")]
+        if not lost: continue
+    for t in lost:
+        mod = t.split("::")[0]
+        mod = re.sub(r"\.[A-Z]\w*$", "", mod)
+        excused = GW.search(reason) and (t in gw_ids or mod in gw_mods)
+        print(("OK" if excused else "BAD") + "\t" + t + "\t" + reason[:160])
 PY
 }
 
@@ -363,26 +442,20 @@ junit fails "$BX" | sort > "$LOGDIR/fail-base.txt"
 junit skips "$HX" | sort > "$LOGDIR/skip-head.txt"
 junit skips "$BX" | sort > "$LOGDIR/skip-base.txt"
 junit passes "$BX" | sort > "$LOGDIR/pass-base.txt"
-junit skipinfo "$HX" | sort > "$LOGDIR/skipinfo-head.txt"
 NEW=$(comm -23 "$LOGDIR/fail-head.txt" "$LOGDIR/fail-base.txt")
 FIXED=$(comm -13 "$LOGDIR/fail-head.txt" "$LOGDIR/fail-base.txt")
 NEWSKIP=$(comm -23 "$LOGDIR/skip-head.txt" "$LOGDIR/skip-base.txt")
-# Skip gate: a test that PASSED on base and is SKIPPED on head silently loses coverage. Only skips whose
-# reason is the shared LLM-gateway probe (tests/_llm_gate.py) are allowed; those are printed.
+# Skip gate (see skipgate above): tests that passed on base but are skipped on head.
 BADSKIP="" OKSKIP=""
-while IFS= read -r t; do
+while IFS=$'\t' read -r verdict t reason; do
   [ -n "$t" ] || continue
-  reason=$(awk -F'\t' -v t="$t" '$1 == t {print $2; exit}' "$LOGDIR/skipinfo-head.txt")
-  case "$reason" in
-    *"(AMES_LLM_BASE) is unreachable"*) OKSKIP="$OKSKIP$t  [$reason]"$'\n';;
-    *) BADSKIP="$BADSKIP$t  [$reason]"$'\n';;
-  esac
-done < <(comm -12 "$LOGDIR/skip-head.txt" "$LOGDIR/pass-base.txt")
+  if [ "$verdict" = OK ]; then OKSKIP="$OKSKIP$t  [$reason]"$'\n'; else BADSKIP="$BADSKIP$t  [$reason]"$'\n'; fi
+done < <(skipgate "$HX" "$BX")
 echo "===== NEW failures/errors vs base (gate):"; indent "${NEW:-<none>}"
 echo "===== fixed vs base:"; indent "${FIXED:-<none>}"
 echo "===== pre-existing (fail on both):"; indent "$(comm -12 "$LOGDIR/fail-head.txt" "$LOGDIR/fail-base.txt" | grep . || echo "<none>")"
 echo "===== newly skipped vs base (informational):"; indent "${NEWSKIP:-<none>}"
-echo "===== passed on base, SKIPPED on head, allow-listed (LLM gateway unreachable):"; indent "$(printf '%s' "$OKSKIP" | grep . || echo "<none>")"
+echo "===== passed on base, SKIPPED on head, allow-listed (gateway-down skip that base also shows):"; indent "$(printf '%s' "$OKSKIP" | grep . || echo "<none>")"
 echo "===== passed on base, SKIPPED on head, NOT allowed (gate):"; indent "$(printf '%s' "$BADSKIP" | grep . || echo "<none>")"
 NNEW=$(printf '%s' "$NEW" | grep -c . || true)
 NBAD=$(printf '%s' "$BADSKIP" | grep -c . || true)

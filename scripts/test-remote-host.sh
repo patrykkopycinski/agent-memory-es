@@ -8,7 +8,7 @@
 #   RUN_DIR/out/        junit-<label>.xml + <label>.log  (what the local side collects)
 #   RUN_DIR/status      "running ..." while going, then "done head_rc=.. base_rc=.." or "infra <why>"
 #   RUN_DIR/driver.pid  written by the launcher; the poll uses it to notice a SIGKILLed driver
-#   RUN_DIR/es_created  marker: this run created the ES container (survives a driver crash)
+#   ES container       labelled ames-test-run=<id> at creation: that label (not a marker file) says "this run owns it"
 #
 # On EXIT (any path, including SIGTERM) it removes the test containers, the ES container it
 # created (unless --keep-es) and the shipped trees, and releases the host lock / external claim.
@@ -30,8 +30,11 @@ MODEL_CACHE=${AMES_TEST_MODEL_CACHE:-$HOME/.cache/ames-test-models}
 CONTAINER_MEM=${AMES_TEST_CONTAINER_MEM:-3g}
 SUITE_TIMEOUT_S=${AMES_TEST_SUITE_TIMEOUT_S:-2400}
 RESULT="infra driver exited early"
+# This run owns the ES container iff docker run stamped it with our label (set at creation, so it survives a
+# driver crash and can never match a container another run created under the same name).
+es_owned() { [ -n "$(docker ps -aq --filter "name=^${ES_NAME}\$" --filter "label=ames-test-run=$ID" 2>/dev/null)" ]; }
 ES_CREATED=0
-[ -f "$RUN/es_created" ] && ES_CREATED=1
+es_owned && ES_CREATED=1
 
 log() { echo "[$(date +%H:%M:%S)] $*"; }
 status() { echo "$*" > "$RUN/status"; }
@@ -55,7 +58,9 @@ cleanup() { # note
     docker rm -f "$ES_NAME" >/dev/null 2>&1
   elif curl -sf -m 5 "$ES/_cluster/health" >/dev/null 2>&1; then
     # ES outlives this run (--keep-es / reused / not ours): drop only this run's indices.
-    for idx in $(curl -s -m 10 "$ES/_cat/indices/amtest_${ID}*?h=index" 2>/dev/null); do
+    # exactly this run's prefixes (amtest_<id>h_ / amtest_<id>b_): a bare amtest_<id>* would also match
+    # another run whose id merely starts with ours
+    for idx in $(curl -s -m 10 "$ES/_cat/indices/amtest_${ID}h_*,amtest_${ID}b_*?h=index" 2>/dev/null); do
       curl -s -m 10 -o /dev/null -XDELETE "$ES/$idx"
     done
   fi
@@ -74,7 +79,7 @@ if [ "$REAP" = 1 ]; then
   KEEP_ES=0
   echo "reaping run $ID: removing containers ames-rv-${ID}-*"
   cleanup "driver died; reaped (status was: $(cat "$RUN/status" 2>/dev/null))"
-  [ "$ES_CREATED" = 1 ] && echo "removed ES container $ES_NAME (created by this run)" || echo "ES $ES_NAME not created by this run: dropped only its amtest_${ID}* indices"
+  [ "$ES_CREATED" = 1 ] && echo "removed ES container $ES_NAME (created by this run)" || echo "ES $ES_NAME not created by this run: dropped only its amtest_${ID}[hb]_* indices"
   echo "released lock/claim for $RES"
   rm -rf "$RUN"
   echo "removed $RUN"
@@ -106,14 +111,15 @@ if docker inspect "$ES_NAME" >/dev/null 2>&1; then
   fi
 else
   log "starting $ES_NAME on 127.0.0.1:$PORT"
-  touch "$RUN/es_created"   # before docker run: a crash between the two is then still reaped
-  ES_CREATED=1
-  if ! docker run -d --name "$ES_NAME" -p "127.0.0.1:${PORT}:9200" \
+  if ! docker run -d --name "$ES_NAME" --label "ames-test-run=$ID" -p "127.0.0.1:${PORT}:9200" \
     -e discovery.type=single-node -e xpack.security.enabled=false \
     -e ES_JAVA_OPTS="-Xms1g -Xmx1g" "$ES_IMAGE" >/dev/null; then
-    docker rm -f "$ES_NAME" >/dev/null 2>&1    # a failed `docker run` can leave a Created container behind
+    # a failed `docker run` can leave a Created container behind: remove it only if it is OURS (label), never
+    # a same-named container another run created
+    es_owned && docker rm -f "$ES_NAME" >/dev/null 2>&1
     RESULT="infra ES container failed to start"; exit 70
   fi
+  ES_CREATED=1
 fi
 ok=0
 for _ in $(seq 1 90); do

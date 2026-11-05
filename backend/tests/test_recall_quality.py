@@ -111,8 +111,12 @@ def test_recency_boost_orders_recent_first(monkeypatch):
     _wipe()
     old = "The nightly capacity report lists shard rebalance targets for the cluster"
     new = "Capacity planning notes: shard rebalance target moved after the incident review"
-    memory.retain(OWNER, "semantic", old, occurred_at="2024-01-01T00:00:00Z")
-    memory.retain(OWNER, "semantic", new, occurred_at="2026-10-03T00:00:00Z")
+    # Timestamps are relative to NOW: recall scores recency against the current clock, so fixed dates
+    # would decay (a 2026-10-03 doc is ~0 boost by 2027) and the assertion would degrade to a tie-break.
+    now = dt.datetime.now(dt.timezone.utc)
+    fmt = "%Y-%m-%dT%H:%M:%SZ"
+    memory.retain(OWNER, "semantic", old, occurred_at=(now - dt.timedelta(days=800)).strftime(fmt))
+    memory.retain(OWNER, "semantic", new, occurred_at=(now - dt.timedelta(days=1)).strftime(fmt))
 
     monkeypatch.setattr(memory, "RECENCY_WEIGHT", 5.0)
     # the recency arm only orders the FUSED list; the (default-on) cross-encoder rerank replaces
@@ -133,6 +137,10 @@ def test_recency_boost_orders_recent_first(monkeypatch):
     d_flat = f[new]["score"] - f[old]["score"]
     assert abs((d_boost - d_flat) - (b[new]["recency"] - b[old]["recency"])) < 1e-9
     assert d_boost > 0, (d_boost, d_flat)
+    # `new` is 1 day old: decay ~0.999, so its boost is ~5/61 = 0.082 whatever today's date is, while the
+    # RRF gap between two docs is ~1e-3. Require a margin so this can never be a tie-break again.
+    assert b[new]["recency"] > 0.9 * 5.0 / (memory.RANK_CONSTANT + 1), b[new]["recency"]
+    assert d_boost > abs(d_flat) + 0.05, (d_boost, d_flat)
 
 
 def test_recency_boost_unit_fixed_timestamps(monkeypatch):
