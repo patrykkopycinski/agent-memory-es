@@ -114,6 +114,10 @@ def test_oversized_size_is_rejected_on_every_http_surface():
 
 
 def test_library_callers_cannot_push_num_candidates_past_the_es_limit(monkeypatch):
+    """A direct memory.recall() caller bypasses the HTTP bound; the in-function clamp is the
+    last line of defence for both the ES size and num_candidates."""
     bodies = _recall_bodies(monkeypatch, "es", size=10**6)
-    knn = next(b for b in bodies if "retriever" in b)["retriever"]["rrf"]["retrievers"][1]["knn"]
-    assert knn["num_candidates"] <= ES_MAX_NUM_CANDIDATES
+    rrf = next(b for b in bodies if "retriever" in b)
+    assert rrf["retriever"]["rrf"]["retrievers"][1]["knn"]["num_candidates"] <= ES_MAX_NUM_CANDIDATES
+    assert all(b["size"] <= memory.MAX_RECALL_SIZE * 5 for b in bodies if "size" in b), bodies
+    assert rrf["size"] <= memory.MAX_RECALL_SIZE * 5

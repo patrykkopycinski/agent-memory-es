@@ -14,6 +14,8 @@ import sys
 import urllib.error
 import urllib.request
 
+MAX_RECALL_SIZE = 50   # keep equal to backend app.memory.MAX_RECALL_SIZE (a test pins it)
+
 TOOLS = [
     {
         "name": "ames_recall",
@@ -26,7 +28,8 @@ TOOLS = [
                 "query": {"type": "string", "description": "natural-language search"},
                 "kinds": {"type": "array", "items": {"type": "string",
                           "enum": ["episodic", "semantic", "procedural"]}},
-                "size": {"type": "integer", "default": 8},
+                "size": {"type": "integer", "default": 8, "minimum": 1,
+                         "maximum": MAX_RECALL_SIZE},
             },
             "required": ["query"],
         },
@@ -70,7 +73,7 @@ def dispatch(url: str, key: str, name: str, args: dict) -> dict:
     if name == "ames_recall":
         return http(url, key, "/memory/recall",
                     {"query": args["query"], "kinds": args.get("kinds"),
-                     "size": args.get("size", 8)})
+                     "size": min(max(int(args.get("size", 8)), 1), MAX_RECALL_SIZE)})
     if name == "ames_retain":
         return http(url, key, "/memory/retain",
                     {"kind": args["kind"], "text": args["text"],
