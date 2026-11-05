@@ -59,7 +59,7 @@ class RetainIn(BaseModel):
 class RecallIn(BaseModel):
     query: str
     kinds: Optional[list] = None
-    size: int = 8
+    size: int = Field(8, ge=1, le=memory.MAX_RECALL_SIZE)
     min_score: Optional[float] = None
     as_of: Optional[str] = None     # ISO-8601 instant the query is asked (cause 3)
     per_doc: Optional[int] = None   # max passages per source doc_group (default 3)
@@ -339,6 +339,13 @@ def rerank_ep(body: RerankIn, who: dict = Depends(caller)):
     return out
 
 
+def _bounded_size(size) -> int:
+    """Same bound as RecallIn.size for the dict-bodied MCP surface (no pydantic model there)."""
+    if isinstance(size, bool) or not isinstance(size, int) or not 1 <= size <= memory.MAX_RECALL_SIZE:
+        raise ValueError(f"size must be an integer in 1..{memory.MAX_RECALL_SIZE}")
+    return size
+
+
 @app.post("/mcp/tools/{tool}")
 def mcp_tool(tool: str, body: dict, who: dict = Depends(caller)):
     """Minimal MCP-style tools surface (JSON in/out) for coding-farm clients."""
@@ -347,7 +354,7 @@ def mcp_tool(tool: str, body: dict, who: dict = Depends(caller)):
                                           b.get("visibility", "private"),
                                           b.get("occurred_at"), b.get("doc_group")),
         "recall": lambda b: memory.recall(who["owner_id"], b["query"], b.get("kinds"),
-                                          b.get("size", 8), b.get("min_score"),
+                                          _bounded_size(b.get("size", 8)), b.get("min_score"),
                                           b.get("as_of"), b.get("per_doc"), b.get("rerank"),
                                           rerank_depth=b.get("rerank_depth"),
                                           min_similarity=b.get("min_similarity")),
