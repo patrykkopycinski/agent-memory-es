@@ -108,6 +108,12 @@ class UpdateIn(BaseModel):
 class DeleteIn(BaseModel):
     kind: str
     doc_id: str
+    retract: bool = False               # also tombstone the semantic text ("wrong, never record again")
+
+
+class UnrejectIn(BaseModel):
+    text: Optional[str] = None          # lift every tombstone that would block retaining this text
+    source_id: Optional[str] = None     # or those a retracting delete recorded for this doc id
 
 
 class ExistsIn(BaseModel):
@@ -207,9 +213,9 @@ def _superseded_409(e: "memory.SupersededError") -> HTTPException:
 
 
 @app.delete("/memory/{kind}/{doc_id}")
-def delete_memory(kind: str, doc_id: str, who: dict = Depends(caller)):
+def delete_memory(kind: str, doc_id: str, retract: bool = False, who: dict = Depends(caller)):
     try:
-        return memory.delete(who["owner_id"], kind, doc_id)
+        return memory.delete(who["owner_id"], kind, doc_id, retract)
     except ValueError as e:
         raise HTTPException(422, str(e))
     except PermissionError:
@@ -271,13 +277,21 @@ def update(body: UpdateIn, who: dict = Depends(caller)):
 @app.post("/memory/delete")
 def delete(body: DeleteIn, who: dict = Depends(caller)):
     try:
-        return memory.delete(who["owner_id"], body.kind, body.doc_id)
+        return memory.delete(who["owner_id"], body.kind, body.doc_id, body.retract)
     except memory.SupersededError as e:
         raise _superseded_409(e) from None
     except LookupError as e:
         raise HTTPException(404, str(e))
     except (ValueError, PermissionError) as e:
         raise HTTPException(422 if isinstance(e, ValueError) else 403, str(e))
+
+
+@app.post("/memory/unreject")
+def unreject(body: UnrejectIn, who: dict = Depends(caller)):
+    try:
+        return memory.unreject(who["owner_id"], body.text, body.source_id)
+    except ValueError as e:
+        raise HTTPException(422, str(e))
 
 
 @app.post("/memory/consolidate")
@@ -418,7 +432,9 @@ def mcp_tool(tool: str, body: dict, who: dict = Depends(caller)):
         "update": lambda b: memory.update(who["owner_id"], b["kind"], b["doc_id"],
                                           b.get("text"), b.get("tags"),
                                           b.get("visibility"), b.get("occurred_at")),
-        "delete": lambda b: memory.delete(who["owner_id"], b["kind"], b["doc_id"]),
+        "delete": lambda b: memory.delete(who["owner_id"], b["kind"], b["doc_id"],
+                                          b.get("retract", False)),
+        "unreject": lambda b: memory.unreject(who["owner_id"], b.get("text"), b.get("source_id")),
     }
     if tool not in handlers:
         raise HTTPException(404, f"unknown tool {tool}; available: {sorted(handlers)}")
