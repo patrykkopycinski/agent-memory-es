@@ -183,3 +183,38 @@ def test_process_retry_uses_cached_facts_and_best_passage():
     assert semantic[0]["source_id"] == "p2"
     assert semantic[0]["doc_group"] == "group"
     assert semantic[0]["valid_from"] == "2021-04-02T16:30:00Z"
+
+
+def _process_semantic_docs(source_extra):
+    docs = {}
+    source = {"owner_id": "alice", "visibility": "private", "active": True,
+              "occurred_at": "2021-04-02T16:30:00Z", "doc_group": "group", "passages_total": 1,
+              **source_extra}
+
+    def fake_es(method, path, body=None):
+        if path.endswith("_search"):
+            return {"hits": {"hits": [{"_id": "p1", "_source": {"text": "Alice lives in Paris."}}]}}
+        if path.endswith("/_doc/p1"):
+            return {"_source": source}
+        if method == "GET":
+            raise RuntimeError('ES GET -> 404: {"_index":"s","_id":"k","found":false}')
+        docs[path] = body
+        return {}
+    with patch.object(facts, "es", fake_es), \
+         patch.object(facts, "_extract", lambda text, date: [f"[{date}] Alice lives in Paris."]), \
+         patch.object(facts.embeddings, "embed", return_value=[[0.1]]), \
+         patch.object(facts, "_replacement_ids", return_value=[]):
+        facts.process("p1", "alice")
+    return [v for k, v in docs.items() if f"/{facts.idx('semantic')}/_create/" in k]
+
+
+def test_derived_facts_inherit_the_sources_tags():
+    (fact,) = _process_semantic_docs({"tags": ["probe:qa", "project:x"]})
+    assert fact["tags"] == ["probe:qa", "project:x"]
+
+
+def test_untagged_source_gives_facts_without_a_tags_key():
+    (fact,) = _process_semantic_docs({})
+    assert "tags" not in fact
+    (fact,) = _process_semantic_docs({"tags": []})
+    assert "tags" not in fact

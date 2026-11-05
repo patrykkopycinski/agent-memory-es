@@ -395,6 +395,8 @@ def process(source_id, owner_id, abort=None):
                    "entities": [], "occurred_at": source["occurred_at"], "active": True,
                    "valid_from": date, "doc_group": source.get("doc_group", source_id),
                    "supersedes": replacements}
+            if source.get("tags"):
+                doc["tags"] = list(source["tags"])      # tag-based cleanup must reach derived facts
             check_abort()
             try:
                 es("PUT", f"/{idx('semantic')}/_create/{fact_id}?refresh=true", doc)
