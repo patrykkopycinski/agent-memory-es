@@ -211,3 +211,18 @@ def test_retain_caps_text_length():
 
 def teardown_module(_m):
     _clean()
+
+
+def test_admin_keys_maps_unwritable_key_store_to_503(tmp_path, monkeypatch):
+    d = tmp_path / "ro"
+    d.mkdir()
+    monkeypatch.setenv("AMES_API_KEYS_FILE", str(d / "keys.json"))
+    monkeypatch.setenv("AMES_ADMIN_TOKEN", "s3cret-tg")
+    d.chmod(0o500)
+    try:
+        r = TestClient(app, raise_server_exceptions=False).post(
+            "/admin/keys?owner_id=x", headers={"X-Admin-Token": "s3cret-tg"})
+    finally:
+        d.chmod(0o700)
+    assert r.status_code == 503, r.text
+    assert "not writable" in r.text and str(tmp_path) not in r.text, r.text

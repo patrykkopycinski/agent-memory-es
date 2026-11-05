@@ -100,7 +100,12 @@ def mint_key(owner_id: str, role: str = "member", _admin: str = Header(None, ali
         raise HTTPException(403, "key minting disabled: AMES_ADMIN_TOKEN is not set")
     if not _admin or not hmac.compare_digest(_admin.encode(), expected.encode()):
         raise HTTPException(403, "bad admin token")
-    return {"api_key": auth.create_key(owner_id, role), "owner_id": owner_id}
+    try:
+        return {"api_key": auth.create_key(owner_id, role), "owner_id": owner_id}
+    except auth.KeyStoreNotWritable as exc:
+        # path/errno stay server-side; the client only learns the store is unavailable
+        logging.getLogger("ames.auth").error("%s", exc)
+        raise HTTPException(503, "key store not writable") from None
 
 
 @app.get("/memory/facts/drain")

@@ -218,3 +218,114 @@ def test_save_uses_unique_temp_name_and_fsyncs_file_and_dir(tmp_path, monkeypatc
     assert all(s != "keys.json.tmp" and s.startswith(".ames_keys.") and s.endswith(".tmp") for s in sources)
     # per save: the temp file (regular) is fsynced before the rename, then the directory
     assert [stat.S_ISREG(m) for m in synced] == [True, False, True, False]
+
+
+# --- best-effort migration in owner_of never blocks and is memoized -----------------------
+
+def _legacy_store(tmp_path, monkeypatch, name="keys.json"):
+    token = "ame_" + "9" * 64
+    keys_file = tmp_path / name
+    keys_file.write_text(json.dumps({"hermes-default": token}))
+    monkeypatch.setattr(auth, "_keys_file", lambda: str(keys_file))
+    return keys_file, token
+
+
+def test_owner_of_legacy_file_not_blocked_by_writer_holding_guard(tmp_path, monkeypatch):
+    import threading
+    import time
+    keys_file, token = _legacy_store(tmp_path, monkeypatch)
+    held, release = threading.Event(), threading.Event()
+
+    def writer():
+        with auth._guard():
+            held.set()
+            release.wait(10)
+
+    t = threading.Thread(target=writer)
+    t.start()
+    assert held.wait(5)
+    try:
+        t0 = time.monotonic()
+        who = auth.owner_of(token)
+        elapsed = time.monotonic() - t0
+    finally:
+        release.set()
+        t.join()
+    assert who == {"owner_id": "hermes-default", "role": "owner"}
+    assert elapsed < 0.1, f"owner_of blocked {elapsed:.2f}s behind a writer"
+
+
+def test_owner_of_blocked_by_another_process_flock_returns_fast(tmp_path, monkeypatch):
+    import fcntl
+    import threading
+    import time
+    keys_file, token = _legacy_store(tmp_path, monkeypatch)
+    out = {}
+
+    def lookup():
+        t0 = time.monotonic()
+        out["who"] = auth.owner_of(token)
+        out["elapsed"] = time.monotonic() - t0
+
+    with open(str(keys_file) + ".lock", "a") as other:  # separate open file description
+        fcntl.flock(other, fcntl.LOCK_EX)
+        t = threading.Thread(target=lookup, daemon=True)
+        t.start()
+        t.join(2)  # a blocking flock would hang here until `other` is released
+        hung = t.is_alive()
+    t.join(5)
+    assert not hung, "owner_of blocked behind another process's flock"
+    assert out["who"]["owner_id"] == "hermes-default"
+    assert out["elapsed"] < 0.1, f"owner_of took {out['elapsed']:.2f}s"
+
+
+def test_owner_of_readonly_legacy_store_attempts_migration_once(tmp_path, monkeypatch):
+    d = tmp_path / "ro"
+    d.mkdir()
+    keys_file, token = _legacy_store(d, monkeypatch)
+    attempts = []
+    real = auth._try_guard
+    monkeypatch.setattr(auth, "_try_guard", lambda: (attempts.append(1), real())[1])
+    d.chmod(0o500)
+    try:
+        for _ in range(100):
+            assert auth.owner_of(token)["owner_id"] == "hermes-default"  # type: ignore[index]
+    finally:
+        d.chmod(0o700)
+    assert len(attempts) == 1, f"{len(attempts)} guard attempts for 100 lookups"
+
+
+def test_owner_of_retries_migration_after_file_change_or_backoff(tmp_path, monkeypatch):
+    keys_file, token = _legacy_store(tmp_path, monkeypatch)
+    attempts = []
+    real = auth._try_guard
+    monkeypatch.setattr(auth, "_try_guard", lambda: (attempts.append(1), real())[1])
+    # first attempt skipped: pretend the guard is busy by pre-recording nothing and
+    # holding the thread lock so _try_guard yields False
+    with auth._lock:
+        auth.owner_of(token)
+        auth.owner_of(token)
+    assert len(attempts) == 1
+    # file change (size) -> new attempt allowed
+    keys_file.write_text(json.dumps({"hermes-default": token, "other": "ame_" + "8" * 64}))
+    with auth._lock:
+        auth.owner_of(token)
+    assert len(attempts) == 2
+    # same file version, but the backoff window elapsed -> allowed again
+    real_mono = auth.time.monotonic
+    monkeypatch.setattr(auth.time, "monotonic", lambda: real_mono() + auth._MIGRATE_BACKOFF_S + 1)
+    with auth._lock:
+        auth.owner_of(token)
+    assert len(attempts) == 3
+
+
+def test_owner_of_migration_still_persists_when_uncontended_and_keeps_deletes(tmp_path, monkeypatch):
+    keys_file, token = _legacy_store(tmp_path, monkeypatch)
+    minted = auth.create_key("bob")  # create_key migrates under the guard
+    assert auth.owner_of(token)["owner_id"] == "hermes-default"  # type: ignore[index]
+    assert auth.delete_key(minted) is True
+    on_disk = json.loads(keys_file.read_text())
+    import hashlib
+    assert hashlib.sha256(token.encode()).hexdigest() in on_disk
+    assert hashlib.sha256(minted.encode()).hexdigest() not in on_disk
+    assert auth.owner_of(minted) is None

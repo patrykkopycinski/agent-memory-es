@@ -8,6 +8,7 @@ import os
 import secrets
 import tempfile
 import threading
+import time
 from typing import Optional
 
 _lock = threading.Lock()
@@ -69,7 +70,11 @@ class KeyStoreNotWritable(OSError):
 def _guard():
     """Serialize load-modify-save: threading.Lock within a process, flock on a sidecar file
     across processes (backend and any other writer sharing the key volume). Writer paths
-    only: readers must not take it (see owner_of)."""
+    only: readers must not take it (see owner_of).
+
+    makedirs lives here, and in _save, on purpose: create_key is what creates the key store
+    directory on first use. Never move it onto a read path (owner_of/_read/load_readonly):
+    lookups on a missing or read-only store must neither create nor fail."""
     with _lock:
         path = _keys_file()
         try:
@@ -83,6 +88,38 @@ def _guard():
                 yield
             finally:
                 fcntl.flock(lf, fcntl.LOCK_UN)
+
+
+@contextlib.contextmanager
+def _try_guard():
+    """Non-blocking _guard for best-effort writers on a hot path. Yields True when both the
+    thread lock and the file lock were taken without waiting; yields False (and does
+    nothing) when either is busy or the lock file cannot be opened. No makedirs: the
+    caller has just read the key file, so the directory exists."""
+    if not _lock.acquire(blocking=False):
+        yield False
+        return
+    try:
+        try:
+            lf = open(_keys_file() + ".lock", "a")
+        except OSError:
+            lf = None
+        locked = False
+        if lf is not None:
+            try:
+                fcntl.flock(lf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                locked = True
+            except OSError:
+                pass
+        try:
+            yield locked
+        finally:
+            if lf is not None:
+                if locked:
+                    fcntl.flock(lf, fcntl.LOCK_UN)
+                lf.close()
+    finally:
+        _lock.release()
 
 
 def _save(keys: dict) -> None:
@@ -124,16 +161,40 @@ def create_key(owner_id: str, role: str = "member") -> str:
     return token
 
 
+# Best-effort legacy migration is attempted at most once per (file version, backoff window)
+# per path, so a read-only or contended store costs one failed attempt, not one per request.
+_MIGRATE_BACKOFF_S = 60.0
+_migrate_attempts: dict = {}  # path -> ((st_mtime_ns, st_size), monotonic time of attempt)
+
+
+def _migration_due(path: str) -> bool:
+    try:
+        st = os.stat(path)
+    except OSError:
+        return False
+    sig = (st.st_mtime_ns, st.st_size)
+    now = time.monotonic()
+    prev = _migrate_attempts.get(path)
+    if prev and prev[0] == sig and now - prev[1] < _MIGRATE_BACKOFF_S:
+        return False
+    _migrate_attempts[path] = (sig, now)
+    return True
+
+
 def owner_of(token: str) -> Optional[dict]:
     if not token:
         return None
     digest = hashlib.sha256(token.encode()).hexdigest()
     # lock-free: _save is an atomic os.replace, so a reader sees a whole old or new file
     keys = _read()
-    if _normalize_legacy(keys):
-        try:  # persist the migration best-effort; the in-memory result already answers this lookup
-            with _guard():
-                _load()
+    if _normalize_legacy(keys) and _migration_due(_keys_file()):
+        # persist the migration best-effort and never wait for it: the in-memory result
+        # already answers this lookup. _load re-reads inside the guard, so a key deleted
+        # since our read stays deleted.
+        try:
+            with _try_guard() as got:
+                if got:
+                    _load()
         except OSError:
             pass
     return keys.get(digest)
