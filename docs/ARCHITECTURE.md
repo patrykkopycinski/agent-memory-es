@@ -42,7 +42,7 @@ Every document carries the same envelope (`store.py` MAPPINGS):
 - **Identity**: API key → `owner_id` + role (`auth.py`, keyfile `data/api_keys.json`). The owner is *never* a request argument.
 - **Read filter** (`memory.py:_visibility_filter`): `owner_id == caller OR visibility ∈ {team, common}` — applied to both retrieval arms, so a client cannot widen visibility.
 - **Write guard** (`memory.py:guard_promotion`): deterministic marker regex blocks promoting a private memory that contains sensitive markers (api key, token, secret, …) to team/common. Same text, same decision — no classifier involved.
-- **Rejection tombstones** (`tombstone.py`): the user's "forget this / that's wrong" verdicts block re-learning the same value at retain time.
+- **Rejection tombstones** (`tombstone.py`): the user's "that's wrong, never record it again" verdicts block re-learning the same value at retain time. Three separate intents: `delete` removes a memory and writes no tombstone (duplicate, stale wording, test write); `delete` with `retract=true` also tombstones a semantic memory; `POST /memory/unreject` (owner-only, by `text` with the same matching rule as the retain check, or by `source_id`) lifts tombstones again.
 
 ## Recall pipeline
 

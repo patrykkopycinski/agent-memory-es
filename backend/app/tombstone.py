@@ -151,6 +151,33 @@ def _hit(s: dict, terms: set, key: str) -> bool:
     return len(rterms) >= MIN_FUZZY_TERMS and len(terms & rterms) / len(rterms) >= 0.8
 
 
+def _scan(owner_id: str, terms: set, first_only: bool) -> tuple[list, bool]:
+    """The owner's tombstones that block a text with these (non-empty) terms, as raw ES hits,
+    plus whether the paged scan hit MAX_PAGES before checking them all (capped)."""
+    _ensure_index()
+    key = _key(terms)
+    should = [{"term": {"value_key": key}}]
+    if len(terms) <= TERMS_CHUNK:
+        should.append({"terms_set": {"terms": {
+            "terms": sorted(terms), "minimum_should_match_script": {"source": _MIN_MATCH}}}})
+    body = {"size": PAGE, "sort": [{"value_key": "asc"}, {"_doc": "asc"}],
+            "query": {"bool": {"filter": [{"term": {"owner_id": owner_id}}]}}}
+    if len(terms) <= TERMS_CHUNK:
+        body["query"]["bool"].update(should=should, minimum_should_match=1)
+    found = []
+    for _ in range(MAX_PAGES):
+        hits = es("POST", f"/{PREFIX}am_rejected/_search", body)["hits"]["hits"]
+        for h in hits:
+            if _hit(h["_source"], terms, key):
+                found.append(h)
+                if first_only:
+                    return found, False
+        if len(hits) < PAGE:
+            return found, False
+        body["search_after"] = hits[-1]["sort"]
+    return found, True
+
+
 def is_rejected(owner_id: str, text: str) -> dict | None:
     """Return the rejection record if this value was rejected for this owner.
     Matches exact term-set, or (for tombstones with >= MIN_FUZZY_TERMS terms) a
@@ -167,23 +194,63 @@ def is_rejected(owner_id: str, text: str) -> dict | None:
     terms = _terms(text)
     if not terms:
         return None
-    _ensure_index()
-    key = _key(terms)
-    should = [{"term": {"value_key": key}}]
-    if len(terms) <= TERMS_CHUNK:
-        should.append({"terms_set": {"terms": {
-            "terms": sorted(terms), "minimum_should_match_script": {"source": _MIN_MATCH}}}})
+    found, capped = _scan(owner_id, terms, first_only=True)
+    if found:
+        return found[0]["_source"]
+    if capped:
+        return {"reason": f"tombstone check exceeded {MAX_PAGES * PAGE} candidates; failing closed",
+                "value_key": _key(terms), "owner_id": owner_id, "capacity": True}
+    return None
+
+
+def blockers(owner_id: str, text: str) -> list:
+    """Ids and sources of every tombstone of this owner that is_rejected() would match for
+    this text. Raises ValueError when the scan cap is hit: lifting a partial set would leave
+    the text blocked while reporting success."""
+    terms = _terms(text)
+    if not terms:
+        return []
+    found, capped = _scan(owner_id, terms, first_only=False)
+    if capped:
+        raise ValueError(
+            f"owner has more than {MAX_PAGES * PAGE} candidate tombstones for this text; "
+            "use source_id or shorten the text")
+    return [{"_id": h["_id"], **h["_source"]} for h in found]
+
+
+def by_source(owner_id: str, source_id: str) -> list:
+    """Ids and sources of this owner's tombstones recorded for source_id. Same fail-closed cap
+    as blockers(); [] when am_rejected does not exist."""
     body = {"size": PAGE, "sort": [{"value_key": "asc"}, {"_doc": "asc"}],
-            "query": {"bool": {"filter": [{"term": {"owner_id": owner_id}}]}}}
-    if len(terms) <= TERMS_CHUNK:
-        body["query"]["bool"].update(should=should, minimum_should_match=1)
+            "query": {"bool": {"filter": [{"term": {"owner_id": owner_id}},
+                                          {"term": {"source_id": source_id}}]}}}
+    found = []
     for _ in range(MAX_PAGES):
-        hits = es("POST", f"/{PREFIX}am_rejected/_search", body)["hits"]["hits"]
-        for h in hits:
-            if _hit(h["_source"], terms, key):
-                return h["_source"]
+        try:
+            hits = es("POST", f"/{PREFIX}am_rejected/_search", body)["hits"]["hits"]
+        except RuntimeError as e:
+            if _is_missing_index(e):
+                return []
+            raise
+        found += [{"_id": h["_id"], **h["_source"]} for h in hits]
         if len(hits) < PAGE:
-            return None
+            return found
         body["search_after"] = hits[-1]["sort"]
-    return {"reason": f"tombstone check exceeded {MAX_PAGES * PAGE} candidates; failing closed",
-            "value_key": key, "owner_id": owner_id, "capacity": True}
+    raise ValueError(f"owner has more than {MAX_PAGES * PAGE} tombstones for this source_id")
+
+
+def lift(owner_id: str, ids: list) -> int:
+    """Delete this owner's tombstones by ES id. The owner term is always part of the query, so
+    another owner's tombstone is never touched. Returns the number deleted (0 when am_rejected
+    does not exist)."""
+    if not ids:
+        return 0
+    try:
+        r = es("POST", f"/{PREFIX}am_rejected/_delete_by_query?refresh=true&conflicts=proceed",
+               {"query": {"bool": {"filter": [{"term": {"owner_id": owner_id}},
+                                              {"ids": {"values": ids}}]}}})
+    except RuntimeError as e:
+        if _is_missing_index(e):
+            return 0
+        raise
+    return r.get("deleted", 0)
