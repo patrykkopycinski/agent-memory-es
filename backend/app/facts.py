@@ -30,6 +30,13 @@ class BackfillHeartbeatAbort(RuntimeError):
     """Scope lease renewal failed; do not charge the source's retry budget."""
 
 
+class SourceGone(Exception):
+    """The source doc is missing (404), soft-deleted, or owned by someone else: nothing to
+    extract, ever. A terminal skip, not a failure: it must not consume the retry budget."""
+
+
+SKIP_MESSAGE = "skipped: source inactive, missing, or owner mismatch"
+
 LEASE_SECONDS = 3600  # generic-worker lease; upstream calls have bounded retry budgets
 # Backfill claims use short leases for both scope and job; the heartbeat renews
 # only this holder's minted job token. Dead holders become claimable after at most
@@ -351,9 +358,14 @@ def process(source_id, owner_id, abort=None):
             raise BackfillHeartbeatAbort("backfill heartbeat abort (lease renewal failed)")
 
     check_abort()
-    source = es("GET", f"/{idx('episodic')}/_doc/{source_id}")["_source"]
+    try:
+        source = es("GET", f"/{idx('episodic')}/_doc/{source_id}")["_source"]
+    except RuntimeError as exc:
+        if "-> 404" in str(exc):
+            raise SourceGone(SKIP_MESSAGE) from exc
+        raise
     if source["owner_id"] != owner_id or not source.get("active", True):
-        raise ValueError("source missing, inactive, or owner mismatch")
+        raise SourceGone(SKIP_MESSAGE)
     date = _date(source["occurred_at"])
     passages = _passages(source_id, source)
     for fact in _document_facts(passages, date):
@@ -414,6 +426,9 @@ def run_once(owner_id=None, job_id=None, on_claim=None, on_finish=None, abort=No
             raise BackfillHeartbeatAbort("backfill heartbeat abort (lease renewal failed)")
     except BackfillHeartbeatAbort:
         _finish(job_id, token, "pending", next_at=_iso(_now()))
+    except SourceGone:
+        log.info("fact extraction job %s: %s", job_id, SKIP_MESSAGE)
+        _finish(job_id, token, "completed", error=SKIP_MESSAGE, finished_at=_iso(_now()))
     except Exception as exc:
         if abort is not None and abort.is_set():
             _finish(job_id, token, "pending", next_at=_iso(_now()))
