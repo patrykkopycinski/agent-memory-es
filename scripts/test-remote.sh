@@ -2,10 +2,11 @@
 # Run the full AMES backend pytest suite from this machine on a remote docker host (default m1max)
 # against a THROWAWAY Elasticsearch, and gate on "no NEW failures vs a base ref".
 #
-#   scripts/test-remote.sh [--ref REF] [--base REF] [--host SSH] [--port N] [--keep-es] [-- pytest args]
+#   scripts/test-remote.sh [--repo DIR] [--ref REF] [--base REF] [--host SSH] [--port N] [--keep-es] [-- pytest args]
 #   scripts/test-remote.sh --collect RUN_ID      re-attach to a run (local runner died / ssh dropped)
 #   scripts/test-remote.sh --abort RUN_ID        kill a run and clean the host
 #
+#   --repo  git checkout to archive refs from (default: the checkout this script lives in)
 #   --ref   commit to test (default HEAD)             --base  also run BASE; exit 1 on NEW failures vs it
 #   --host  ssh alias (default $AMES_TEST_HOST|m1max) --port  host-local ES port (default 9291)
 #   --keep-es  leave the ES container (and the ops-claim) in place after the run
@@ -27,11 +28,12 @@
 # Logs: ~/.cache/ames-test-remote/<ref>-<time>/  (run.log, junit-*.xml, head.log, base.log)
 set -uo pipefail
 
-REF=HEAD BASE="" HOST=${AMES_TEST_HOST:-m1max} PORT=9291 KEEP_ES=0 MODE=run RUN_ARG=""
+REPO="" REF=HEAD BASE="" HOST=${AMES_TEST_HOST:-m1max} PORT=9291 KEEP_ES=0 MODE=run RUN_ARG=""
 PYARGS=()
-usage() { sed -n 2,26p "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n 2,27p "$0" | sed 's/^# \{0,1\}//'; }
 while [ $# -gt 0 ]; do
   case "$1" in
+    --repo) REPO=${2:?--repo needs a value}; shift 2;;
     --ref) REF=${2:?--ref needs a value}; shift 2;;
     --base) BASE=${2:?--base needs a value}; shift 2;;
     --host) HOST=${2:?--host needs a value}; shift 2;;
@@ -50,7 +52,7 @@ case "$PORT" in
 esac
 
 HERE=$(cd "$(dirname "$0")" && pwd)
-REPO=$(git -C "$HERE" rev-parse --show-toplevel) || { echo "not inside a git checkout"; exit 64; }
+REPO=$(git -C "${REPO:-$HERE}" rev-parse --show-toplevel) || { echo "not inside a git checkout"; exit 64; }
 SSHOPT=(-o ConnectTimeout=10 -o BatchMode=yes -o ServerAliveInterval=5 -o ServerAliveCountMax=3)
 SSH=(ssh -n "${SSHOPT[@]}" "$HOST")     # no stdin: safe inside loops/pipes
 SSHI=(ssh "${SSHOPT[@]}" "$HOST")       # reads stdin: for tar / env.sh uploads
