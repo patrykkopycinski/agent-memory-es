@@ -1,6 +1,7 @@
 """Elasticsearch client + index management for agent-memory-es."""
 import json
 import os
+import re
 import urllib.error
 import urllib.request
 from typing import Any, Optional
@@ -103,6 +104,16 @@ def _guard_path(path: str, method: str) -> None:
                 f"ES test guard: refusing {method} {path} — index {index!r} "
                 f"does not start with required test prefix {PREFIX!r}. This "
                 "would hit non-test data; check AMES_INDEX_PREFIX.")
+
+
+_DOC_MISS = re.compile(r'"found"\s*:\s*false')
+
+
+def is_doc_miss(exc) -> bool:
+    """A document-level 404 (`{"found": false}`). An index-level 404 (`index_not_found_exception`)
+    is an infrastructure fault, not a missing document: callers must not read it as "absent"."""
+    text = str(exc)
+    return "-> 404" in text and bool(_DOC_MISS.search(text))
 
 
 def es(method: str, path: str, body: Optional[dict] = None, timeout: float = 30) -> dict:

@@ -12,7 +12,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from . import auth, embeddings, memory, pages as pages_mod, mental_models as mm_mod, reranker, tagfilter, facts
-from .store import KINDS, ensure_indices
+from .store import KINDS, ensure_indices, is_doc_miss
 
 app = FastAPI(title="agent-memory-es", version="0.2.0")
 
@@ -206,7 +206,7 @@ def delete_memory(kind: str, doc_id: str, who: dict = Depends(caller)):
     except LookupError as e:
         raise HTTPException(404, str(e)) from None
     except RuntimeError as e:
-        if "-> 404:" in str(e):
+        if is_doc_miss(e):
             raise HTTPException(404, "memory not found") from None
         raise
 

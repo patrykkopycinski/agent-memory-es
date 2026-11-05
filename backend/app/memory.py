@@ -11,7 +11,7 @@ import urllib.parse
 import uuid
 from typing import Any, Optional
 
-from .store import KINDS, es, idx, ensure_indices, ensure_indices_once, knn_num_candidates
+from .store import KINDS, es, idx, is_doc_miss, ensure_indices, ensure_indices_once, knn_num_candidates
 from . import embeddings
 from . import tagfilter as _tf
 from . import tombstone
@@ -525,7 +525,7 @@ def _get_source(kind: str, doc_id: str) -> dict:
     try:
         return es("GET", f"/{idx(kind)}/_doc/{_q(doc_id)}")["_source"]
     except RuntimeError as e:
-        if "-> 404" in str(e):
+        if is_doc_miss(e):          # an index-level 404 is a broken store, not "no such doc"
             raise LookupError(f"no such {kind} doc: {doc_id}") from e
         raise
 

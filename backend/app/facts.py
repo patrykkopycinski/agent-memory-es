@@ -11,7 +11,7 @@ import threading
 
 from . import embeddings, llm
 from . import http_retry
-from .store import es, idx, PREFIX, knn_num_candidates
+from .store import es, idx, is_doc_miss, PREFIX, knn_num_candidates
 
 log = logging.getLogger(__name__)
 QUEUE = f"{PREFIX}am_fact_jobs"
@@ -36,14 +36,7 @@ class SourceGone(Exception):
 
 
 SKIP_MESSAGE = "skipped: source inactive, missing, or owner mismatch"
-_DOC_MISS = re.compile(r'"found"\s*:\s*false')
-
-
-def _is_doc_miss(exc) -> bool:
-    """A document-level 404 (`{"found": false}`). An index-level 404 (`index_not_found_exception`)
-    is an infrastructure fault, not a gone source: skipping it would silently complete every job."""
-    text = str(exc)
-    return "-> 404" in text and bool(_DOC_MISS.search(text))
+_is_doc_miss = is_doc_miss
 
 LEASE_SECONDS = 3600  # generic-worker lease; upstream calls have bounded retry budgets
 # Backfill claims use short leases for both scope and job; the heartbeat renews
