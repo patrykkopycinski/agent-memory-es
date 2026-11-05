@@ -185,6 +185,8 @@ def test_recall_rejects_unknown_kinds_and_clamps_size():
     r = client.post("/memory/recall", headers=H(VK),
                     json={"query": "x", "kinds": ["semantic", "am_rejected"]})
     assert r.status_code == 422, r.text
+    r = client.post("/memory/recall", headers=H(VK), json={"query": "x", "size": 5_000_000})
+    assert r.status_code == 422, r.text     # oversized size is rejected at the edge, not clamped
     seen = []
     real = memory.es
 
@@ -195,7 +197,7 @@ def test_recall_rejects_unknown_kinds_and_clamps_size():
     memory.es = spy
     try:
         r = client.post("/memory/recall", headers=H(VK),
-                        json={"query": "x", "kinds": ["semantic"] * 500, "size": 5_000_000})
+                        json={"query": "x", "kinds": ["semantic"] * 500, "size": memory.MAX_RECALL_SIZE})
     finally:
         memory.es = real
     assert r.status_code == 200, r.text
