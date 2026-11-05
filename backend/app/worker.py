@@ -1,10 +1,16 @@
 """Consolidation worker loop: periodic dedup/supersede + mental-model draft
 proposals (never auto-promoted) across all owners."""
+import logging
 import os
 import time
 
-from . import auth, memory, mental_models as mm
-from .store import es, idx
+from . import auth, embeddings, memory, mental_models as mm
+from .store import KINDS, es, idx
+
+log = logging.getLogger(__name__)
+
+# Max vectorless docs the re-embed sweep repairs per tick (oldest first).
+REEMBED_BATCH = int(os.environ.get("AMES_REEMBED_BATCH", "50"))
 
 # '1'/'true' enable worker model-draft proposals; anything else disables.
 def _drafts_enabled() -> bool:
@@ -114,6 +120,46 @@ def run_once() -> dict:
     return stats
 
 
+def reembed_sweep(batch: int = 0) -> dict:
+    """Embed active docs that were stored without a vector (the embedder was down or still
+    loading at write time) and update them in place. Bounded: at most `batch` docs per call,
+    oldest first. Skipped while the embedder is degraded or loading. Each update carries
+    if_seq_no/if_primary_term, so a doc edited or deleted since the search is skipped (409)."""
+    batch = batch or REEMBED_BATCH
+    try:
+        embeddings.probe()
+    except Exception as exc:  # ModelLoading, ModelUnavailable, a dead backend: all mean "not now"
+        return {"skipped": embeddings.describe_error(exc), "embedded": 0, "conflicts": 0}
+    found = []
+    for kind in KINDS:
+        r = es("POST", f"/{idx(kind)}/_search", {
+            "size": batch, "seq_no_primary_term": True, "_source": ["text", "occurred_at"],
+            "sort": [{"occurred_at": "asc"}],
+            "query": {"bool": {"filter": [{"term": {"active": True}}],
+                               "must_not": [{"exists": {"field": "embedding"}}]}}})
+        for h in r["hits"]["hits"]:
+            if h["_source"].get("text"):
+                found.append((h["_source"].get("occurred_at") or "", kind, h))
+    found.sort(key=lambda t: t[0])
+    found = found[:batch]
+    result = {"found": len(found), "embedded": 0, "conflicts": 0}
+    if not found:
+        return result
+    vectors = embeddings.embed([h["_source"]["text"] for _, _, h in found])
+    for (_, kind, h), vec in zip(found, vectors):
+        try:
+            es("POST", f"/{idx(kind)}/_update/{h['_id']}"
+                       f"?if_seq_no={h['_seq_no']}&if_primary_term={h['_primary_term']}",
+               {"doc": {"embedding": vec}})
+            result["embedded"] += 1
+        except RuntimeError as exc:
+            if "-> 409:" not in str(exc):
+                raise
+            result["conflicts"] += 1
+    log.info("reembed sweep: %s", result)
+    return result
+
+
 def run_forever(interval_s: int = 0):
     interval_s = interval_s or int(os.environ.get("AMES_CONSOLIDATE_INTERVAL", "600"))
     while True:
@@ -121,6 +167,10 @@ def run_forever(interval_s: int = 0):
             print(time.strftime("%H:%M:%S"), run_once(), flush=True)
         except Exception as e:  # noqa: BLE001 — worker must never die
             print(time.strftime("%H:%M:%S"), "worker error:", e, flush=True)
+        try:
+            print(time.strftime("%H:%M:%S"), "reembed", reembed_sweep(), flush=True)
+        except Exception as e:  # noqa: BLE001 — a failed sweep must not stop consolidation
+            print(time.strftime("%H:%M:%S"), "reembed error:", e, flush=True)
         time.sleep(interval_s)
 
 
