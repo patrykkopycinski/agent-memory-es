@@ -280,7 +280,7 @@ FIXED=$(comm -13 "$LOGDIR/fail-head.txt" "$LOGDIR/fail-base.txt")
 NEWSKIP=$(comm -23 "$LOGDIR/skip-head.txt" "$LOGDIR/skip-base.txt")
 echo "===== NEW failures/errors vs base (gate):"; indent "${NEW:-<none>}"
 echo "===== fixed vs base:"; indent "${FIXED:-<none>}"
-echo "===== pre-existing (fail on both):"; indent "$(comm -12 "$LOGDIR/fail-head.txt" "$LOGDIR/fail-base.txt")"
+echo "===== pre-existing (fail on both):"; indent "$(comm -12 "$LOGDIR/fail-head.txt" "$LOGDIR/fail-base.txt" | grep . || echo "<none>")"
 echo "===== newly skipped vs base (informational; check none was passing on base):"; indent "${NEWSKIP:-<none>}"
 NNEW=$(printf '%s' "$NEW" | grep -c . || true)
 echo "===== RESULT head_rc=$HRC base_rc=$BRC head_tests=$HN base_tests=$BN head_skipped=$HS base_skipped=$BS head_collection_errors=$HCE new=$NNEW"

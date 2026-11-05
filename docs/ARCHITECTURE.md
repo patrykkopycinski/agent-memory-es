@@ -98,7 +98,7 @@ scripts/test-remote.sh --collect RUN_ID     # re-attach after a dropped ssh / ki
 scripts/test-remote.sh --abort RUN_ID
 ```
 
-- Ships the whole repo at `--ref` (and `--base`) with `git archive` (tests load `../../scripts/*`), starts `ames-review-es-<port>` (ES 9.6, 1 GB heap) and runs pytest in a container from the prod backend image (`docker inspect ames-backend`) with `AMES_EMBED_BACKEND=local` and a per-run `amtest_` index prefix.
+- Ships the whole repo at `--ref` (and `--base`) with `git archive` (tests load `../../scripts/*`), starts `ames-review-es-<port>` (ES 9.6, 1 GB heap) and runs pytest in a container from the prod backend image (`docker inspect ames-backend`) with `AMES_EMBED_BACKEND=local`, a per-run `amtest_` index prefix and a non-root user (permission tests are meaningless as root). The throwaway ES starts its own trial license (RRF retrievers need one).
 - Takes the ops-claim `<host>:ames-review-es` (exit 75 when held), refuses with exit 70 below `AMES_TEST_MIN_FREE_MB` (4096) free memory, and always removes its containers, trees and claim on exit.
 - With `--base` it prints NEW / fixed / pre-existing failure sets and exits 1 on any NEW failure. `AMES_MIN_TESTS` (50) is a positive control: a run that executed fewer tests fails.
 - Exit codes: 0 green, 1 failures, 64 refused (bad args, reserved ports 9200/9220/9268/9279), 70 infra, 75 busy. Logs and junit land in `~/.cache/ames-test-remote/`.

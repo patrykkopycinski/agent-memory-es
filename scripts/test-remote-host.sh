@@ -75,6 +75,10 @@ for _ in $(seq 1 90); do
 done
 [ $ok = 1 ] || { RESULT="infra ES on $ES not healthy after 3 min"; exit 70; }
 log "ES healthy: $ES"
+# RRF retrievers need a non-basic license (403 "license is non-compliant" otherwise). The ES is
+# throwaway, so start its own 30-day trial; this touches nothing but this container.
+curl -s -m 20 -XPOST "$ES/_license/start_trial?acknowledge=true" | tr -d '\n' | cut -c1-120 | sed 's/^/  license: /'
+echo
 
 # ---- 2. the prod backend image already carries every runtime dependency
 BACKEND_IMAGE=$(docker inspect -f '{{.Config.Image}}' ames-backend 2>/dev/null)
@@ -119,14 +123,17 @@ run_suite() { # label sha
   status "running $label"
   log "pytest $label @ ${sha:0:7} prefix=$pfx args: ${ARGS[*]}"
   # No --rm: the container is the durable record of the run until its log is copied out.
-  docker run -d --name "$name" --memory "$CONTAINER_MEM" \
+  # Non-root: tests that chmod a dir unwritable (auth store, key store) only mean something when
+  # the process is not root. HOME/PYTHONUSERBASE give `pip install --user` a writable place.
+  docker run -d --name "$name" --memory "$CONTAINER_MEM" --user "$(id -u):$(id -g)" \
+    -e HOME=/tmp/home -e PYTHONUSERBASE=/tmp/pyuser -e PATH="/tmp/pyuser/bin:/usr/local/bin:/usr/bin:/bin" \
     --add-host host.docker.internal:host-gateway \
     -v "$tree:/repo" -v "$OUT:/out" ${MODEL_MOUNT[@]+"${MODEL_MOUNT[@]}"} -w /repo/backend \
     -e PYTHONDONTWRITEBYTECODE=1 -e AMES_INDEX_PREFIX="$pfx" -e AMES_EMBED_BACKEND=local \
     -e AMES_ES_URL="http://host.docker.internal:$PORT" -e FIX2_ES="http://host.docker.internal:$PORT" \
     -e AMES_HTTP_RETRY_BUDGET_S="${AMES_HTTP_RETRY_BUDGET_S:-2}" \
     -e AMES_REQUIRE_MODEL="$REQUIRE_MODEL" -e AMES_TEST_MODEL_CACHE=/models \
-    "$BACKEND_IMAGE" sh -c 'pip install -q pytest >/dev/null 2>&1
+    "$BACKEND_IMAGE" sh -c 'mkdir -p /tmp/home; pip install -q --user pytest >/dev/null 2>&1
       t=$1; shift
       exec timeout "$t" python -m pytest "$@"' sh \
     "$SUITE_TIMEOUT_S" "${ARGS[@]}" \
