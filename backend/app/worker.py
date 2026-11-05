@@ -124,25 +124,26 @@ def reembed_sweep(batch: int = 0) -> dict:
     """Embed active docs that were stored without a vector (the embedder was down or still
     loading at write time) and update them in place. Bounded: at most `batch` docs per call,
     oldest first. Skipped while the embedder is degraded or loading. Each update carries
-    if_seq_no/if_primary_term, so a doc edited or deleted since the search is skipped (409)."""
+    if_seq_no/if_primary_term, so a doc edited since the search is skipped (409 -> "conflicts")
+    and a doc hard-deleted since the search is skipped too (404 document_missing_exception ->
+    "gone"); any other error raises."""
     batch = batch or REEMBED_BATCH
     try:
         embeddings.probe()
     except Exception as exc:  # ModelLoading, ModelUnavailable, a dead backend: all mean "not now"
-        return {"skipped": embeddings.describe_error(exc), "embedded": 0, "conflicts": 0}
+        return {"skipped": embeddings.describe_error(exc), "embedded": 0, "conflicts": 0, "gone": 0}
     found = []
     for kind in KINDS:
         r = es("POST", f"/{idx(kind)}/_search", {
             "size": batch, "seq_no_primary_term": True, "_source": ["text", "occurred_at"],
             "sort": [{"occurred_at": "asc"}],
-            "query": {"bool": {"filter": [{"term": {"active": True}}],
+            "query": {"bool": {"filter": [{"term": {"active": True}}, {"exists": {"field": "text"}}],
                                "must_not": [{"exists": {"field": "embedding"}}]}}})
         for h in r["hits"]["hits"]:
-            if h["_source"].get("text"):
-                found.append((h["_source"].get("occurred_at") or "", kind, h))
+            found.append((h["_source"].get("occurred_at") or "", kind, h))
     found.sort(key=lambda t: t[0])
     found = found[:batch]
-    result = {"found": len(found), "embedded": 0, "conflicts": 0}
+    result = {"found": len(found), "embedded": 0, "conflicts": 0, "gone": 0}
     if not found:
         return result
     vectors = embeddings.embed([h["_source"]["text"] for _, _, h in found])
@@ -153,9 +154,13 @@ def reembed_sweep(batch: int = 0) -> dict:
                {"doc": {"embedding": vec}})
             result["embedded"] += 1
         except RuntimeError as exc:
-            if "-> 409:" not in str(exc):
+            text = str(exc)
+            if "-> 409:" in text:
+                result["conflicts"] += 1
+            elif "-> 404" in text and "document_missing_exception" in text:
+                result["gone"] += 1      # not store.is_doc_miss: this 404 body has no found:false
+            else:
                 raise
-            result["conflicts"] += 1
     log.info("reembed sweep: %s", result)
     return result
 
