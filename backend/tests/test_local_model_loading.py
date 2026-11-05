@@ -16,6 +16,7 @@ import _safety  # noqa: F401
 import pytest
 
 from app import embeddings  # noqa: E402
+from model_cache import require_runtime  # noqa: E402
 
 BACKEND = os.path.join(os.path.dirname(__file__), "..")
 REV = embeddings.LOCAL_MODEL_REVISION
@@ -194,8 +195,7 @@ def unpinned(monkeypatch):
 
 
 def test_auto_detect_prefers_local_when_model_dir_is_valid(tmp_path, monkeypatch, unpinned):
-    pytest.importorskip("onnxruntime")
-    pytest.importorskip("tokenizers")
+    require_runtime()
     _write_model(str(tmp_path))
     monkeypatch.setattr(embeddings, "LOCAL_MODEL_DIR", str(tmp_path))
     monkeypatch.setattr(embeddings, "_es_embed", lambda t: pytest.fail("probed ES"))

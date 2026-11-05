@@ -45,8 +45,8 @@ def _unavailable(reason):
     pytest.skip(reason)
 
 
-def model_or_skip(spec):
-    """Return (session, tokenizer) for `spec`, or skip (fail under AMES_REQUIRE_MODEL=1)."""
+def require_runtime():
+    """Skip (fail under AMES_REQUIRE_MODEL=1) when onnxruntime or tokenizers cannot be imported."""
     for module in ("onnxruntime", "tokenizers"):
         if require_model():
             try:
@@ -55,6 +55,11 @@ def model_or_skip(spec):
                 _unavailable(f"{module} is not installed")
         else:
             pytest.importorskip(module)
+
+
+def model_or_skip(spec):
+    """Return (session, tokenizer) for `spec`, or skip (fail under AMES_REQUIRE_MODEL=1)."""
+    require_runtime()
     dest = os.path.join(CACHE, spec["name"])
     if embeddings.model_problem(dest, spec["revision"]):
         if _files_match(dest, spec["sha256"]):
