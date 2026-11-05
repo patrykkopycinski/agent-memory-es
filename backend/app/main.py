@@ -431,6 +431,8 @@ def _compute_health() -> dict:
     try:
         embeddings.probe()
         embed_error = None
+    except embeddings.ModelLoading:
+        embed_error = "loading"
     except Exception as exc:
         embed_error = embeddings.describe_error(exc)
     body = {"ok": embed_error is None, "kinds": list(KINDS), "embed_ok": embed_error is None,
@@ -445,6 +447,8 @@ def _compute_health() -> dict:
 
 
 def _store_health(body: dict) -> None:
+    if body.get("embed_error") == "loading":
+        return      # transient: caching it would keep /health/ready at 503 after the load finishes
     with _health_state_lock:
         _health.update(at=time.monotonic(), body=body)
 

@@ -73,6 +73,10 @@ class ModelUnavailable(RuntimeError):
     """The local embedding model is missing or is not the pinned revision. Never auto-fetched."""
 
 
+class ModelLoading(RuntimeError):
+    """The local model is still being loaded by another thread (startup warm-up)."""
+
+
 def fetch_allowed() -> bool:
     """Runtime downloads are opt-in (AMES_LOCAL_MODEL_ALLOW_FETCH=1), for tests and dev checkouts
     only. Production bakes the model into the image and never reaches for the network."""
@@ -221,6 +225,12 @@ def embed(texts: list) -> list:
 def probe() -> None:
     """One embed for /health: a single attempt with a PROBE_TIMEOUT_S cap, never http_retry's
     multi-minute budget (a dead backend must not hang the health endpoint). Raises on failure."""
+    if backend() == "local" and _local is None:
+        # Another thread is building the ONNX session: report "loading" now rather than queueing
+        # on _local_lock for the whole load (a watchdog's curl -m 10 would give up first).
+        if not _local_lock.acquire(blocking=False):
+            raise ModelLoading("local embedding model is loading")
+        _local_lock.release()
     _probe_ctx.active = True
     try:
         embed(["probe"])

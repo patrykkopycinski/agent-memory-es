@@ -299,3 +299,53 @@ def test_startup_hook_schedules_the_warmup_after_ensure_indices_and_survives_thr
         raise RuntimeError("can't start new thread")
     monkeypatch.setattr(threading.Thread, "start", no_start)
     main._startup()                                           # a failed warm-up thread must not fail startup
+
+
+def _hold_local_load(monkeypatch):
+    """Start a real _local_model() load that parks inside load_local, holding _local_lock."""
+    import threading
+    entered, release = threading.Event(), threading.Event()
+    monkeypatch.setattr(embeddings, "backend", lambda: "local")
+    monkeypatch.setattr(embeddings, "_local", None)
+
+    def slow_load(*a, **kw):
+        entered.set()
+        release.wait(10)
+        return ("session", "tokenizer")
+    monkeypatch.setattr(embeddings, "load_local", slow_load)
+    loader = threading.Thread(target=embeddings._local_model, daemon=True)
+    loader.start()
+    assert entered.wait(5), "load never started"
+    return release, loader
+
+
+def test_health_answers_loading_at_once_while_the_local_model_loads(monkeypatch):
+    """/health must not queue on _local_lock for the whole load: it answers 200 + degraded with
+    embed_error 'loading', /health/ready is 503, and the transient body is not cached, so both
+    recover as soon as the load finishes."""
+    import time
+    release, loader = _hold_local_load(monkeypatch)
+    try:
+        t = time.monotonic()
+        r = client.get("/health")
+        assert time.monotonic() - t < 3, "health waited for the model load"
+        assert r.status_code == 200
+        body = r.json()
+        assert body["degraded"] is True and body["embed_ok"] is False and body["embed_error"] == "loading"
+        assert client.get("/health/ready").status_code == 503
+    finally:
+        release.set()
+        loader.join(5)
+    monkeypatch.setattr(embeddings, "embed", lambda texts: [[0.0]])
+    assert embeddings._local is not None
+    assert client.get("/health/ready").status_code == 200       # 'loading' was not cached
+    assert client.get("/health").json()["degraded"] is False
+
+
+def test_probe_with_the_model_loaded_does_not_report_loading(monkeypatch):
+    """Negative control: a held lock is irrelevant once the model is in memory."""
+    monkeypatch.setattr(embeddings, "backend", lambda: "local")
+    monkeypatch.setattr(embeddings, "_local", ("session", "tokenizer"))
+    monkeypatch.setattr(embeddings, "embed", lambda texts: [[0.0]])
+    with embeddings._local_lock:
+        embeddings.probe()
