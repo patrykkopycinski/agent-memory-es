@@ -391,6 +391,12 @@ def _bounded_size(size) -> int:
     return size
 
 
+def _exists_size(size) -> int:
+    if isinstance(size, bool) or not isinstance(size, int) or not 1 <= size <= 20:
+        raise HTTPException(422, "size must be an integer in 1..20")
+    return size
+
+
 @app.post("/mcp/tools/{tool}")
 def mcp_tool(tool: str, body: dict, who: dict = Depends(caller)):
     """Minimal MCP-style tools surface (JSON in/out) for coding-farm clients."""
@@ -404,7 +410,7 @@ def mcp_tool(tool: str, body: dict, who: dict = Depends(caller)):
                                           rerank_depth=b.get("rerank_depth"),
                                           min_similarity=b.get("min_similarity")),
         "exists": lambda b: memory.exists(who["owner_id"], b.get("kind"), b.get("tags"),
-                                          b.get("text"), b.get("size", 5)),
+                                          b.get("text"), _exists_size(b.get("size", 5))),
         "reflect": lambda b: memory.reflect(who["owner_id"], b["question"]),
         "promote": lambda b: memory.promote(who["owner_id"], b["kind"], b["doc_id"], b["to_visibility"]),
         "update": lambda b: memory.update(who["owner_id"], b["kind"], b["doc_id"],
@@ -417,7 +423,7 @@ def mcp_tool(tool: str, body: dict, who: dict = Depends(caller)):
     try:
         return {"result": handlers[tool](body)}
     except memory.SupersededError as e:
-        return {"error": str(e), "live_id": e.live_id}
+        raise _superseded_409(e) from None
     except (ValueError, PermissionError) as e:
         return {"error": str(e)}
 

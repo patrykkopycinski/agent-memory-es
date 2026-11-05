@@ -27,7 +27,8 @@ class FakeEs:
         if kind == "term":
             return src.get(field) == want
         if kind == "exists":
-            return bool(src.get(want)) if field == "field" else pytest.fail(f"clause {clause}")
+            # ES `exists` matches a present empty string; only a missing/null field is absent
+            return src.get(want) is not None if field == "field" else pytest.fail(f"clause {clause}")
         pytest.fail(f"FakeEs does not understand {clause}")
 
     def __call__(self, method, path, body=None, timeout=30):
@@ -106,15 +107,15 @@ def test_a_409_is_skipped_not_raised(monkeypatch, healthy):
     assert [w[0] for w in fake.writes] == ["d1", "d2"]
 
 
-def test_sweep_selects_only_active_textful_vectorless_docs_oldest_first(monkeypatch, healthy):
+def test_sweep_selects_only_active_vectorless_docs_with_a_text_field_oldest_first(monkeypatch, healthy):
     docs = [_doc(1, active=False), _doc(2, embedding=[1.0]), _doc(3, text=""), _doc(4),
             _doc(6, occurred="2026-11-05T03:37:0%dZ"), _doc(5)]
     del docs[2]["_source"]["text"]                  # no text field at all
-    docs.append(_doc(7, text=""))
+    docs.append(_doc(7, text=""))                   # ES `exists` matches "": selected, embedded like any text
     fake = _use(monkeypatch, FakeEs(docs))
     out = worker.reembed_sweep()
-    assert [w[0] for w in fake.writes] == ["d4", "d5", "d6"]       # oldest first
-    assert out["embedded"] == 3
+    assert [w[0] for w in fake.writes] == ["d4", "d5", "d6", "d7"]  # oldest first; d3 has no text field
+    assert out["embedded"] == 4
 
 
 def test_search_query_asks_for_active_textful_vectorless_oldest_first(monkeypatch, healthy):

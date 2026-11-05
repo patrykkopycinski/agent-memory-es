@@ -550,14 +550,16 @@ def _is_superseded(s: dict) -> bool:
     return bool(s.get("superseded_by")) and (s.get("active") is False or bool(s.get("valid_to")))
 
 
+MAX_SUPERSEDE_HOPS = 10
+
+
 def _live_successor(kind: str, s: dict) -> Optional[str]:
-    """Follow superseded_by to the first doc still in service. Bounded + cycle-safe."""
-    seen = set()
+    """Follow superseded_by to the first doc still in service. The hop bound is the only guard:
+    a cycle or an over-long chain exhausts it and yields None."""
     nxt = s.get("superseded_by")
-    for _ in range(10):
-        if not nxt or nxt in seen:
+    for _ in range(MAX_SUPERSEDE_HOPS):
+        if not nxt:
             return None
-        seen.add(nxt)
         try:
             cur = _get_source(kind, nxt)
         except LookupError:
@@ -879,7 +881,11 @@ CONF_COS_LO = _env_float("AMES_CONF_COS_LO", 0.80)
 CONF_COS_HI = _env_float("AMES_CONF_COS_HI", 0.90)
 CONF_BM25_K = _env_float("AMES_CONF_BM25_K", 10.0)
 CONF_VEC_WEIGHT = _env_float("AMES_CONF_VEC_WEIGHT", 0.6)
-ABSTAIN_CONFIDENCE = _env_float("AMES_ABSTAIN_CONFIDENCE", 0.35)   # abstain_hint below this
+# 0.35 is deliberately conservative: it never hides an answerable query (0/24 false abstains across
+# two independent probe sets, both fusion modes) but catches only ~58-62% of hard negatives
+# (on-topic, answer not stored). Raising it trades answerable recall for them (see the sweep in
+# the P2 review notes), so deployments that prefer precision set AMES_ABSTAIN_CONFIDENCE.
+ABSTAIN_CONFIDENCE = _env_float("AMES_ABSTAIN_CONFIDENCE", 0.35)
 
 
 def _confidence(bm25: Optional[float], cosine: Optional[float], have_vec: bool) -> float:
@@ -1025,6 +1031,8 @@ def recall(owner_id: str, query: str, kinds=None, size: int = 8,
         if qvec is not None and fusion_mode() == "es_rrf":
             body = {
                 "size": fetch,
+                # ES 9.x drops dense_vector from _source by default; confidence needs the stored vector.
+                "_source": {"includes": ["*", "embedding"]},
                 "retriever": {"rrf": {
                     "retrievers": [{"standard": {"query": lexical_query}}, {"knn": knn}],
                     "rank_constant": RANK_CONSTANT,

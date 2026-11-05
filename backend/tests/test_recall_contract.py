@@ -89,6 +89,25 @@ PROBES = [
 ]
 
 
+# Hard negatives: on-topic queries (they share vocabulary with a stored doc) whose answer is NOT
+# stored. Written against CORPUS only; not tuned to any score.
+HARD_NEGATIVES = [
+    "what is the weight capacity of the harbour crane",
+    "what is the price of a sourdough loaf at the bakery",
+    "how many partitions does the orders-v2 kafka topic have",
+    "who is on call for the platform team this week",
+    "which region holds the postgres backup archive bucket",
+    "what is the ssh key passphrase for the bastion host",
+    "who approved the last production deploy freeze exception",
+    "how old is Patryk's cat Biscuit",
+    "which bank pays out the approved invoices",
+    "which certificate authority issued the internal wildcard certificate",
+    "what was Anna's finishing position at the Warsaw marathon",
+    "which flyway version do we run for schema migrations",
+]
+PROBES_HARD = PROBES + [(q, None) for q in HARD_NEGATIVES]
+
+
 def auc(scores, labels):
     """Mann-Whitney AUC with average ranks for ties; P(random positive outranks random negative)."""
     order = sorted(range(len(scores)), key=lambda i: scores[i])
@@ -103,6 +122,17 @@ def auc(scores, labels):
     pos = [r for r, l in zip(ranks, labels) if l]
     n1, n0 = len(pos), len(labels) - len(pos)
     return (sum(pos) - n1 * (n1 + 1) / 2.0) / (n1 * n0)
+
+
+@pytest.fixture(scope="module", params=["app", "es"])
+def fusion(request):
+    """Run every recall-quality test under both fusion modes: es_rrf hides the per-arm scores, so
+    its confidence comes from the stored vector, which ES only returns when asked for it."""
+    mp = pytest.MonkeyPatch()
+    mp.setenv("AMES_FUSION", request.param)
+    assert memory.fusion_mode() == ("es_rrf" if request.param == "es" else "app_rrf")
+    yield request.param
+    mp.undo()
 
 
 @pytest.fixture(scope="module")
@@ -124,13 +154,18 @@ def _top_conf(out):
 
 
 @pytest.fixture(scope="module")
-def probe_run(corpus_ids):
+def probe_run(corpus_ids, fusion):
     rows = []
-    for q, key in PROBES:
+    for q, key in PROBES_HARD:
         out = _recall(q)
-        rows.append({"q": q, "key": key, "out": out, "conf": _top_conf(out),
+        rows.append({"q": q, "key": key, "hard": (q, key) not in PROBES, "out": out, "conf": _top_conf(out),
                      "top_is_expected": bool(out["results"]) and out["results"][0]["id"] == corpus_ids.get(key)})
     return rows
+
+
+def _subset(rows, hard):
+    """Answerable probes plus either the easy negatives or the hard negatives."""
+    return [r for r in rows if r["key"] or r["hard"] == hard]
 
 
 # ── confidence ───────────────────────────────────────────────────────────────────────────────
@@ -146,10 +181,20 @@ def test_answerable_probe_ranks_expected_doc_first(probe_run):
     assert sum(r["top_is_expected"] for r in answerable) >= len(answerable) - 1   # label sanity
 
 
-def test_confidence_auc_separates_answerable_from_abstain(probe_run, capsys):
-    scores = [r["conf"] for r in probe_run]
-    labels = [r["key"] is not None for r in probe_run]
-    real = auc(scores, labels)
+def _auc_of(rows):
+    return auc([r["conf"] for r in rows], [r["key"] is not None for r in rows])
+
+
+def _abstain_acc(rows, thr):
+    """Share of probes where `max confidence < thr` agrees with the label."""
+    return sum((r["conf"] < thr) == (r["key"] is None) for r in rows) / len(rows)
+
+
+def test_confidence_auc_separates_answerable_from_abstain(probe_run, fusion, capsys):
+    easy, hard, allp = _subset(probe_run, False), _subset(probe_run, True), probe_run
+    real = _auc_of(allp)
+    labels = [r["key"] is not None for r in allp]
+    scores = [r["conf"] for r in allp]
     rng = random.Random(20261105)
     shuffled = []
     for _ in range(500):
@@ -158,20 +203,40 @@ def test_confidence_auc_separates_answerable_from_abstain(probe_run, capsys):
         shuffled.append(auc(scores, perm))
     mean_shuf = sum(shuffled) / len(shuffled)
     with capsys.disabled():
-        print(f"\nP2 PROBE: n={len(PROBES)} AUC real={real:.3f} shuffled-mean={mean_shuf:.3f} "
-              f"(500 seeded shuffles)")
-        for r in sorted(probe_run, key=lambda r: -r["conf"]):
+        print(f"\nP2 PROBE [{fusion}]: AUC easy-only={_auc_of(easy):.3f} (n={len(easy)})  "
+              f"hard-only={_auc_of(hard):.3f} (n={len(hard)})  all={real:.3f} (n={len(allp)})  "
+              f"shuffled-mean={mean_shuf:.3f}")
+        print(f"  abstain accuracy @{memory.ABSTAIN_CONFIDENCE}: easy={_abstain_acc(easy, memory.ABSTAIN_CONFIDENCE):.2f} "
+              f"hard={_abstain_acc(hard, memory.ABSTAIN_CONFIDENCE):.2f} all={_abstain_acc(allp, memory.ABSTAIN_CONFIDENCE):.2f}")
+        for r in sorted(allp, key=lambda r: -r["conf"]):
             print(f"  conf={r['conf']:.3f} hint={r['out']['abstain_hint']!s:5} "
-                  f"{'ANSWER ' if r['key'] else 'ABSTAIN'} {r['q']}")
-    assert real >= 0.8, f"confidence AUC {real:.3f} < 0.8"
+                  f"{'ANSWER' if r['key'] else 'HARD-N' if r['hard'] else 'EASY-N'} {r['q']}")
+    assert _auc_of(easy) >= 0.8 and real >= 0.8, f"confidence AUC easy={_auc_of(easy):.3f} all={real:.3f} < 0.8"
     assert 0.45 <= mean_shuf <= 0.55, f"negative control: shuffled-label AUC {mean_shuf:.3f} should be ~0.5"
 
 
-def test_abstain_hint_fires_on_unanswerable_not_on_answerable(probe_run):
+def test_confidence_is_nonzero_for_answerable_probes_in_every_fusion_mode(probe_run, fusion):
+    """Regression for es_rrf: ES 9.x omits dense_vector from _source, which zeroed every confidence."""
     answerable = [r for r in probe_run if r["key"]]
-    abstain = [r for r in probe_run if not r["key"]]
+    assert sum(r["conf"] > 0.3 for r in answerable) >= len(answerable) - 1, [r["conf"] for r in answerable]
+
+
+def test_abstain_hint_fires_on_off_topic_not_on_answerable(probe_run, fusion):
+    answerable = [r for r in probe_run if r["key"]]
+    easy_neg = [r for r in probe_run if not r["key"] and not r["hard"]]
     assert sum(not r["out"]["abstain_hint"] for r in answerable) >= len(answerable) - 2
-    assert sum(r["out"]["abstain_hint"] for r in abstain) >= len(abstain) - 2
+    assert sum(r["out"]["abstain_hint"] for r in easy_neg) >= len(easy_neg) - 2
+
+
+def test_abstain_hint_is_only_a_hint_results_are_not_filtered(corpus_ids, fusion):
+    weak = [q for q, key in PROBES if key is None]
+    seen = 0
+    for q in weak:
+        out = _recall(q)
+        if out["abstain_hint"] is True and out["results"]:
+            seen += 1
+            assert all(h["confidence"] < memory.ABSTAIN_CONFIDENCE for h in out["results"])   # hint is honest
+    assert seen >= 3, "need weak queries that return hits while abstain_hint is true"
 
 
 def test_abstain_hint_is_true_for_empty_result(corpus_ids):
@@ -237,6 +302,25 @@ def test_exists_via_mcp_tools_surface():
     assert r.json()["result"]["exists"] is True
 
 
+@pytest.mark.parametrize("bad", [[5], {"n": 5}, "5", True, 0, 21, 2.5])
+def test_mcp_exists_rejects_a_malformed_size_with_422_not_500(bad):
+    r = client.post("/mcp/tools/exists", headers=H, json={"text": CORPUS["cat"], "size": bad})
+    assert r.status_code == 422, (bad, r.status_code, r.text)
+
+
+def test_exists_excludes_superseded_and_inactive_docs():
+    old = _retain("exists-excl probe - the lighthouse keeper starts at dusk", tags=["probe:exclusion"])["_id"]
+    new = _retain("exists-excl probe - the lighthouse keeper starts at dawn", tags=["probe:exclusion"])["_id"]
+    by_text = {"text": "exists-excl probe - the lighthouse keeper starts at dusk"}
+    assert client.post("/memory/exists", headers=H, json=by_text).json()["count"] == 1
+    memory._supersede(OWNER, old, new)                                # old: active=false + superseded_by
+    assert client.post("/memory/exists", headers=H, json=by_text).json()["exists"] is False
+    by_tag = client.post("/memory/exists", headers=H, json={"tags": ["probe:exclusion"]}).json()
+    assert [m["id"] for m in by_tag["matches"]] == [new] and by_tag["count"] == 1
+    es("POST", f"/{idx('semantic')}/_update/{new}?refresh=true", {"doc": {"active": False}})   # inactive, not superseded
+    assert client.post("/memory/exists", headers=H, json={"tags": ["probe:exclusion"]}).json()["exists"] is False
+
+
 # ── superseded ids: 409 + live_id ────────────────────────────────────────────────────────────
 def _supersede_chain():
     a = _retain("supersede chain v1 - release train departs from platform nine")["_id"]
@@ -266,13 +350,30 @@ def test_delete_on_superseded_id_is_409_and_deletes_nothing():
     assert es("GET", f"/{idx('semantic')}/_doc/{c}")["found"] is True
 
 
-def test_superseded_cycle_does_not_hang_and_reports_no_live_id():
-    a = _retain("cycle probe one - the ferry leaves at dusk")["_id"]
-    b = _retain("cycle probe two - the ferry leaves at dawn")["_id"]
-    for x, y in ((a, b), (b, a)):
+def _link(ids):
+    """ids[i] is superseded by ids[i+1]; the last one is left alone (caller closes a cycle)."""
+    for x, y in zip(ids, ids[1:]):
         es("POST", f"/{idx('semantic')}/_update/{x}?refresh=true", {"doc": {"active": False, "superseded_by": y}})
-    r = client.post("/memory/delete", headers=H, json={"kind": "semantic", "doc_id": a})
+
+
+@pytest.mark.parametrize("n", [2, 3, 7])
+def test_superseded_cycle_does_not_hang_and_reports_no_live_id(n):
+    """Cycles of any length end at the hop bound (no separate visited-set), with no live_id."""
+    ids = [_retain(f"cycle probe {n}-{i} - the ferry leaves at {i} o'clock")["_id"] for i in range(n)]
+    _link(ids + [ids[0]])
+    es("POST", f"/{idx('semantic')}/_update/{ids[-1]}?refresh=true", {"doc": {"active": False, "superseded_by": ids[0]}})
+    r = client.post("/memory/delete", headers=H, json={"kind": "semantic", "doc_id": ids[0]})
     assert r.status_code == 409 and r.json()["detail"]["live_id"] is None
+
+
+def test_chain_longer_than_the_hop_bound_reports_no_live_id_and_exactly_at_the_bound_resolves():
+    n = memory.MAX_SUPERSEDE_HOPS
+    ids = [_retain(f"long chain probe - the tram stop number {i} is closed")["_id"] for i in range(n + 2)]
+    _link(ids)                                                    # ids[-1] is the live doc
+    over = client.post("/memory/delete", headers=H, json={"kind": "semantic", "doc_id": ids[0]})
+    assert over.status_code == 409 and over.json()["detail"]["live_id"] is None        # n+1 hops
+    at_bound = client.post("/memory/delete", headers=H, json={"kind": "semantic", "doc_id": ids[1]})
+    assert at_bound.status_code == 409 and at_bound.json()["detail"]["live_id"] == ids[-1]   # n hops
 
 
 def test_near_duplicate_link_alone_does_not_block_update():
@@ -288,3 +389,22 @@ def test_foreign_owner_still_gets_403_not_409():
     a, b, c = _supersede_chain()
     r = client.post("/memory/delete", headers=HO, json={"kind": "semantic", "doc_id": a})
     assert r.status_code == 403         # no live_id leak across owners
+    assert "live_id" not in r.text and c not in r.text
+
+
+def test_foreign_owner_update_on_a_superseded_id_gets_403_and_no_live_id():
+    a, b, c = _supersede_chain()
+    for body in ({"text": "hijack"}, {"tags": ["x:y"]}):
+        r = client.post("/memory/update", headers=HO, json={"kind": "semantic", "doc_id": a, **body})
+        assert r.status_code == 403, r.text
+        assert "live_id" not in r.text and c not in r.text
+
+
+def test_mcp_tools_update_and_delete_on_a_superseded_id_are_409_with_live_id():
+    a, b, c = _supersede_chain()
+    up = client.post("/mcp/tools/update", headers=H, json={"kind": "semantic", "doc_id": a, "text": "edited"})
+    de = client.post("/mcp/tools/delete", headers=H, json={"kind": "semantic", "doc_id": b})
+    for r, sid in ((up, a), (de, b)):
+        assert r.status_code == 409, r.text
+        assert r.json()["detail"]["live_id"] == c and r.json()["detail"]["superseded"] == sid
+    assert es("GET", f"/{idx('semantic')}/_doc/{b}")["found"] is True
