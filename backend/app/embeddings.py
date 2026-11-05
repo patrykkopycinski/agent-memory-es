@@ -222,15 +222,46 @@ def embed(texts: list) -> list:
     return _es_embed(texts) if b == "es" else _or_embed(texts)
 
 
+LOAD_RETRY_S = 30                 # after a failed background load, report the error this long before retrying
+_loader = None                    # the probe-started loader thread, if any
+_load_failure = None              # (exception, monotonic time) of the last failed background load
+_loader_lock = threading.Lock()
+
+
+def _background_load() -> None:
+    global _load_failure
+    try:
+        _local_model()
+        _load_failure = None
+    except Exception as exc:
+        logging.getLogger(__name__).warning("background local model load failed", exc_info=True)
+        _load_failure = (exc, time.monotonic())
+
+
+def _ensure_background_load() -> None:
+    """Start a load unless one is already running (this loader, or another thread holding the
+    lock, e.g. the startup warm-up). Raises the last load error while it is recent."""
+    global _loader, _load_failure
+    with _loader_lock:
+        if _local_lock.locked() or (_loader is not None and _loader.is_alive()):
+            return
+        if _load_failure is not None:
+            exc, at = _load_failure
+            if time.monotonic() - at < LOAD_RETRY_S:
+                raise exc
+            _load_failure = None
+        _loader = threading.Thread(target=_background_load, daemon=True, name="embed-probe-load")
+        _loader.start()
+
+
 def probe() -> None:
     """One embed for /health: a single attempt with a PROBE_TIMEOUT_S cap, never http_retry's
     multi-minute budget (a dead backend must not hang the health endpoint). Raises on failure."""
     if backend() == "local" and _local is None:
-        # Another thread is building the ONNX session: report "loading" now rather than queueing
-        # on _local_lock for the whole load (a watchdog's curl -m 10 would give up first).
-        if not _local_lock.acquire(blocking=False):
-            raise ModelLoading("local embedding model is loading")
-        _local_lock.release()
+        # The probe never loads the model itself and never queues on _local_lock: a watchdog's
+        # curl -m 10 would give up first. Report "loading" and make sure a load is running.
+        _ensure_background_load()
+        raise ModelLoading("local embedding model is loading")
     _probe_ctx.active = True
     try:
         embed(["probe"])

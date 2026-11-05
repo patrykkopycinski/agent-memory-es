@@ -349,3 +349,65 @@ def test_probe_with_the_model_loaded_does_not_report_loading(monkeypatch):
     monkeypatch.setattr(embeddings, "embed", lambda texts: [[0.0]])
     with embeddings._local_lock:
         embeddings.probe()
+
+
+def _fake_local(monkeypatch, gate, loaded_in):
+    import threading
+    monkeypatch.setattr(embeddings, "backend", lambda: "local")
+    monkeypatch.setattr(embeddings, "_local", None)
+    monkeypatch.setattr(embeddings, "_loader", None)
+    monkeypatch.setattr(embeddings, "_load_failure", None)
+
+    def load(*a, **kw):
+        loaded_in.append(threading.current_thread())
+        gate.wait(10)
+        return ("session", "tokenizer")
+    monkeypatch.setattr(embeddings, "load_local", load)
+    monkeypatch.setattr(embeddings, "local_embed_with", lambda s, t, texts: [[0.0] for _ in texts])
+
+
+def test_probe_with_no_warmup_thread_never_loads_inline_and_recovers(monkeypatch):
+    """The startup warm-up thread may never have started, or a load may begin between the probe's
+    lock check and its embed. The probe must report 'loading' at once, load the model on a
+    background thread of its own, and report healthy once that load finishes."""
+    import threading
+    import time
+    gate, loaded_in = threading.Event(), []
+    _fake_local(monkeypatch, gate, loaded_in)
+    try:
+        t = time.monotonic()
+        body = client.get("/health").json()
+        assert time.monotonic() - t < 3, "health waited for (or ran) the model load"
+        assert body["embed_error"] == "loading" and body["degraded"] is True
+        assert client.get("/health/ready").status_code == 503
+        assert client.get("/health").json()["embed_error"] == "loading"      # still loading
+        loaders = [th for th in threading.enumerate() if th.name == "embed-probe-load"]
+        assert len(loaders) == 1, f"{len(loaders)} loader threads queued behind the load"
+    finally:
+        gate.set()
+    for _ in range(100):
+        if embeddings._local is not None:
+            break
+        time.sleep(0.05)
+    assert len(loaded_in) == 1, "one background load, not one per probe"
+    assert loaded_in[0] is not threading.current_thread() and loaded_in[0].name == "embed-probe-load"
+    again = client.get("/health").json()
+    assert again["embed_ok"] is True and "embed_error" not in again
+    assert client.get("/health/ready").status_code == 200
+
+
+def test_probe_reports_a_failed_background_load_instead_of_loading_forever(monkeypatch):
+    import threading
+    import time
+    _fake_local(monkeypatch, threading.Event(), [])
+
+    def broken(*a, **kw):
+        raise embeddings.ModelUnavailable("model files missing at /nowhere")
+    monkeypatch.setattr(embeddings, "load_local", broken)
+    assert client.get("/health").json()["embed_error"] == "loading"           # the load starts
+    for _ in range(100):
+        if embeddings._load_failure is not None:
+            break
+        time.sleep(0.05)
+    body = client.get("/health").json()
+    assert "ModelUnavailable" in body["embed_error"] and "/nowhere" in body["embed_error"]
