@@ -377,15 +377,24 @@ def _nearest_dup(owner_id: str, kind: str, visibility: str, vec):
 RETAIN_SOFT_MAX_CHARS = 1500
 
 
+def _reject_secret(text, tags) -> None:
+    """ValueError (HTTP 422) if the text or any raw tag looks like a credential. The message names
+    the pattern, never the match. Must run before any write or delete."""
+    hit = secrets_guard.find_secret(text)
+    if hit:
+        raise ValueError(f"text looks like a secret ({hit}); remove the credential and retry")
+    hit = secrets_guard.find_secret_in_tags(tags)
+    if hit:
+        raise ValueError(f"a tag looks like a secret ({hit}); remove the credential and retry")
+
+
 def retain(owner_id: str, kind: str, text: str, visibility: str = "private",
            occurred_at: Optional[str] = None, doc_group: Optional[str] = None,
            tags: Optional[list] = None, labels: Optional[list] = None,
            extract_facts: bool = True) -> dict:
     """Write a memory, refusing text that looks like a credential (ValueError -> HTTP 422) and
     flagging over-long text with a `too_long` hint on the result (the write still happens)."""
-    kind_hit = secrets_guard.find_secret(text)
-    if kind_hit:
-        raise ValueError(f"text looks like a secret ({kind_hit}); remove the credential and retry")
+    _reject_secret(text, tags)
     out = _retain(owner_id, kind, text, visibility, occurred_at, doc_group, tags, labels,
                   extract_facts)
     if isinstance(text, str) and len(text) > RETAIN_SOFT_MAX_CHARS:
@@ -677,6 +686,7 @@ def update(owner_id: str, kind: str, doc_id: str, text=None, tags=None,
     if visibility is not None and visibility not in VISIBILITIES:
         raise ValueError(f"visibility must be one of {VISIBILITIES}")
     _check_text_size(text)
+    _reject_secret(text, tags)  # before _log_mutation and the delete: a 422 must change nothing
     group = s.get("doc_group")
     occurred = s.get("occurred_at")
     old_tags = s.get(_tf.TAG_FIELD)

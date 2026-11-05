@@ -424,6 +424,10 @@ def mcp_tool(tool: str, body: dict, who: dict = Depends(caller)):
         return {"result": handlers[tool](body)}
     except memory.SupersededError as e:
         raise _superseded_409(e) from None
+    except KeyError as e:                         # KeyError is a LookupError: a missing body field is not a 404
+        raise HTTPException(422, f"missing field: {e}") from None
+    except LookupError as e:                      # _get_source: no such doc
+        raise HTTPException(404, str(e)) from None
     except ValueError as e:                       # bad input, secret-shaped text, rejected value
         raise HTTPException(422, str(e)) from None
     except PermissionError as e:
