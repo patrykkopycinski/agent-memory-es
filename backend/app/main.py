@@ -424,8 +424,10 @@ def mcp_tool(tool: str, body: dict, who: dict = Depends(caller)):
         return {"result": handlers[tool](body)}
     except memory.SupersededError as e:
         raise _superseded_409(e) from None
-    except (ValueError, PermissionError) as e:
-        return {"error": str(e)}
+    except ValueError as e:                       # bad input, secret-shaped text, rejected value
+        raise HTTPException(422, str(e)) from None
+    except PermissionError as e:
+        raise HTTPException(403, str(e)) from None
 
 
 HEALTH_TTL_S = 60

@@ -13,6 +13,7 @@ from typing import Any, Optional
 
 from .store import KINDS, es, idx, is_doc_miss, ensure_indices, ensure_indices_once, knn_num_candidates
 from . import embeddings
+from . import secrets_guard
 from . import tagfilter as _tf
 from . import tombstone
 
@@ -372,10 +373,32 @@ def _nearest_dup(owner_id: str, kind: str, visibility: str, vec):
     return hits[0]["_id"], 2.0 * hits[0]["_score"] - 1.0
 
 
+# Soft length hint: durable facts are short and self-contained. Never rejects the write.
+RETAIN_SOFT_MAX_CHARS = 1500
+
+
 def retain(owner_id: str, kind: str, text: str, visibility: str = "private",
            occurred_at: Optional[str] = None, doc_group: Optional[str] = None,
            tags: Optional[list] = None, labels: Optional[list] = None,
            extract_facts: bool = True) -> dict:
+    """Write a memory, refusing text that looks like a credential (ValueError -> HTTP 422) and
+    flagging over-long text with a `too_long` hint on the result (the write still happens)."""
+    kind_hit = secrets_guard.find_secret(text)
+    if kind_hit:
+        raise ValueError(f"text looks like a secret ({kind_hit}); remove the credential and retry")
+    out = _retain(owner_id, kind, text, visibility, occurred_at, doc_group, tags, labels,
+                  extract_facts)
+    if isinstance(text, str) and len(text) > RETAIN_SOFT_MAX_CHARS:
+        out["too_long"] = True
+        out["too_long_hint"] = (f"text is {len(text)} chars (> {RETAIN_SOFT_MAX_CHARS}); "
+                                "durable facts should be short and self-contained")
+    return out
+
+
+def _retain(owner_id: str, kind: str, text: str, visibility: str = "private",
+            occurred_at: Optional[str] = None, doc_group: Optional[str] = None,
+            tags: Optional[list] = None, labels: Optional[list] = None,
+            extract_facts: bool = True) -> dict:
     """Write a memory. Long text is split into verbatim passages (cause 2) that share
     a `doc_group` (the caller's stable id for the source document, e.g. a session id);
     recall returns each passage with its group + occurred_at, so callers can treat a
@@ -882,7 +905,7 @@ CONF_COS_HI = _env_float("AMES_CONF_COS_HI", 0.90)
 CONF_BM25_K = _env_float("AMES_CONF_BM25_K", 10.0)
 CONF_VEC_WEIGHT = _env_float("AMES_CONF_VEC_WEIGHT", 0.6)
 # 0.35 is deliberately conservative: it never hides an answerable query (0/24 false abstains across
-# two independent probe sets, both fusion modes) but catches only ~58-62% of hard negatives
+# two independent probe sets, both fusion modes) but catches only ~50-60% of hard negatives
 # (on-topic, answer not stored). Raising it trades answerable recall for them (see the sweep in
 # the P2 review notes), so deployments that prefer precision set AMES_ABSTAIN_CONFIDENCE.
 ABSTAIN_CONFIDENCE = _env_float("AMES_ABSTAIN_CONFIDENCE", 0.35)

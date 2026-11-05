@@ -107,8 +107,8 @@ def test_oversized_size_is_rejected_on_every_http_surface():
     top = memory.MAX_RECALL_SIZE
     for bad in (top + 1, 0, -3, 5000):
         assert client.post("/memory/recall", headers=h, json={"query": "q", "size": bad}).status_code == 422, bad
-        r = client.post("/mcp/tools/recall", headers=h, json={"query": "q", "size": bad}).json()
-        assert "size must be" in r["error"], bad
+        r = client.post("/mcp/tools/recall", headers=h, json={"query": "q", "size": bad})
+        assert r.status_code == 422 and "size must be" in r.json()["detail"], bad
     assert client.post("/memory/recall", headers=h, json={"query": "q", "size": top}).status_code == 200
     assert "error" not in client.post("/mcp/tools/recall", headers=h, json={"query": "q", "size": top}).json()
 

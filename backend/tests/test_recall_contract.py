@@ -360,8 +360,23 @@ def _link(ids):
         es("POST", f"/{idx('semantic')}/_update/{x}?refresh=true", {"doc": {"active": False, "superseded_by": y}})
 
 
+@pytest.fixture
+def hard_timeout(monkeypatch):
+    """Fail (not hang) a test whose supersede walk spins. The request runs in a worker thread that
+    cannot be interrupted from outside, so the bound is a lookup budget (a correct walk needs at
+    most MAX_SUPERSEDE_HOPS + 1 reads), not a wall clock: a mutated hop bound raises here instead of looping."""
+    real, calls = memory._get_source, []
+
+    def counted(kind, doc_id):
+        calls.append(doc_id)
+        if len(calls) > 3 * 10:
+            raise AssertionError("supersede walk did not terminate: lookup budget exhausted")
+        return real(kind, doc_id)
+    monkeypatch.setattr(memory, "_get_source", counted)
+
+
 @pytest.mark.parametrize("n", [2, 3, 7])
-def test_superseded_cycle_does_not_hang_and_reports_no_live_id(n):
+def test_superseded_cycle_does_not_hang_and_reports_no_live_id(n, hard_timeout):
     """Cycles of any length end at the hop bound (no separate visited-set), with no live_id."""
     ids = [_retain(f"cycle probe {n}-{i} - the ferry leaves at {i} o'clock")["_id"] for i in range(n)]
     _link(ids + [ids[0]])
@@ -370,7 +385,7 @@ def test_superseded_cycle_does_not_hang_and_reports_no_live_id(n):
     assert r.status_code == 409 and r.json()["detail"]["live_id"] is None
 
 
-def test_chain_longer_than_the_hop_bound_reports_no_live_id_and_exactly_at_the_bound_resolves():
+def test_chain_longer_than_the_hop_bound_reports_no_live_id_and_exactly_at_the_bound_resolves(hard_timeout):
     assert memory.MAX_SUPERSEDE_HOPS == 10      # literal on purpose: the test must not move with the constant
     n = 10
     ids = [_retain(f"long chain probe - the tram stop number {i} is closed")["_id"] for i in range(n + 2)]
