@@ -90,16 +90,16 @@ Tests that need the live reflect LLM gateway (`test_hermes_adapter.py`, `test_re
 
 ### Running the whole suite on a remote host
 
-`scripts/test-remote.sh` runs the full suite from your machine on a docker host (default `m1max`) against a throwaway Elasticsearch, never against prod:
+`scripts/test-remote.sh` runs the full suite from your machine on a docker host you name (`--host` or `$AMES_TEST_HOST`; there is no default) against a throwaway Elasticsearch, never against a production one:
 
 ```
-scripts/test-remote.sh [--ref REF] [--base REF] [--host SSH] [--port 9291] [--keep-es] [-- pytest args]
-scripts/test-remote.sh --collect RUN_ID     # re-attach after a dropped ssh / killed runner
-scripts/test-remote.sh --abort RUN_ID
+scripts/test-remote.sh --host SSH [--ref REF] [--base REF] [--port 9291] [--keep-es] [-- pytest args]
+scripts/test-remote.sh --host SSH --collect RUN_ID     # re-attach after a dropped ssh / killed runner
+scripts/test-remote.sh --host SSH --abort RUN_ID
 ```
 
-- Ships the whole repo at `--ref` (and `--base`) with `git archive` (tests load `../../scripts/*`), starts `ames-review-es-<port>` (ES 9.6, 1 GB heap) and runs pytest in a container from the prod backend image (`docker inspect ames-backend`) with `AMES_EMBED_BACKEND=local`, a per-run `amtest_` index prefix and a non-root user (permission tests are meaningless as root). The throwaway ES starts its own trial license (RRF retrievers need one).
-- Takes the ops-claim `<host>:ames-review-es` (exit 75 when held), refuses with exit 70 below `AMES_TEST_MIN_FREE_MB` (4096) free memory, and always removes its containers, trees and claim on exit.
-- With `--base` it prints NEW / fixed / pre-existing failure sets and exits 1 on any NEW failure. `AMES_MIN_TESTS` (50) is a positive control: a run that executed fewer tests fails.
-- Exit codes: 0 green, 1 failures, 64 refused (bad args, reserved ports 9200/9220/9268/9279), 70 infra, 75 busy. Logs and junit land in `~/.cache/ames-test-remote/`.
-- All state is on the host, so long runs are detached and polled; the run id is printed on the first line.
+- Ships the whole repo at `--ref` (and `--base`) with `git archive` (tests load `../../scripts/*`), starts `ames-review-es-<port>` (ES 9.6, 1 GB heap) and runs pytest in a container from the backend image already on the host (`docker inspect ames-backend`) with `AMES_EMBED_BACKEND=local`, a per-run `amtest_` index prefix and a non-root user (permission tests are meaningless as root). The throwaway ES starts its own trial license (RRF retrievers need one).
+- One run at a time per host: a host-side lock dir `/tmp/ames-test-lock-<resource>` (exit 75 when held; a lock older than its 2 h TTL, or whose run dir is gone, is taken over). Optionally layer an external claim on top with `AMES_TEST_CLAIM_CMD=<claim helper on the host>` (subcommands `claim|release|journal`; its exit 1 means busy) and `AMES_TEST_CLAIM_RESOURCE` (default `<host>:ames-review-es`). Below `AMES_TEST_MIN_FREE_MB` (4096) free memory or `AMES_TEST_MIN_SWAP_FREE_MB` (512) free swap it refuses with exit 70. Containers, trees and the lock/claim are always removed on exit.
+- With `--base` it prints NEW / fixed / pre-existing failure sets and exits 1 on any NEW failure, and also on any test that passed on base but is skipped on head, except skips whose reason is the LLM-gateway probe (`tests/_llm_gate.py`; those are printed). `AMES_MIN_TESTS` (50) is a positive control: a head that executed fewer tests fails (exit 1), and a base that did (almost) nothing is exit 70 "base did not run".
+- Exit codes: 0 green, 1 failures, 64 refused (bad args, no host, reserved ports 9200/9220/9268/9279), 70 infra, 75 busy. Logs and junit land in `${AMES_TEST_LOG_DIR:-${XDG_CACHE_HOME:-~/.cache}/ames-test-remote}/`.
+- All state is on the host, so long runs are detached and polled; the run id is printed on the first line. The host driver writes `driver.pid`; if the poll (or `--collect`) finds the driver dead while the status is not terminal (SIGKILL, OOM, reboot), it runs `driver.sh --reap` on the host (removes `ames-rv-<id>-*`, the ES container if this run created it, otherwise only its `amtest_<id>*` indices; releases the lock/claim; deletes the run dir) and exits 70 instead of waiting out `AMES_TEST_WAIT_S`.

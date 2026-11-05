@@ -7,12 +7,18 @@
 #   RUN_DIR/head, base  git-archive trees of the two refs (removed when the driver finishes)
 #   RUN_DIR/out/        junit-<label>.xml + <label>.log  (what the local side collects)
 #   RUN_DIR/status      "running ..." while going, then "done head_rc=.. base_rc=.." or "infra <why>"
+#   RUN_DIR/driver.pid  written by the launcher; the poll uses it to notice a SIGKILLed driver
+#   RUN_DIR/es_created  marker: this run created the ES container (survives a driver crash)
 #
 # On EXIT (any path, including SIGTERM) it removes the test containers, the ES container it
-# created (unless --keep-es) and the shipped trees, journals, and releases the ops-claim.
+# created (unless --keep-es) and the shipped trees, and releases the host lock / external claim.
+# `driver.sh --reap RUN_DIR` does the same cleanup (plus removing RUN_DIR) for a driver that was
+# SIGKILLed / OOM-killed and so could not run its own trap; the local runner calls it on detection.
 set -uo pipefail
 export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH
-RUN=${1:?usage: test-remote-host.sh RUN_DIR}
+REAP=0
+if [ "${1:-}" = "--reap" ]; then REAP=1; shift; fi
+RUN=${1:?usage: test-remote-host.sh [--reap] RUN_DIR}
 # shellcheck disable=SC1091
 . "$RUN/env.sh"
 OUT=$RUN/out
@@ -25,48 +31,89 @@ CONTAINER_MEM=${AMES_TEST_CONTAINER_MEM:-3g}
 SUITE_TIMEOUT_S=${AMES_TEST_SUITE_TIMEOUT_S:-2400}
 RESULT="infra driver exited early"
 ES_CREATED=0
+[ -f "$RUN/es_created" ] && ES_CREATED=1
 
-log() { echo "[$(TZ=Europe/Warsaw date +%H:%M:%S)] $*"; }
+log() { echo "[$(date +%H:%M:%S)] $*"; }
 status() { echo "$*" > "$RUN/status"; }
-claim_cmd() { OPS_ACTOR=$ACTOR "$HOME/bin/ops-claim" "$@" >/dev/null 2>&1 || true; }
+# optional external claim helper (subcommands journal|release); the lock dir is always ours to drop
+claim_cmd() {
+  local c=${CLAIM_CMD:-}
+  case "$c" in \~/*) c=$HOME/${c#\~/};; esac
+  [ -n "$c" ] && [ -x "$c" ] && OPS_ACTOR=$ACTOR "$c" "$@" >/dev/null 2>&1
+  return 0
+}
+release_lock() {
+  if [ -n "${LOCK_DIR:-}" ] && [ "$(cut -d' ' -f1 "$LOCK_DIR/owner" 2>/dev/null)" = "$ID" ]; then rm -rf "$LOCK_DIR"; fi
+}
 
-finish() {
-  local rc=$? idx
-  trap - EXIT
+# Remove everything this run created on the host. Idempotent; safe on a half-built run.
+cleanup() { # note
+  local idx
   # xargs -r does not exist on macOS: test for emptiness first.
   docker ps -aq --filter "name=ames-rv-${ID}-" | while read -r ids; do docker rm -f "$ids" >/dev/null 2>&1; done
   if [ "$ES_CREATED" = 1 ] && [ "$KEEP_ES" != 1 ]; then
     docker rm -f "$ES_NAME" >/dev/null 2>&1
-  elif curl -sf "$ES/_cluster/health" >/dev/null 2>&1; then
-    # ES outlives this run (--keep-es / reused): drop only this run's indices.
-    for idx in $(curl -s "$ES/_cat/indices/amtest_${ID}*?h=index" 2>/dev/null); do
-      curl -s -o /dev/null -XDELETE "$ES/$idx"
+  elif curl -sf -m 5 "$ES/_cluster/health" >/dev/null 2>&1; then
+    # ES outlives this run (--keep-es / reused / not ours): drop only this run's indices.
+    for idx in $(curl -s -m 10 "$ES/_cat/indices/amtest_${ID}*?h=index" 2>/dev/null); do
+      curl -s -m 10 -o /dev/null -XDELETE "$ES/$idx"
     done
   fi
   rm -rf "$RUN/head" "$RUN/base"
-  status "$RESULT"
-  if [ "$KEEP_ES" = 1 ]; then
+  if [ "$KEEP_ES" = 1 ] && [ "$ES_CREATED" = 1 ]; then
     claim_cmd journal "$RES" "run $ID finished; $ES_NAME kept on 127.0.0.1:$PORT (--keep-es), claim held to ttl"
   else
-    claim_cmd journal "$RES" "run $ID finished and cleaned up: $RESULT"
+    claim_cmd journal "$RES" "run $ID: $1"
     claim_cmd release "$RES"
+    release_lock
   fi
+}
+
+if [ "$REAP" = 1 ]; then
+  # the driver is dead (SIGKILL / OOM / reboot): do its cleanup from the persisted state, then drop the run dir
+  KEEP_ES=0
+  echo "reaping run $ID: removing containers ames-rv-${ID}-*"
+  cleanup "driver died; reaped (status was: $(cat "$RUN/status" 2>/dev/null))"
+  [ "$ES_CREATED" = 1 ] && echo "removed ES container $ES_NAME (created by this run)" || echo "ES $ES_NAME not created by this run: dropped only its amtest_${ID}* indices"
+  echo "released lock/claim for $RES"
+  rm -rf "$RUN"
+  echo "removed $RUN"
+  exit 0
+fi
+
+finish() {
+  local rc=$?
+  trap - EXIT
+  cleanup "finished and cleaned up: $RESULT"
+  status "$RESULT"
   exit $rc
 }
 trap finish EXIT
 trap 'RESULT="infra driver terminated"; exit 143' TERM INT
 
+# Reserved ports (a production AMES / shared ES may live there): refuse here too, not only in the launcher.
+case "$PORT" in
+  9200|9220|9268|9279) RESULT="infra refused: port $PORT is reserved"; exit 70;;
+  ''|*[!0-9]*) RESULT="infra refused: bad port '$PORT'"; exit 70;;
+esac
+
 status "running starting-es"
 # ---- 1. throwaway ES
 if docker inspect "$ES_NAME" >/dev/null 2>&1; then
   log "reusing existing $ES_NAME (left by --keep-es)"
-  [ "$(docker inspect -f '{{.State.Running}}' "$ES_NAME")" = true ] || docker start "$ES_NAME" >/dev/null
+  if [ "$(docker inspect -f '{{.State.Running}}' "$ES_NAME")" != true ]; then
+    docker start "$ES_NAME" >/dev/null || { RESULT="infra could not start existing $ES_NAME"; exit 70; }
+  fi
 else
   log "starting $ES_NAME on 127.0.0.1:$PORT"
-  docker run -d --name "$ES_NAME" -p "127.0.0.1:${PORT}:9200" \
-    -e discovery.type=single-node -e xpack.security.enabled=false \
-    -e ES_JAVA_OPTS="-Xms1g -Xmx1g" "$ES_IMAGE" >/dev/null || { RESULT="infra ES container failed to start"; exit 70; }
+  touch "$RUN/es_created"   # before docker run: a crash between the two is then still reaped
   ES_CREATED=1
+  if ! docker run -d --name "$ES_NAME" -p "127.0.0.1:${PORT}:9200" \
+    -e discovery.type=single-node -e xpack.security.enabled=false \
+    -e ES_JAVA_OPTS="-Xms1g -Xmx1g" "$ES_IMAGE" >/dev/null; then
+    docker rm -f "$ES_NAME" >/dev/null 2>&1    # a failed `docker run` can leave a Created container behind
+    RESULT="infra ES container failed to start"; exit 70
+  fi
 fi
 ok=0
 for _ in $(seq 1 90); do
