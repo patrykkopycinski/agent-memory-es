@@ -41,10 +41,18 @@ _SLUG_SEP = re.compile(r"[-_+=]+")
 # alphabetic may also be Capitalized or UPPER ("SNAPSHOT", "Users"); a part with digits must be
 # lowercase, so random mixed-case/digit runs ("Zx81QwQw") never qualify.
 _SLUG_PIECE = re.compile(r"^(?:[a-z]{1,}[0-9]{0,4}[a-z]{0,2}|v?[0-9]{1,8}[a-z]{0,2})$")
-_HEX_HASH = re.compile(r"^[0-9a-f]{7,40}$")
-_COMMIT_WORDS = {"commit", "sha", "rev", "revision", "hash", "ref", "merge", "merged", "at", "pr", "head"}
-_COMMIT_CONTEXT = re.compile(r"\b(?:commit|sha1?|rev|revision|hash|merge[d]?|cherry-pick|head)\b[^\n]{0,24}$",
-                             re.IGNORECASE)
+# Hash exemption: 7-12 hex or exactly 40 (a git SHA-1). 32-hex values (Datadog, Sentry, npm keys)
+# and 64-hex values are never exempt, and neither are upper-case hex strings.
+_HEX_HASH = re.compile(r"^(?:[0-9a-f]{7,12}|[0-9a-f]{40})$")
+_COMMIT_WORDS = frozenset({"commit", "sha", "rev", "hash"})
+# Path-only pieces, on top of _is_slug_piece: a short git-style id ("b400b54"), a compact
+# timestamp ("20261105T091828"), a long numeric id (GCP project number), a Capitalized word with a
+# size suffix ("Qwen3", "Llama"), a size ("70B") and an "A3B"-style tag. Hex chunks that start
+# with a digit ("3f9a8c7b") match none of these.
+_PATH_PIECE = re.compile(
+    r"^(?:[a-z]{1,2}[0-9]{1,4}[a-z]{1,2}[0-9]{1,4}|[0-9]{8}T[0-9]{6}|[0-9]{1,12}|[A-Z][a-z]{2,}[0-9]{0,3}|[0-9]{1,3}[A-Z]|[A-Z][0-9]{1,2}[A-Z])$")
+_PATH_ROOT = re.compile(r"^(?:~|\.{1,2})?/")
+_ALNUM_RUN = re.compile(r"[A-Za-z0-9]{12,}")
 
 
 def _is_slug_piece(piece: str) -> bool:
@@ -60,33 +68,42 @@ def _is_slug(value: str) -> bool:
     return all(all(_is_slug_piece(x) for x in p.split(".") if x) for p in parts)
 
 
+def _has_random_run(value: str) -> bool:
+    """A 12+ char alphanumeric run mixing upper case, lower case and digits is key material."""
+    return any(re.search(r"[a-z]", r) and re.search(r"[A-Z]", r) and re.search(r"[0-9]", r)
+               for r in _ALNUM_RUN.findall(value))
+
+
+def _is_path_segment(seg: str) -> bool:
+    pieces = [x for part in _SLUG_SEP.split(seg) for x in part.split(".") if x]
+    return bool(pieces) and all(_is_slug_piece(x) or _PATH_PIECE.match(x) is not None for x in pieces)
+
+
 def _is_path(value: str) -> bool:
-    """A filesystem path or owner/repo reference, not a credential: either rooted ('/', '~/',
-    './') with 2+ slashes, or every '/'-segment is itself a slug. Base64 secrets that merely
-    contain '/' (AWS-style) have mixed-case/digit segments, so they stay rejected."""
-    if "/" not in value:
+    """A filesystem path, owner/repo, model id or resource name, not a credential: 2+ '/'-segments
+    (after an optional '/', '~/', './' or '../' root), every one made of ordinary words, ids or
+    sizes, and no 12+ char mixed-case-and-digit run anywhere. Rooted values get no special
+    treatment: '~/Xk9mQ2pL7vR4tN8w/B3zH' fails on its first segment like a relative path would.
+    Base64 secrets that merely contain '/' (AWS-style) have mixed-case/digit segments."""
+    if "/" not in value or _has_random_run(value):
         return False
-    if re.match(r"^(?:~|\.{1,2})?/", value) and value.count("/") >= 2:
-        return True
-    segs = [x for x in value.split("/") if x]
-    return len(segs) >= 2 and all(_is_slug(x) or _is_slug_piece(x) for x in segs)
+    segs = [x for x in _PATH_ROOT.sub("", value).split("/") if x]
+    return len(segs) >= 2 and all(_is_path_segment(x) for x in segs)
 
 
-def _is_commit_hash(value: str, scheme_word: str, before: str) -> bool:
-    """7-40 hex chars is also the shape of a hex API key, so it is exempt only with commit
-    context: a commit-ish scheme word ("auth: commit 1470bfd…") or one just before the keyword."""
-    if not _HEX_HASH.match(value):
-        return False
-    return scheme_word.strip().lower() in _COMMIT_WORDS or bool(_COMMIT_CONTEXT.search(before))
+def _is_commit_hash(value: str, scheme_word: str) -> bool:
+    """A 7-12 or 40 char hex string is also the shape of a hex API key, so it is exempt only when
+    the scheme word right after the separator says it is a hash ("auth: commit 1470bfd…")."""
+    return _HEX_HASH.match(value) is not None and scheme_word.strip().lower() in _COMMIT_WORDS
 
 
-def _keyword_value_is_secret(value: str, scheme_word: str = "", before: str = "") -> bool:
+def _keyword_value_is_secret(value: str, scheme_word: str = "") -> bool:
     return (len(value) >= KEYWORD_MIN_VALUE_CHARS
             and re.search(r"[A-Za-z]", value) is not None
             and re.search(r"[0-9]", value) is not None
             and not _is_slug(value)
             and not _is_path(value)
-            and not _is_commit_hash(value, scheme_word, before))
+            and not _is_commit_hash(value, scheme_word))
 
 
 def find_secret(text: Optional[str]) -> Optional[str]:
@@ -97,7 +114,7 @@ def find_secret(text: Optional[str]) -> Optional[str]:
         if rx.search(text):
             return name
     for m in KEYWORD_RE.finditer(text):
-        if _keyword_value_is_secret(m.group(4), m.group(3) or "", text[max(0, m.start() - 40):m.start()]):
+        if _keyword_value_is_secret(m.group(4), m.group(3) or ""):
             return "keyword_value"
     return None
 
@@ -106,7 +123,8 @@ def find_secret_in_tags(tags) -> Optional[str]:
     """Like find_secret over each caller-supplied tag, on the RAW strings: norm_tags lowercases
     and turns '_'/'-' into spaces, which would hide a token shape. Also tries the lowercased tag,
     since the shapes are case-sensitive and an UPPER-cased `GHP_...` tag is still a secret
-    attempt. Non-strings are left for norm_tags to reject."""
+    attempt. That retry is for tags ONLY: upper-case shapes (`GHP_…`, `SK-…`) in retained TEXT
+    are not matched. Non-strings are left for norm_tags to reject."""
     if not isinstance(tags, (list, tuple)):
         return None
     for t in tags:

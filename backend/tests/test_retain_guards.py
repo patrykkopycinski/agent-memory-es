@@ -117,6 +117,15 @@ MUST_ACCEPT = [
     "credentials: elastic/kibana-evals/weekly2",
     "SERVICE_KEY=deepseek-v3.2-flash",
     "api key: gpt-4o-2024-08-06",
+    "model: meta-llama/Llama-3.3-70B-Instruct",
+    "token: Qwen/Qwen3-Coder-30B-A3B-Instruct",
+    "token file: src/plugins/auth/README.md",
+    "token: src/plugins2/auth/README.md",             # same path where the keyword rule really fires
+    "secret: projects/123456789/secrets/my-api/versions/3",   # the path is the secret's NAME, not its value
+    "token: ~/src/plugins2/auth/README.md",
+    "token: ./src/plugins2/auth/README.md",
+    "token: ../src/plugins2/auth/README.md",
+    "secret: /srv/app2/config/keys.json",
 ]
 
 
@@ -295,3 +304,108 @@ def test_promote_of_a_missing_doc_is_404_not_500_on_both_surfaces():
     assert r2.status_code == 404, r2.text
     mine = _post("/memory/retain", text="promote control: a real private fact").json()["_id"]
     assert _post("/memory/promote", doc_id=mine, to_visibility="team").status_code == 200
+
+
+# --- review round 2 ---
+HEX32 = "3f9a8c7b6d5e4f3a2b1c0d9e8f7a6b5c"                       # 32 hex: Datadog / Sentry / npm key shape
+HEX40 = "1470bfd8b2fc1a2b3c4d5e6f7a8b9c0d1e2f3a4b"               # 40 hex: also a git SHA-1
+HEX64 = HEX32 + HEX32[::-1]
+
+MUST_REJECT = [
+    # rooted values get the same per-segment check as relative ones
+    "aws_secret: /K7MDENG/bPxRfiCY9kLmQ2zX8vB7nR4tY0wJalrXUtn",
+    "secret: ./Xk9mQ2pL7vR4tN8wB3zH/a1",
+    "token: ~/Xk9mQ2pL7vR4tN8w/B3zH",
+    # prose around a hex value is not commit context
+    "pushed the merge; deploy token: " + HEX32,
+    "After the merge, set the datadog api key: " + HEX32,
+    "Since commit 1a2b3c, DD_" + "API_KEY=" + HEX32,
+    "pinned at HEAD; token: " + HEX40,
+    "The commit hook uses token: " + HEX40,
+    "api_key: at " + HEX32,
+    # scheme words that were removed from the allow-list
+    "token: ref " + HEX40, "token: head " + HEX40, "token: pr " + HEX40, "token: at " + HEX40,
+    # hash exemption is length- and case-bound
+    "auth: commit " + HEX32,
+    "auth: sha " + HEX64,
+    "auth: commit " + HEX40.upper(),
+    "auth: commit " + HEX40[:20],
+    "auth: commit " + HEX40 + "ab",
+    # a path needs EVERY segment and every piece to be an ordinary word or id (all, not any)
+    "token: owner/repo/k9x2m7q1p4z8",
+    "token: owner/repo/k9x2m7q1-p4z8w3n6-owner",
+    "secret: ./k9x2m7q1/p4z8w3n6/r5t1y8u2",
+    # a Capitalized word is a path piece, but a 12+ char mixed-case-and-digit run never is
+    "token: owner/Abcdefghijkl9/repo",
+    # hex chunks joined by '/' are not a path
+    "secret: 3f9a8c7b/6d5e4f3a/2b1c0d9e/8f7a6b5c",
+    "token: 3f9a8c7b6d5e/4f3a2b1c0d9e",
+]
+
+
+@pytest.mark.parametrize("text", MUST_REJECT)
+def test_review_round_2_bypasses_stay_rejected(text):
+    assert secrets_guard.find_secret(text) == "keyword_value", text
+
+
+@pytest.mark.parametrize("text", [
+    "commit: 1470bfd8b2fc1", "auth: commit " + HEX40, "token: sha " + HEX40[:12], "auth: rev 1470bfd8b2fc1",
+    "auth: hash " + HEX40,
+])
+def test_a_commit_hash_with_a_hash_scheme_word_is_still_accepted(text):
+    assert secrets_guard.find_secret(text) is None, text
+
+
+def test_hash_exemption_has_no_before_context_window():                                  # N5c is moot
+    assert not hasattr(secrets_guard, "_COMMIT_CONTEXT")
+    assert secrets_guard.find_secret("commit " + HEX40[:7] + " then token: " + HEX40) == "keyword_value"
+
+
+def test_hash_exemption_is_bounded_hex_only():                                             # N5e
+    for n in (16, 20, 32, 39, 41, 64):
+        assert secrets_guard.find_secret("auth: commit " + (HEX64 * 2)[:n]) == "keyword_value", n
+    assert secrets_guard.find_secret("auth: commit " + HEX40[:7] + "0000") is None          # 11 hex ok
+    assert secrets_guard.find_secret("auth: commit " + "AB" + HEX40[2:]) == "keyword_value"  # A-F not hex here
+
+
+def test_mixed_case_alpha_pieces_are_not_slug_pieces():                                    # N6
+    for v in ("aBcDeFgHiJkLmNoP-v3", "token-xK" + "pQrStUvWxYzAbC-v3", "camelCaseTokenValueHere-2"):
+        assert secrets_guard.find_secret("token: " + v) == "keyword_value", v
+
+
+def test_digit_bearing_slug_pieces_must_be_lowercase():                                    # N6b
+    for v in ("Abc12-def34-ghi56-jkl78", "ABC12-DEF34-GHI56-JKL78", "abc12-Def34-ghi56-jkl78"):
+        assert secrets_guard.find_secret("token: " + v) == "keyword_value", v
+
+
+def test_every_slug_part_and_dot_piece_must_pass_N10():
+    for v in ("deepseek-Xk9mQ2pL7vR4tN8w", "gpt-4o.Xk9mQ2pL7vR4tN8w-flash", "Xk9mQ2pL7vR4tN8w-flash-v3"):
+        assert secrets_guard.find_secret("token: " + v) == "keyword_value", v
+    assert secrets_guard.find_secret("token: owner/Xk9mQ2pL7vR4tN8w3/repo") == "keyword_value"
+
+
+def test_slash_is_not_a_slug_separator_and_a_lone_segment_is_not_a_path_N11():
+    assert not secrets_guard._is_slug("abcdefghijk1/m")
+    assert not secrets_guard._is_path("abcdefghijklmnop1/")                                   # one segment only
+    assert not secrets_guard._is_path("Xk9mQ2pL7vR4tN8w3zH")                                  # no slash at all
+
+
+def test_scheme_word_group_is_linear_time_N12b():
+    import subprocess
+    code = ("import sys,time; sys.path.insert(0,'.'); from app import secrets_guard as g\n"
+            "t=time.time()\n"
+            "for k in (3, 5, 8, 40):\n"
+            "    g.find_secret('token: ' + 'abcdefgh'*k + '!')\n"
+            "    g.find_secret('token: ' + 'abcdefg '*k + '!')\n"
+            "print(time.time()-t)")
+    r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=20,
+                       cwd=os.path.join(os.path.dirname(__file__), ".."))
+    assert r.returncode == 0, r.stderr
+    assert float(r.stdout.strip()) < 1.0
+
+
+def test_promote_checks_the_kind_before_touching_the_store_N15():
+    with pytest.raises(ValueError, match="kind must be one of"):
+        memory.promote(OWNER, "bogus", "any-doc", "team")
+    r = _post("/memory/promote", kind="bogus", doc_id="any-doc", to_visibility="team")
+    assert r.status_code == 422 and "kind must be one of" in r.text, r.text
