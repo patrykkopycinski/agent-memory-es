@@ -110,6 +110,13 @@ class DeleteIn(BaseModel):
     doc_id: str
 
 
+class ExistsIn(BaseModel):
+    kind: Optional[str] = None
+    tags: Optional[list] = None       # every tag must match
+    text: Optional[str] = None        # exact match on the normalized-text hash (no embedding)
+    size: int = Field(5, ge=1, le=20)
+
+
 class ReflectIn(BaseModel):
     question: str
 
@@ -195,6 +202,10 @@ def retain(body: RetainIn, who: dict = Depends(caller)):
         raise HTTPException(502, str(e))
 
 
+def _superseded_409(e: "memory.SupersededError") -> HTTPException:
+    return HTTPException(409, {"detail": str(e), "superseded": e.doc_id, "live_id": e.live_id})
+
+
 @app.delete("/memory/{kind}/{doc_id}")
 def delete_memory(kind: str, doc_id: str, who: dict = Depends(caller)):
     try:
@@ -203,6 +214,8 @@ def delete_memory(kind: str, doc_id: str, who: dict = Depends(caller)):
         raise HTTPException(422, str(e))
     except PermissionError:
         raise HTTPException(403, "only the creator can delete their memory")
+    except memory.SupersededError as e:
+        raise _superseded_409(e) from None
     except LookupError as e:
         raise HTTPException(404, str(e)) from None
     except RuntimeError as e:
@@ -218,6 +231,14 @@ def recall(body: RecallIn, who: dict = Depends(caller)):
                              body.min_score, body.as_of, body.per_doc, body.rerank, body.filter,
                              rerank_depth=body.rerank_depth, min_similarity=body.min_similarity)
     except tagfilter.FilterError as e:
+        raise HTTPException(422, str(e))
+
+
+@app.post("/memory/exists")
+def exists(body: ExistsIn, who: dict = Depends(caller)):
+    try:
+        return memory.exists(who["owner_id"], body.kind, body.tags, body.text, body.size)
+    except (ValueError, tagfilter.FilterError) as e:
         raise HTTPException(422, str(e))
 
 
@@ -237,6 +258,8 @@ def update(body: UpdateIn, who: dict = Depends(caller)):
     try:
         return memory.update(who["owner_id"], body.kind, body.doc_id, body.text,
                              body.tags, body.visibility, body.occurred_at)
+    except memory.SupersededError as e:
+        raise _superseded_409(e) from None
     except LookupError as e:
         raise HTTPException(404, str(e))
     except (ValueError, PermissionError) as e:
@@ -247,6 +270,8 @@ def update(body: UpdateIn, who: dict = Depends(caller)):
 def delete(body: DeleteIn, who: dict = Depends(caller)):
     try:
         return memory.delete(who["owner_id"], body.kind, body.doc_id)
+    except memory.SupersededError as e:
+        raise _superseded_409(e) from None
     except LookupError as e:
         raise HTTPException(404, str(e))
     except (ValueError, PermissionError) as e:
@@ -378,6 +403,8 @@ def mcp_tool(tool: str, body: dict, who: dict = Depends(caller)):
                                           b.get("as_of"), b.get("per_doc"), b.get("rerank"),
                                           rerank_depth=b.get("rerank_depth"),
                                           min_similarity=b.get("min_similarity")),
+        "exists": lambda b: memory.exists(who["owner_id"], b.get("kind"), b.get("tags"),
+                                          b.get("text"), b.get("size", 5)),
         "reflect": lambda b: memory.reflect(who["owner_id"], b["question"]),
         "promote": lambda b: memory.promote(who["owner_id"], b["kind"], b["doc_id"], b["to_visibility"]),
         "update": lambda b: memory.update(who["owner_id"], b["kind"], b["doc_id"],
@@ -389,6 +416,8 @@ def mcp_tool(tool: str, body: dict, who: dict = Depends(caller)):
         raise HTTPException(404, f"unknown tool {tool}; available: {sorted(handlers)}")
     try:
         return {"result": handlers[tool](body)}
+    except memory.SupersededError as e:
+        return {"error": str(e), "live_id": e.live_id}
     except (ValueError, PermissionError) as e:
         return {"error": str(e)}
 

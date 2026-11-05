@@ -530,6 +530,44 @@ def _get_source(kind: str, doc_id: str) -> dict:
         raise
 
 
+class SupersededError(Exception):
+    """update/delete addressed a memory that has been replaced. HTTP 409 with `live_id`.
+
+    We refuse rather than silently redirect to the successor: a client that holds a stale id
+    asked to change/delete *that* text, and applying a destructive delete (or a text overwrite)
+    to a different document it never named is the worse failure. 409 + live_id lets the caller
+    re-issue against the successor deliberately. `live_id` is None when the chain ends in a doc
+    that no longer exists."""
+
+    def __init__(self, doc_id: str, live_id: Optional[str]):
+        super().__init__(f"memory {doc_id} was superseded; live memory: {live_id}")
+        self.doc_id, self.live_id = doc_id, live_id
+
+
+def _is_superseded(s: dict) -> bool:
+    # retain's near-duplicate link sets superseded_by on a doc that stays active (coexistence);
+    # only a doc taken out of service (active:false via _supersede, or valid_to via facts) is stale.
+    return bool(s.get("superseded_by")) and (s.get("active") is False or bool(s.get("valid_to")))
+
+
+def _live_successor(kind: str, s: dict) -> Optional[str]:
+    """Follow superseded_by to the first doc still in service. Bounded + cycle-safe."""
+    seen = set()
+    nxt = s.get("superseded_by")
+    for _ in range(10):
+        if not nxt or nxt in seen:
+            return None
+        seen.add(nxt)
+        try:
+            cur = _get_source(kind, nxt)
+        except LookupError:
+            return None
+        if not _is_superseded(cur):
+            return nxt
+        nxt = cur.get("superseded_by")
+    return None
+
+
 def _owned_group_query(owner_id: str, group: str) -> dict:
     # doc_group is a caller-chosen string (often a session id), so two owners can
     # share one. It is not a tenant boundary: every group-level read or delete must
@@ -609,6 +647,8 @@ def update(owner_id: str, kind: str, doc_id: str, text=None, tags=None,
     s = _get_source(kind, doc_id)
     if s["owner_id"] != owner_id:
         raise PermissionError("only the creator can modify their memory")
+    if _is_superseded(s):
+        raise SupersededError(doc_id, _live_successor(kind, s))
     if visibility is not None and visibility not in VISIBILITIES:
         raise ValueError(f"visibility must be one of {VISIBILITIES}")
     _check_text_size(text)
@@ -674,6 +714,8 @@ def delete(owner_id: str, kind: str, doc_id: str) -> dict:
     s = _get_source(kind, doc_id)
     if s["owner_id"] != owner_id:
         raise PermissionError("only the creator can delete their memory")
+    if _is_superseded(s):
+        raise SupersededError(doc_id, _live_successor(kind, s))
     group = s.get("doc_group")
     _log_mutation("delete", owner_id, kind, doc_id,
                   {"text": s["text"], "doc_group": group,
@@ -695,6 +737,45 @@ def delete(owner_id: str, kind: str, doc_id: str) -> dict:
             "tombstoned": tombstoned}
 
 
+MAX_EXISTS_TAGS = 16
+
+
+def exists(owner_id: str, kind: Optional[str] = None, tags: Optional[list] = None,
+           text: Optional[str] = None, size: int = 5) -> dict:
+    """Cheap "do I already hold this?" lookup: exact normalized-text hash and/or tags (all must
+    match). Term filters only: no embedding, no LLM, no kNN. Scope = this owner's docs plus
+    team/common, active only (same visibility rule as recall). `kind` omitted searches all kinds."""
+    if text is None and not tags:
+        raise ValueError("exists needs text and/or tags")
+    if text is not None and (not isinstance(text, str) or not text.strip()):
+        raise ValueError("text must be a non-empty string")
+    if kind is not None and kind not in KINDS:
+        raise ValueError(f"kind must be one of {KINDS}")
+    _check_text_size(text)
+    size = max(1, min(int(size), 20))
+    ensure_indices_once()
+    flt = [{"term": {"active": True}}, _visibility_filter(owner_id)]
+    if text is not None:
+        flt.append({"term": {"text_hash": text_hash(text)}})
+    if tags:
+        norm = _tf.norm_tags(tags)
+        if len(norm) > MAX_EXISTS_TAGS:
+            raise ValueError(f"at most {MAX_EXISTS_TAGS} tags")
+        flt += [{"term": {_tf.TAG_FIELD: t}} for t in norm]
+    matches, total = [], 0
+    for k in ([kind] if kind else list(KINDS)):
+        r = es("POST", f"/{idx(k)}/_search", {
+            "size": size, "track_total_hits": True, "_source": ["text", "doc_group", "tags", "occurred_at", "visibility"],
+            "query": {"bool": {"filter": flt}}})
+        total += r["hits"]["total"]["value"]
+        for h in r["hits"]["hits"]:
+            src = h["_source"]
+            matches.append({"id": h["_id"], "kind": k, "doc_group": src.get("doc_group"),
+                            "tags": src.get("tags", []), "occurred_at": src.get("occurred_at"),
+                            "visibility": src.get("visibility"), "text": (src.get("text") or "")[:200]})
+    return {"exists": total > 0, "count": total, "matches": matches[:size]}
+
+
 def _visibility_filter(owner_id: str) -> dict:
     # private docs: only creator. team/common docs shared.
     return {"bool": {"should": [
@@ -707,7 +788,7 @@ def _abstained(query: str, parsed: dict, resolved: dict, vocab_truncated: bool) 
     """A filter whose narrow_any resolved to nothing: answer without touching ES at all, so there
     is no code path that could fall back to an unfiltered search."""
     out = {"query": query, "results": [], "by_kind": {}, "fused": [], "abstained": True,
-           "doc_groups": 0, "reranked": False,
+           "abstain_hint": True, "doc_groups": 0, "reranked": False,
            "filter": {"applied": True, "resolved": resolved}}
     if vocab_truncated:
         out["filter"]["vocab_truncated"] = True
@@ -767,12 +848,59 @@ def _hybrid_app_fusion(kind: str, lexical_query: dict, knn: dict, fetch: int) ->
              {"size": RRF_RANK_WINDOW, "query": lexical_query, "_source": no_vec})
     vec = es("POST", f"/{idx(kind)}/_search", {"size": fetch, "knn": knn, "_source": no_vec})
     by_id = {}
-    for h in vec["hits"]["hits"] + lex["hits"]["hits"]:   # lexical wins on _source: identical docs
-        by_id[h["_id"]] = h
+    # Keep each arm's raw score on the hit: recall() turns them into `confidence`, and the RRF
+    # score that replaces `_score` below carries no absolute relevance.
+    for h in vec["hits"]["hits"]:
+        by_id[h["_id"]] = {**h, "_cosine": 2.0 * h["_score"] - 1.0}   # ES cosine knn: (1+cos)/2
+    for h in lex["hits"]["hits"]:                          # lexical wins on _source: identical docs
+        by_id[h["_id"]] = {**h, "_bm25": h["_score"],
+                           **({"_cosine": by_id[h["_id"]]["_cosine"]} if h["_id"] in by_id else {})}
     fused = rrf_fuse([[h["_id"] for h in lex["hits"]["hits"]],
                       [h["_id"] for h in vec["hits"]["hits"]]])
     hits = [{**by_id[d], "_score": sc} for d, sc in fused[:fetch]]
     return hits, (lex.get("took") or 0) + (vec.get("took") or 0)
+
+
+# --- recall confidence ---------------------------------------------------------------------
+# RRF scores are rank-only (a nonsense query still gets a 1/61 top hit), so they cannot tell a
+# caller "nothing relevant here". `confidence` (0..1) is built from the two raw arm scores:
+#   vector: E5 cosines live in a narrow band, so rescale [CONF_COS_LO, CONF_COS_HI] -> [0, 1]
+#   lexical: BM25 is unbounded and corpus-dependent, so saturate it: s / (s + CONF_BM25_K)
+# and blended CONF_VEC_WEIGHT : (1 - CONF_VEC_WEIGHT). Constants are calibrated by the labelled
+# probe in tests/test_recall_contract.py (AUC), not guessed.
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, default))
+    except ValueError:
+        return default
+
+
+CONF_COS_LO = _env_float("AMES_CONF_COS_LO", 0.80)
+CONF_COS_HI = _env_float("AMES_CONF_COS_HI", 0.90)
+CONF_BM25_K = _env_float("AMES_CONF_BM25_K", 10.0)
+CONF_VEC_WEIGHT = _env_float("AMES_CONF_VEC_WEIGHT", 0.6)
+ABSTAIN_CONFIDENCE = _env_float("AMES_ABSTAIN_CONFIDENCE", 0.35)   # abstain_hint below this
+
+
+def _confidence(bm25: Optional[float], cosine: Optional[float], have_vec: bool) -> float:
+    """0..1 relevance estimate for one hit. `bm25`/`cosine` are None when that arm did not return
+    the hit (or, for bm25, is unobservable: retriever.rrf hides per-arm scores). With no vector
+    arm at all (embed failed) the lexical term stands alone; with no bm25 the vector term does."""
+    lex = 0.0 if bm25 is None or bm25 <= 0 else bm25 / (bm25 + CONF_BM25_K)
+    vec = 0.0 if cosine is None else min(1.0, max(0.0, (cosine - CONF_COS_LO) / (CONF_COS_HI - CONF_COS_LO)))
+    if not have_vec:
+        return round(lex, 4)
+    if bm25 is None and cosine is not None:      # es_rrf: lexical score hidden
+        return round(vec, 4)
+    return round(CONF_VEC_WEIGHT * vec + (1.0 - CONF_VEC_WEIGHT) * lex, 4)
+
+
+def _cosine(a: list, b: list) -> Optional[float]:
+    if not a or not b or len(a) != len(b):
+        return None
+    dot = sum(x * y for x, y in zip(a, b))
+    na, nb = math.sqrt(sum(x * x for x in a)), math.sqrt(sum(y * y for y in b))
+    return dot / (na * nb) if na and nb else None
 
 
 def _ms(t0: float) -> float:
@@ -872,6 +1000,7 @@ def recall(owner_id: str, query: str, kinds=None, size: int = 8,
     qvec = qvecs[0] if qvecs else None
     timings["embed"] = _ms(t_embed)
     results = {}
+    raw_arm = {}     # doc id -> (bm25, cosine) for the confidence signal
     search_by_kind, es_took = {}, 0
     # Over-fetch: the per-doc collapse runs AFTER ranking and can only shrink the list,
     # so each arm must return more than `size` candidates or a size-8 window would come
@@ -924,6 +1053,13 @@ def recall(owner_id: str, query: str, kinds=None, size: int = 8,
                 if k not in ("kind", "embedding")}}
             for h in raw
         ]
+        for h in raw:
+            if body is None:                       # app_rrf: per-arm scores kept by the fusion
+                raw_arm[h["_id"]] = (h.get("_bm25"), h.get("_cosine"))
+            elif qvec is None:                     # BM25-only: _score is the lexical score
+                raw_arm[h["_id"]] = (h["_score"], None)
+            else:                                  # es_rrf hides per-arm scores; cosine from the stored vector
+                raw_arm[h["_id"]] = (None, _cosine(qvec, h["_source"].get("embedding")))
     timings["search"] = round(sum(search_by_kind.values()), 3)
     timings["by_kind"] = search_by_kind
     timings["es_took"] = es_took
@@ -985,6 +1121,8 @@ def recall(owner_id: str, query: str, kinds=None, size: int = 8,
         h.setdefault("es_score", h.get("score"))
         h["recency"] = _recency_boost(h.get("occurred_at"), _now)
         h["score"] = h["rrf"] + h["recency"]
+        # graph/temporal-only hits have no arm score: confidence 0.0 = "no relevance evidence"
+        h["confidence"] = _confidence(*raw_arm.get(h["id"], (None, None)), have_vec=qvec is not None)
     ordered = sorted(fused.values(), key=lambda x: -x["score"])
     if min_score is not None:
         ordered = [h for h in ordered if h["score"] >= min_score]
@@ -1018,6 +1156,9 @@ def recall(owner_id: str, query: str, kinds=None, size: int = 8,
         "vector_arm": qvec is not None,
         "degraded": [] if qvec is not None else ["vector_arm"],
     }
+    # True when nothing in the window is confidently relevant: the caller should say "I don't
+    # know" instead of presenting the top hit as an answer. A hint, not a filter: results stay.
+    out["abstain_hint"] = max((h["confidence"] for h in window), default=0.0) < ABSTAIN_CONFIDENCE
     if embed_error:
         out["embed_error"] = embed_error
     if rerank_info is not None:
