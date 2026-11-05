@@ -37,6 +37,11 @@ def _is_missing_index(exc: RuntimeError) -> bool:
     return "-> 404" in msg or "index_not_found_exception" in msg
 
 
+def _is_forbidden(exc: RuntimeError) -> bool:
+    msg = str(exc)
+    return "-> 403" in msg or "security_exception" in msg
+
+
 def _ensure_index():
     global _index_ready
     if _index_ready:
@@ -46,9 +51,12 @@ def _ensure_index():
         existing = es("GET", f"/{PREFIX}am_rejected")
     except RuntimeError as e:
         if not _is_missing_index(e):
-            # Not "missing" (ES down, 403, ...): don't create over it and don't claim the
-            # upgrade happened. _index_ready stays False so the next call re-checks.
+            # Not "missing": never create over it. A 403 is permanent for this key, so warn once
+            # and stop re-checking (as the PUT _mapping failure below). 5xx / connection errors
+            # are transient: leave _index_ready False so the next call re-checks.
             _log.warning("am_rejected GET failed (%s); skipping reason.keyword upgrade", e)
+            if _is_forbidden(e):
+                _index_ready = True
             return
     if existing is not None:
         # Index predates reason.keyword: add the multi-field. ES allows adding a

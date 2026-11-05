@@ -275,7 +275,12 @@ def test_reason_terms_agg_covers_docs_written_after_upgrade(monkeypatch, restore
     _recreate_index(monkeypatch, _OLD_MAPPING)
     # Written on the OLD mapping, before the upgrade: the sub-field is not backfilled
     # (documented limitation; no reindex), so this doc must NOT show up in the buckets.
-    tombstone.reject(o, "the moon is cheese today", "pre-upgrade reason")
+    # Index it directly: reject() calls _ensure_index() first, which would upgrade the mapping
+    # before the doc lands and defeat the point of the test.
+    es("POST", f"/{PREFIX}am_rejected/_doc?refresh=true", {
+        "value_key": "pre-upgrade", "terms": ["moon", "cheese", "today"], "owner_id": o,
+        "reason": "pre-upgrade reason", "source_id": "t", "rejected_at": "2026-01-01T00:00:00Z"})
+    assert _reason_buckets(o) == [], "old mapping has no reason.keyword to aggregate on"
     tombstone._ensure_index()
     tombstone.reject(o, "the sky is green today", "factually wrong claim")
     assert [(b["key"], b["doc_count"]) for b in _reason_buckets(o)] == [("factually wrong claim", 1)]
@@ -301,15 +306,22 @@ def test_failed_mapping_upgrade_does_not_break_writes_or_retry(monkeypatch, rest
     assert len(puts) == 1, "a failed upgrade must not be retried on every call"
 
 
-def test_non_404_get_error_neither_creates_nor_marks_ready(monkeypatch):
+@pytest.mark.parametrize("err,ready", [
+    ("503: cluster_block_exception", False),   # transient: re-check next call
+    ("403: security_exception", True),         # permanent for this key: warn once, stop retrying
+])
+def test_non_404_get_error_never_creates(monkeypatch, err, ready):
     monkeypatch.setattr(tombstone, "_index_ready", False)
     calls = []
 
-    def flaky(method, path, body=None):
+    def failing(method, path, body=None):
         calls.append(method)
-        raise RuntimeError("ES GET %s -> 503: cluster_block_exception" % path)
+        raise RuntimeError("ES GET %s -> %s" % (path, err))
 
-    monkeypatch.setattr(tombstone, "es", flaky)
+    monkeypatch.setattr(tombstone, "es", failing)
     tombstone._ensure_index()
     assert calls == ["GET"], "no PUT (create or mapping) after a non-404 GET failure"
-    assert tombstone._index_ready is False, "must re-check next call, not claim the upgrade happened"
+    assert tombstone._index_ready is ready
+    tombstone._ensure_index()
+    assert len(calls) == (1 if ready else 2), "403 must not re-GET per write; 5xx must re-check"
+    monkeypatch.setattr(tombstone, "_index_ready", False)  # don't leak a stuck flag to other tests
