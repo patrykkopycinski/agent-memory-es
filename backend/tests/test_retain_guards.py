@@ -445,6 +445,44 @@ def test_scheme_word_group_is_linear_time_N12b():
     assert float(r.stdout.strip()) < 1.0
 
 
+# --- review P3 pin tests: pure logic, no guard change ---
+def test_commit_words_set_is_exactly_the_four_approved_H1_H2():
+    assert secrets_guard._COMMIT_WORDS == frozenset({"commit", "sha", "rev", "hash"})
+
+
+def test_hex_boundary_is_twelve_digits_at_most_H4():
+    # NOTE: a literal "reject 13/14-hex" pin is unfulfillable: 13-15 hex values are under the
+    # 16-char value floor, so HEAD accepts them with any scheme word and {7,12}->{7,13}/{7,14}
+    # is observationally equivalent (verified). The observable boundary starts at 16.
+    # value floor, so it is accepted either way. The observable boundary starts at 16: a 16-39
+    # char hex value with a commit scheme word must NOT be hash-exempt (only 7-12 or exactly 40).
+    hex38 = "abcdef1234567890" * 3
+    for n in (16, 17, 19, 23, 39):
+        assert secrets_guard.find_secret("token: commit " + hex38[:n]) == "keyword_value", n
+    assert secrets_guard.find_secret("token: sha abcdef123456") is None                 # 12 hex
+
+
+# K3 is unfulfillable without a guard change: '$' is not in the keyword value class, so a value
+# like "xk9$mQ2..." never produces a 16+ char match at HEAD and is simply not flagged; adding
+# '$' to the class would REJECT it (stricter), not accept more. Reported, not pinned.
+
+
+def test_short_slug_pieces_and_midpart_digit_runs_stay_secret_shaped_S2_S3():
+    assert secrets_guard.find_secret("token: a123-b456-c789-d012") == "keyword_value"           # S2
+    assert secrets_guard.find_secret("token: qq12345678-ww12345678") == "keyword_value"         # S3
+
+
+def test_a_mixed_case_sk_tag_is_caught_only_by_the_fold_T1():
+    tag = "Sk-" + "q7" * 10                       # raw shape does not match; "sk-" after folding does
+    assert secrets_guard.find_secret(tag) is None
+    assert secrets_guard.find_secret_in_tags([tag]) == "shape_sk"
+
+
+def test_empty_and_none_text_find_nothing_N1():
+    assert secrets_guard.find_secret("") is None
+    assert secrets_guard.find_secret(None) is None
+
+
 def test_promote_checks_the_kind_before_touching_the_store_N15():
     with pytest.raises(ValueError, match="kind must be one of"):
         memory.promote(OWNER, "bogus", "any-doc", "team")
