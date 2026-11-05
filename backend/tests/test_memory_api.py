@@ -1,9 +1,11 @@
 """Integration tests against live ES (AMES_ES_URL). Run: pytest backend/tests -v"""
 import os
 import sys
+import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import _safety  # noqa: F401  (script-path guard: conftest bypass)
+import _llm_gate
 
 import pytest
 from fastapi.testclient import TestClient
@@ -25,8 +27,17 @@ def _retain(key, kind="semantic", text="x", visibility="private"):
 
 
 def test_health():
-    r = client.get("/health")
-    assert r.status_code == 200 and r.json()["ok"]
+    # With the local embed backend the model loads in a background thread: until it finishes,
+    # /health is 200 with ok=false and embed_error="loading" (by design; /health/ready is 503).
+    # Wait out that documented state, then assert real health; any other embed_error fails at once.
+    deadline = time.monotonic() + 60
+    while True:
+        r = client.get("/health")
+        body = r.json()
+        if body.get("embed_error") != "loading" or time.monotonic() > deadline:
+            break
+        time.sleep(1)
+    assert r.status_code == 200 and body["ok"], body
 
 
 def test_auth_reject():
@@ -85,6 +96,10 @@ def test_consolidate_supersession():
 
 
 def test_reflect_no_llm():
+    # memory.reflect() with no llm_answer_fn calls llm.chat, i.e. the live gateway (AMES_LLM_BASE).
+    reason = _llm_gate.llm_unreachable_reason()
+    if reason:
+        pytest.skip(reason)
     _retain(ALICE, text="Hermes runs on the local workstation plus remote build-host")
     r = client.post("/memory/reflect", headers=H(ALICE), json={"question": "Where does Hermes run?"})
     j = r.json()

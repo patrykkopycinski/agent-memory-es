@@ -4,9 +4,12 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import _safety  # noqa: F401  (script-path guard: conftest bypass)
+import _llm_gate
 
 from app import auth
 from app.hermes_provider import HermesMemoryProvider
+
+_llm_gate.require_llm(__name__)  # reflect() below needs a live gateway; skip at collection when down
 
 key = auth.create_key("hermes-default")
 p = HermesMemoryProvider("hermes-default", api_key=key)

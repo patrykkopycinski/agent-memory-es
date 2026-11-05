@@ -4,9 +4,11 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import _safety  # noqa: F401  (script-path guard: conftest bypass)
+import _llm_gate
 
 from app import memory
 from app.store import es, idx
+_llm_gate.require_llm(__name__)  # skip at collection when the gateway is down
 
 # owner-scoped clean slate: the throwaway cluster is shared across modules,
 # and the abstention assert below must not see leftover r1 facts
