@@ -25,9 +25,16 @@ _cache_dim = None
 _backend = None
 
 
+_probe_ctx = threading.local()   # set only inside probe(): single attempt, short timeout
+PROBE_TIMEOUT_S = 5
+
+
 def _post(url, body, headers=None, timeout=60):
     req = urllib.request.Request(url, data=json.dumps(body).encode(), method="POST",
                                  headers={"Content-Type": "application/json", **(headers or {})})
+    if getattr(_probe_ctx, "active", False):
+        with urllib.request.urlopen(req, timeout=PROBE_TIMEOUT_S) as response:
+            return json.load(response)
     return http_retry.request_json(req, timeout=timeout)
 
 
@@ -143,11 +150,26 @@ def backend() -> str:
     return _backend
 
 
+def backend_name() -> str:
+    """The configured backend without triggering auto-detection I/O."""
+    return _backend or os.environ.get("AMES_EMBED_BACKEND", "") or "auto"
+
+
 def embed(texts: list) -> list:
     b = backend()
     if b == "local":
         return _local_embed(texts)
     return _es_embed(texts) if b == "es" else _or_embed(texts)
+
+
+def probe() -> None:
+    """One embed for /health: a single attempt with a PROBE_TIMEOUT_S cap, never http_retry's
+    multi-minute budget (a dead backend must not hang the health endpoint). Raises on failure."""
+    _probe_ctx.active = True
+    try:
+        embed(["probe"])
+    finally:
+        _probe_ctx.active = False
 
 
 # Process-wide embed failure counter. embed() failures on the retain/recall hot path used to be

@@ -105,7 +105,7 @@ def _guard_path(path: str, method: str) -> None:
                 "would hit non-test data; check AMES_INDEX_PREFIX.")
 
 
-def es(method: str, path: str, body: Optional[dict] = None) -> dict:
+def es(method: str, path: str, body: Optional[dict] = None, timeout: float = 30) -> dict:
     if os.environ.get("AMES_TEST_GUARD") == "1":
         _guard_path(path, method)
     data = json.dumps(body).encode() if body is not None else None
@@ -114,7 +114,7 @@ def es(method: str, path: str, body: Optional[dict] = None) -> dict:
         headers={"Content-Type": "application/json"},
     )
     try:
-        return json.load(urllib.request.urlopen(req, timeout=30))
+        return json.load(urllib.request.urlopen(req, timeout=timeout))
     except urllib.error.HTTPError as e:
         detail = e.read().decode()[:400]
         raise RuntimeError(f"ES {method} {path} -> {e.code}: {detail}") from e

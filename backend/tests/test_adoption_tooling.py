@@ -173,3 +173,36 @@ class TestDoctor:
             capture_output=True, text=True, timeout=60)
         assert "ames doctor" in proc.stdout
         assert proc.returncode in (0, 1)   # both are valid outcomes
+
+    def _doctor_against(self, body):
+        import http.server
+        import threading
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                payload = json.dumps(body).encode()
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def log_message(self, *a):
+                pass
+        srv = http.server.HTTPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            env = {**os.environ, "AMES_SERVICE_URL": f"http://127.0.0.1:{srv.server_port}",
+                   "AMES_SERVICE_KEY": ""}
+            return subprocess.run([sys.executable, os.path.join(SCRIPTS, "ames_doctor.py")],
+                                  capture_output=True, text=True, timeout=60, env=env).stdout
+        finally:
+            srv.shutdown()
+
+    def test_prints_embed_error_when_health_is_degraded(self):
+        out = self._doctor_against({"ok": False, "degraded": True, "kinds": ["semantic"],
+                                    "embed_error": "RuntimeError: HTTP Error 403 license", "license_status": "expired"})
+        assert "DEGRADED" in out and "HTTP Error 403 license" in out and "expired" in out
+
+    def test_healthy_service_is_green(self):
+        out = self._doctor_against({"ok": True, "degraded": False, "kinds": ["semantic"]})
+        assert "DEGRADED" not in out and "ames service at" in out

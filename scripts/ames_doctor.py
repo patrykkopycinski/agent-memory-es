@@ -32,7 +32,7 @@ def warn(msg, fix): print(f"  \033[33m!\033[0m {msg}\n      fix: {fix}"); return
 def get(url, timeout=5):
     req = urllib.request.Request(url)
     with urllib.request.urlopen(req, timeout=timeout) as r:
-        return r.status, r.read().decode()[:500]
+        return r.status, r.read().decode()[:2000]
 
 
 def main() -> int:
@@ -55,7 +55,11 @@ def main() -> int:
                       "cd backend && pip install -r requirements.txt")
 
     # 3. Docker present (optional but recommended)
-    if subprocess.run(["docker", "info"], capture_output=True).returncode == 0:
+    try:
+        docker_up = subprocess.run(["docker", "info"], capture_output=True).returncode == 0
+    except FileNotFoundError:      # no docker binary at all is "not reachable", not a crash
+        docker_up = False
+    if docker_up:
         all_ok &= ok("docker daemon reachable")
     else:
         all_ok &= warn("docker daemon not reachable",
@@ -74,7 +78,16 @@ def main() -> int:
     try:
         status, body = get(AMES_URL + "/health")
         if status == 200:
-            all_ok &= ok(f"ames service at {AMES_URL} ({json.loads(body).get('kinds')})")
+            info = json.loads(body)
+            if info.get("degraded"):
+                all_ok &= bad(f"ames service at {AMES_URL} is DEGRADED: embed_error={info.get('embed_error')} "
+                              f"(recall runs BM25-only, new writes land without vectors; "
+                              f"license_status={info.get('license_status')}, "
+                              f"embed_backend={info.get('embed_backend')})",
+                              "fix the embed backend: AMES_EMBED_BACKEND=local needs no license; "
+                              "GET /health/ready returns 503 while degraded")
+            else:
+                all_ok &= ok(f"ames service at {AMES_URL} ({info.get('kinds')})")
         else:
             all_ok &= bad(f"ames service returned {status}", f"{DOCKER_COMPOSE}")
     except Exception:

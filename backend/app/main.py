@@ -366,36 +366,25 @@ def mcp_tool(tool: str, body: dict, who: dict = Depends(caller)):
         return {"error": str(e)}
 
 
-HEALTH_EMBED_TTL_S = 60
-_embed_probe = {"at": 0.0, "ok": True, "error": None}
-_embed_probe_lock = threading.Lock()
-
-
-def _embed_probe_cached() -> dict:
-    """Live embed of "probe", at most once per HEALTH_EMBED_TTL_S."""
-    with _embed_probe_lock:
-        now = time.monotonic()
-        if _embed_probe["at"] and now - _embed_probe["at"] < HEALTH_EMBED_TTL_S:
-            return dict(_embed_probe)
-        try:
-            embeddings.embed(["probe"])
-            _embed_probe.update(ok=True, error=None)
-        except Exception as exc:
-            _embed_probe.update(ok=False, error=embeddings.describe_error(exc))
-        _embed_probe["at"] = now
-        return dict(_embed_probe)
+HEALTH_TTL_S = 60
+HEALTH_ES_TIMEOUT_S = 5
+_health = {"at": 0.0, "body": None}
+_health_state_lock = threading.Lock()     # guards _health only; never held across I/O
+_health_refresh_lock = threading.Lock()   # held by the single refresher while it does I/O
 
 
 def _license_status() -> Optional[str]:
     from .store import es
     try:
-        return es("GET", "/_license").get("license", {}).get("status")
+        return es("GET", "/_license", timeout=HEALTH_ES_TIMEOUT_S).get("license", {}).get("status")
     except Exception:
         return None
 
 
-def _docs_without_vector_24h() -> Optional[int]:
-    """Active docs written in the last 24h that have no embedding, across all kinds."""
+def _docs_without_vector_occurred_24h() -> Optional[int]:
+    """Active docs with no embedding whose occurred_at is in the last 24h, across all kinds.
+    Counted by occurred_at (the caller-supplied event time), not by write time: a backfill of
+    old events does not show up here, and a fresh write with an old occurred_at does not either."""
     from .store import es, idx
     try:
         total = 0
@@ -403,24 +392,80 @@ def _docs_without_vector_24h() -> Optional[int]:
             r = es("POST", f"/{idx(kind)}/_count", {"query": {"bool": {
                 "filter": [{"term": {"active": True}},
                            {"range": {"occurred_at": {"gte": "now-24h"}}}],
-                "must_not": [{"exists": {"field": "embedding"}}]}}})
+                "must_not": [{"exists": {"field": "embedding"}}]}}}, timeout=HEALTH_ES_TIMEOUT_S)
             total += r.get("count", 0)
         return total
     except Exception:
         return None
 
 
+def _compute_health() -> dict:
+    """Build the whole health body. One embed attempt with a short timeout (no retry budget)."""
+    try:
+        embeddings.probe()
+        embed_error = None
+    except Exception as exc:
+        embed_error = embeddings.describe_error(exc)
+    body = {"ok": embed_error is None, "kinds": list(KINDS), "embed_ok": embed_error is None,
+            "vector_arm": embed_error is None, "degraded": embed_error is not None,
+            "fusion": memory.fusion_mode(), "embed_backend": embeddings.backend_name(),
+            "license_status": _license_status(),
+            "docs_without_vector_occurred_24h": _docs_without_vector_occurred_24h(),
+            "embed_failures": dict(embeddings.FAILURES)}
+    if embed_error:
+        body["embed_error"] = embed_error
+    return body
+
+
+def _store_health(body: dict) -> None:
+    with _health_state_lock:
+        _health.update(at=time.monotonic(), body=body)
+
+
+def _refresh_health_in_background() -> None:
+    try:
+        _store_health(_compute_health())
+    finally:
+        _health_refresh_lock.release()
+
+
+def _health_cached() -> dict:
+    """Health body, recomputed at most once per HEALTH_TTL_S. A stale body is served while a
+    single background refresher recomputes it, so no request waits on the network when a
+    cached value exists. Only the very first call (nothing cached) computes inline."""
+    with _health_state_lock:
+        body, at = _health["body"], _health["at"]
+    if body is not None and time.monotonic() - at < HEALTH_TTL_S:
+        return dict(body)
+    if body is not None:
+        if _health_refresh_lock.acquire(blocking=False):
+            threading.Thread(target=_refresh_health_in_background, daemon=True).start()
+        return dict(body)
+    with _health_refresh_lock:
+        with _health_state_lock:
+            body = _health["body"]
+        if body is None:
+            body = _compute_health()
+            _store_health(body)
+    return dict(body)
+
+
+def _health_reset() -> None:
+    with _health_state_lock:
+        _health.update(at=0.0, body=None)
+
+
 @app.get("/health")
 def health():
-    """Liveness plus embed/fusion truth. 503 when the live embed probe fails: a service that
-    silently writes vector-less docs is not healthy (the 2026-10-31 license expiry did that
-    for five days behind a green /health)."""
-    probe = _embed_probe_cached()
-    body = {"ok": probe["ok"], "kinds": list(KINDS), "embed_ok": probe["ok"],
-            "fusion": memory.fusion_mode(), "license_status": _license_status(),
-            "docs_without_vector_24h": _docs_without_vector_24h(),
-            "embed_failures": dict(embeddings.FAILURES)}
-    if not probe["ok"]:
-        body["embed_error"] = probe["error"]
-        return JSONResponse(body, status_code=503)
-    return body
+    """Liveness (always HTTP 200 while the process serves) plus embed/fusion truth in the body:
+    `degraded`/`embed_ok`/`vector_arm`/`embed_error`. Consumers that gate on reachability (the
+    Hermes plugin, ames_doctor) keep working; readiness probes use GET /health/ready."""
+    return _health_cached()
+
+
+@app.get("/health/ready")
+def health_ready():
+    """Readiness: same body as /health, HTTP 503 while degraded (embed probe failing). The
+    2026-10-31 license expiry silently wrote vector-less docs for five days behind a green health."""
+    body = _health_cached()
+    return JSONResponse(body, status_code=503 if body["degraded"] else 200)
