@@ -123,9 +123,13 @@ def test_recency_boost_orders_recent_first(monkeypatch):
     assert boosted.index(recent_first) < boosted.index(old_second), [h["text"] for h in boosted]
 
     monkeypatch.setattr(memory, "RECENCY_WEIGHT", 0.0)
-    flat = memory.recall(OWNER, "shard rebalance targets", size=8)["results"]
-    assert flat.index(next(h for h in flat if h["text"] == old)) < \
-        flat.index(next(h for h in flat if h["text"] == new)), [h["text"] for h in flat]
+    # With the weight at 0 the recency arm must contribute nothing. Asserting a relative order
+    # of the two docs here was flaky: their lexical/kNN RRF scores are near-tied, so which one
+    # leads depends on embedding/rerank tie-breaks, not on recency.
+    flat = memory.recall(OWNER, "shard rebalance targets", size=8, rerank=False)["results"]
+    pair = [h for h in flat if h["text"] in (old, new)]
+    assert len(pair) == 2, [h["text"] for h in flat]
+    assert all(h["recency"] == 0.0 and h["score"] == h["rrf"] for h in pair), pair
 
 
 # ----------------------------------------------------------------- min_score
