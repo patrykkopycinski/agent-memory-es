@@ -209,3 +209,82 @@ def test_reflect_healthy_is_clean():
     _retain("reflect control: lighthouse keeper rota for the winter season")
     body = memory.reflect(_owner(), "lighthouse keeper rota", llm_answer_fn=False, rounds=1)
     assert body["degraded"] == [] and "embed_error" not in body
+
+
+def test_idle_gap_past_two_ttls_computes_inline_not_stale(monkeypatch):
+    """A one-shot caller after a long idle gap must get the fresh verdict, not the old body."""
+    import time
+    client.get("/health")                                    # healthy verdict cached
+    monkeypatch.setattr(embeddings, "embed", _boom)          # backend now broken
+    main._health["at"] = time.monotonic() - 10 * main.HEALTH_TTL_S
+    assert client.get("/health").json()["degraded"] is True
+    main._health["at"] = time.monotonic() - 10 * main.HEALTH_TTL_S
+    assert client.get("/health/ready").status_code == 503
+
+
+def test_refresh_lock_is_released_when_the_refresher_thread_cannot_start(monkeypatch):
+    import threading
+    import time
+    client.get("/health")
+    main._health["at"] = time.monotonic() - main.HEALTH_TTL_S - 1     # stale but < 2*TTL
+
+    def no_start(self):
+        raise RuntimeError("can't start new thread")
+    monkeypatch.setattr(threading.Thread, "start", no_start)
+    with pytest.raises(RuntimeError, match="can't start"):
+        main._health_cached()
+    assert main._health_refresh_lock.acquire(blocking=False), "lock leaked"
+    main._health_refresh_lock.release()
+
+
+def test_startup_warms_the_local_model_and_health_cache_without_blocking(monkeypatch):
+    import threading
+    calls, gate = [], threading.Event()
+    monkeypatch.setattr(embeddings, "backend", lambda: "local")
+    monkeypatch.setattr(embeddings, "_local_model", lambda: (gate.wait(5), calls.append("model")))
+    monkeypatch.setattr(main, "_health_cached", lambda: calls.append("health"))
+    import time
+    t = time.monotonic()
+    main._warm_embedder_in_background()
+    assert time.monotonic() - t < 1                           # startup does not wait for the load
+    assert calls == []
+    gate.set()
+    for _ in range(50):
+        if calls == ["model", "health"]:
+            break
+        time.sleep(0.05)
+    assert calls == ["model", "health"]
+
+
+def test_warmup_failure_never_propagates_and_skips_model_for_other_backends(monkeypatch):
+    calls = []
+    monkeypatch.setattr(embeddings, "backend", lambda: "es")
+    monkeypatch.setattr(embeddings, "_local_model", lambda: calls.append("model"))
+    monkeypatch.setattr(main, "_health_cached", lambda: calls.append("health"))
+    main._warm_embedder()
+    assert calls == ["health"]                                # no ONNX load on es/omniroute
+    monkeypatch.setattr(embeddings, "backend", lambda: "local")
+    monkeypatch.setattr(embeddings, "_local_model", lambda: (_ for _ in ()).throw(RuntimeError("no model")))
+    main._warm_embedder()                                     # must not raise
+
+
+def test_startup_hook_schedules_the_warmup_after_ensure_indices_and_survives_thread_failure(monkeypatch):
+    import threading
+    order = []
+    monkeypatch.setattr(main, "ensure_indices", lambda: order.append("indices"))
+    monkeypatch.setattr(main.facts, "ensure_queue", lambda: order.append("queue"))
+    monkeypatch.setattr(main.pages_mod, "ensure_pages_index", lambda: order.append("pages"))
+    monkeypatch.setattr(main.mm_mod, "ensure_models_index", lambda: order.append("models"))
+    monkeypatch.setattr(main, "_warm_embedder", lambda: order.append("warm"))
+    main._startup()
+    for _ in range(50):
+        if "warm" in order:
+            break
+        import time
+        time.sleep(0.05)
+    assert order[:4] == ["indices", "queue", "pages", "models"] and order[-1] == "warm"
+
+    def no_start(self):
+        raise RuntimeError("can't start new thread")
+    monkeypatch.setattr(threading.Thread, "start", no_start)
+    main._startup()                                           # a failed warm-up thread must not fail startup

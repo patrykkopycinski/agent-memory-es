@@ -34,6 +34,26 @@ def _startup():
     facts.ensure_queue()
     pages_mod.ensure_pages_index()
     mm_mod.ensure_models_index()
+    _warm_embedder_in_background()
+
+
+def _warm_embedder() -> None:
+    """Load the ONNX session and fill the health cache so the first /health (a watchdog with a
+    10 s curl cap) does not pay the cold-start model load. Best effort: never raises."""
+    try:
+        if embeddings.backend() == "local":
+            embeddings._local_model()
+        _health_cached()
+    except Exception:
+        logging.getLogger("ames.startup").warning(
+            "embedder warm-up failed (first /health will compute inline)", exc_info=True)
+
+
+def _warm_embedder_in_background() -> None:
+    try:
+        threading.Thread(target=_warm_embedder, daemon=True, name="embed-warmup").start()
+    except Exception:
+        logging.getLogger("ames.startup").warning("could not start embedder warm-up", exc_info=True)
 
 
 def caller(x_api_key: Optional[str] = Header(None)) -> dict:
@@ -437,21 +457,27 @@ def _refresh_health_in_background() -> None:
 
 
 def _health_cached() -> dict:
-    """Health body, recomputed at most once per HEALTH_TTL_S. A stale body is served while a
-    single background refresher recomputes it, so no request waits on the network when a
-    cached value exists. Only the very first call (nothing cached) computes inline."""
+    """Health body, recomputed at most once per HEALTH_TTL_S. Within 2*HEALTH_TTL_S a stale body
+    is served while a single background refresher recomputes it, so a busy endpoint never waits
+    on the network. Past that (an idle gap: a one-shot doctor or readiness probe) the stale
+    verdict is too old to trust, so the caller computes inline. Nothing cached also computes inline."""
     with _health_state_lock:
         body, at = _health["body"], _health["at"]
-    if body is not None and time.monotonic() - at < HEALTH_TTL_S:
+    age = time.monotonic() - at
+    if body is not None and age < HEALTH_TTL_S:
         return dict(body)
-    if body is not None:
+    if body is not None and age < 2 * HEALTH_TTL_S:
         if _health_refresh_lock.acquire(blocking=False):
-            threading.Thread(target=_refresh_health_in_background, daemon=True).start()
+            try:
+                threading.Thread(target=_refresh_health_in_background, daemon=True).start()
+            except BaseException:
+                _health_refresh_lock.release()
+                raise
         return dict(body)
     with _health_refresh_lock:
         with _health_state_lock:
-            body = _health["body"]
-        if body is None:
+            body, at = _health["body"], _health["at"]
+        if body is None or time.monotonic() - at >= 2 * HEALTH_TTL_S:
             body = _compute_health()
             _store_health(body)
     return dict(body)
