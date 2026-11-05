@@ -11,10 +11,10 @@ services:
       AMES_API_KEYS_FILE: /data/ames_keys.json
       AMES_CONSOLIDATE_INTERVAL: "600"
       AMES_LLM_BASE: http://host.docker.internal:20128/v1
-      AMES_LLM_KEY: ${OMNIROUTE_API_KEY:?set}
+      AMES_LLM_KEY: ${AMES_LLM_KEY:?set in .env}
       AMES_LLM_MODEL: auto/best-chat
     ports:
-      - "8123:8123"
+      - "127.0.0.1:8123:8123"   # loopback: reached via ssh forward
     volumes:
       - ~/ames-data:/data
     command: uvicorn app.main:app --host 0.0.0.0 --port 8123
@@ -30,3 +30,33 @@ services:
     volumes:
       - ~/ames-data:/data
     command: python -m app.worker
+  ames-fact-worker:
+    build: .
+    container_name: ames-fact-worker
+    restart: unless-stopped
+    environment:
+      AMES_ES_URL: http://host.docker.internal:9268
+      AMES_EMBED_BACKEND: local   # off-license; parity with ES _inference verified (cos>=0.99996)
+      AMES_API_KEYS_FILE: /data/ames_keys.json
+      AMES_LLM_BASE: http://host.docker.internal:20128/v1
+      AMES_LLM_KEY: ${AMES_LLM_KEY:?set in .env}
+      AMES_LLM_MODEL: ames-extract
+      AMES_LLM_TEMPERATURE: omit
+    volumes:
+      - ~/ames-data:/data
+    command: python -m app.worker --facts
+  ames-backfill-worker:
+    build: .
+    container_name: ames-backfill-worker
+    restart: unless-stopped
+    environment:
+      AMES_ES_URL: http://host.docker.internal:9268
+      AMES_EMBED_BACKEND: local   # off-license; parity with ES _inference verified (cos>=0.99996)
+      AMES_API_KEYS_FILE: /data/ames_keys.json
+      AMES_LLM_BASE: http://host.docker.internal:20128/v1
+      AMES_LLM_KEY: ${AMES_LLM_KEY:?set in .env}
+      AMES_LLM_MODEL: ames-extract
+      AMES_LLM_TEMPERATURE: omit
+    volumes:
+      - ~/ames-data:/data
+    command: python -m app.worker --backfill
