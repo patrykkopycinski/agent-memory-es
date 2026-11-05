@@ -130,8 +130,8 @@ def test_recency_boost_orders_recent_first(monkeypatch):
     assert old in b and new in b and old in f and new in f, [h["text"] for h in boosted]
     # weight 5: the recent doc leads, by a margin far above the 1-rank RRF gap
     assert [h["text"] for h in boosted if h["text"] in (old, new)] == [new, old], [h["text"] for h in boosted]
-    # weight 0: the docs' RRF scores tie exactly (BM25 favours one, kNN the other) and fusion breaks
-    # the tie on the random ES doc id, so flat ORDER is arbitrary. Assert the deterministic part.
+    # weight 0: the per-arm RRF scores tie exactly in _hybrid_app_fusion (BM25 favours one doc, kNN
+    # the other), so the flat order is decided by the random ES doc id. Assert the deterministic part.
     assert all(f[t]["recency"] == 0.0 and f[t]["score"] == f[t]["rrf"] for t in (old, new)), f
     assert b[new]["recency"] > b[old]["recency"] >= 0.0
     d_boost = b[new]["score"] - b[old]["score"]
