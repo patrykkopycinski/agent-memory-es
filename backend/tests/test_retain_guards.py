@@ -126,6 +126,11 @@ MUST_ACCEPT = [
     "token: ./src/plugins2/auth/README.md",
     "token: ../src/plugins2/auth/README.md",
     "secret: /srv/app2/config/keys.json",
+    "token: mistralai/Mixtral-8x7B-Instruct-v0.1",    # "model:" is not a keyword; use one that fires
+    "token: deepseek-ai/DeepSeek-V3.2-Exp",
+    "model: mistralai/Mixtral-8x7B-Instruct-v0.1",
+    "model: deepseek-ai/DeepSeek-V3.2-Exp",
+    "token: src/abcdefghij12/README.md",              # 12-char lower+digit run: only 3 classes are key material (M13)
 ]
 
 
@@ -340,6 +345,23 @@ MUST_REJECT = [
     # hex chunks joined by '/' are not a path
     "secret: 3f9a8c7b/6d5e4f3a/2b1c0d9e/8f7a6b5c",
     "token: 3f9a8c7b6d5e/4f3a2b1c0d9e",
+    # review round 3: short random chunks joined by '/' are not a path
+    "token: Xkqz9/Mzpw7/Wqtr3/Hjkl2/Pvbn8",
+    "secret: Qwerty7/Asdfgh3/Zxcvbn9",
+    "token: Hqlmx7/Prtvw8/Zbnck3",
+    "secret: projects/123456789012/secrets/Hqlmxp7/versions/1",
+    "password: ../ab3cd/ef5gh/ij7kl/mn2op",
+    "auth: ./Abc12/Def34/Ghi56/Jkl78.json",
+    "token: xk9mq/pl7vr/tn8wb/zh5k2",
+    "token: owner/repo-Qwen3-KxZqPw2/readme",         # M8: a Capitalized piece is not any-case
+    "token: owner/repo-Qwen123456-readme",            # M9: at most 2 digits after a Capitalized word
+    "secret: owner/repo/12345678901234567890",        # M10: a numeric piece is capped at 12 digits
+    "token: owner/readme/abcdef1234",                 # a word takes a 1-2 digit suffix, not 4
+    "token: owner/repo-Abcdefghijkl9-readme",         # a 12+ char upper/lower/digit run, even inside a model-id segment
+    "token: a1b2-c3d4-e5f6/readme",                   # most pieces mix letters and digits
+    "token: abc1/ab/cd/ef/12345678",                  # no real word (4+ letters) anywhere
+    "token: xkqz/mzpw/wqtr/12345678",                 # 4+ letters but no vowel is not a word
+    "token: ab/cd/ef/12345678",                       # 2 letters is not a word
 ]
 
 

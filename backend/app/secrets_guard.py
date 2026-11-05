@@ -45,12 +45,16 @@ _SLUG_PIECE = re.compile(r"^(?:[a-z]{1,}[0-9]{0,4}[a-z]{0,2}|v?[0-9]{1,8}[a-z]{0
 # and 64-hex values are never exempt, and neither are upper-case hex strings.
 _HEX_HASH = re.compile(r"^(?:[0-9a-f]{7,12}|[0-9a-f]{40})$")
 _COMMIT_WORDS = frozenset({"commit", "sha", "rev", "hash"})
-# Path-only pieces, on top of _is_slug_piece: a short git-style id ("b400b54"), a compact
-# timestamp ("20261105T091828"), a long numeric id (GCP project number), a Capitalized word with a
-# size suffix ("Qwen3", "Llama"), a size ("70B") and an "A3B"-style tag. Hex chunks that start
-# with a digit ("3f9a8c7b") match none of these.
-_PATH_PIECE = re.compile(
-    r"^(?:[a-z]{1,2}[0-9]{1,4}[a-z]{1,2}[0-9]{1,4}|[0-9]{8}T[0-9]{6}|[0-9]{1,12}|[A-Z][a-z]{2,}[0-9]{0,3}|[0-9]{1,3}[A-Z]|[A-Z][0-9]{1,2}[A-Z])$")
+# Path pieces. A lone path segment ("Hqlmx7", "xk9mq") is an ordinary word, a number, or a word plus
+# a 1-2 digit suffix ("plugins2"); mixed letter/digit chunks are accepted only INSIDE a '-'/'_'
+# joined segment, where model ids live ("Qwen3-Coder-30B-A3B-Instruct", "Mixtral-8x7B-v0.1"), so
+# short random chunks joined by '/' never qualify.
+_PATH_NUM = re.compile(r"^(?:[0-9]{8}T[0-9]{6}|[0-9]{1,12})$")        # id, GCP project number, timestamp
+_WORD_NUM = re.compile(r"^[a-z]{3,}[0-9]{1,2}$")                      # "plugins2", "weekly2"
+_JOINED_PIECE = re.compile(
+    r"^(?:[a-z]{1,2}[0-9]{1,4}[a-z]{1,2}[0-9]{1,4}"                   # short git-style id "b400b54"
+    r"|[A-Z][a-z]{2,}[0-9]{0,2}|(?:[A-Z][a-z]{2,}){2,3}"             # "Qwen3", "DeepSeek"
+    r"|V[0-9]{1,2}|[0-9]{1,3}[A-Z]|[A-Z][0-9]{1,2}[A-Z]|[0-9]{1,2}x[0-9]{1,3}[A-Z])$")  # "V3", "70B", "A3B", "8x7B"
 _PATH_ROOT = re.compile(r"^(?:~|\.{1,2})?/")
 _ALNUM_RUN = re.compile(r"[A-Za-z0-9]{12,}")
 
@@ -74,21 +78,43 @@ def _has_random_run(value: str) -> bool:
                for r in _ALNUM_RUN.findall(value))
 
 
+def _dot_pieces(part: str) -> list:
+    return [x for x in part.split(".") if x]
+
+
 def _is_path_segment(seg: str) -> bool:
-    pieces = [x for part in _SLUG_SEP.split(seg) for x in part.split(".") if x]
-    return bool(pieces) and all(_is_slug_piece(x) or _PATH_PIECE.match(x) is not None for x in pieces)
+    parts = [p for p in _SLUG_SEP.split(seg) if p]
+    if not parts:
+        return False
+    if len(parts) > 1:
+        return all(_is_slug_piece(x) or _PATH_NUM.match(x) is not None or _JOINED_PIECE.match(x) is not None
+                   for p in parts for x in _dot_pieces(p))
+    return all((x.isalpha() and _is_slug_piece(x)) or _PATH_NUM.match(x) is not None
+               or _WORD_NUM.match(x) is not None or re.match(r"^v?[0-9]{1,8}$", x) is not None
+               for x in _dot_pieces(parts[0]))
+
+
+def _path_pieces_look_random(segs: list) -> bool:
+    """No real word (4+ letters with a vowel) anywhere, or most pieces mixing letters and digits."""
+    pieces = [x for seg in segs for p in _SLUG_SEP.split(seg) for x in _dot_pieces(p)]
+    if not any(x.isalpha() and len(x) >= 4 and re.search(r"[aeiouAEIOU]", x) for x in pieces):
+        return True
+    mixed = [x for x in pieces if re.search(r"[A-Za-z]", x) and re.search(r"[0-9]", x) and not re.match(r"^v?[0-9]+$", x)]
+    return len(mixed) * 2 > len(pieces)
 
 
 def _is_path(value: str) -> bool:
     """A filesystem path, owner/repo, model id or resource name, not a credential: 2+ '/'-segments
     (after an optional '/', '~/', './' or '../' root), every one made of ordinary words, ids or
-    sizes, and no 12+ char mixed-case-and-digit run anywhere. Rooted values get no special
-    treatment: '~/Xk9mQ2pL7vR4tN8w/B3zH' fails on its first segment like a relative path would.
+    sizes, at least one real word, fewer than half the pieces mixing letters and digits, and no
+    12+ char mixed-case-and-digit run anywhere. Rooted values get no special treatment:
+    '~/Xk9mQ2pL7vR4tN8w/B3zH' fails on its first segment like a relative path would.
     Base64 secrets that merely contain '/' (AWS-style) have mixed-case/digit segments."""
     if "/" not in value or _has_random_run(value):
         return False
     segs = [x for x in _PATH_ROOT.sub("", value).split("/") if x]
-    return len(segs) >= 2 and all(_is_path_segment(x) for x in segs)
+    return (len(segs) >= 2 and all(_is_path_segment(x) for x in segs)
+            and not _path_pieces_look_random(segs))
 
 
 def _is_commit_hash(value: str, scheme_word: str) -> bool:
