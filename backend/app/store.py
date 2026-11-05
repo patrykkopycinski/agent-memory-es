@@ -116,13 +116,24 @@ def is_doc_miss(exc) -> bool:
     return "-> 404" in text and bool(_DOC_MISS.search(text))
 
 
+def _es_headers() -> dict:
+    """Auth for the ES target. Unauthenticated by default (compose quickstart
+    runs security-off); AMES_ES_API_KEY adds an ApiKey header for secured
+    clusters (e.g. an Elastic Cloud deployment)."""
+    headers = {"Content-Type": "application/json"}
+    api_key = os.environ.get("AMES_ES_API_KEY")
+    if api_key:
+        headers["Authorization"] = f"ApiKey {api_key}"
+    return headers
+
+
 def es(method: str, path: str, body: Optional[dict] = None, timeout: float = 30) -> dict:
     if os.environ.get("AMES_TEST_GUARD") == "1":
         _guard_path(path, method)
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(
         _es_url() + path, data=data, method=method,
-        headers={"Content-Type": "application/json"},
+        headers=_es_headers(),
     )
     try:
         return json.load(urllib.request.urlopen(req, timeout=timeout))

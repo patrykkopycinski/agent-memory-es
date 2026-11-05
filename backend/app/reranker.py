@@ -8,7 +8,7 @@ import time
 import urllib.error
 import urllib.request
 
-from .store import _es_url
+from .store import _es_headers, _es_url
 
 # Cross-encoder call budget (seconds). Recall is an interactive call, so rerank gets a short
 # leash: past this the fused order is served and the response says why (fallback_reason).
@@ -61,7 +61,7 @@ def rerank(query: str, hits: list, top_n: int = 5,
     }).encode()
     req = urllib.request.Request(
         _es_url() + f"/_inference/rerank/{model}", data=body, method="POST",
-        headers={"Content-Type": "application/json"})
+        headers=_es_headers())
     try:
         with urllib.request.urlopen(req, timeout=RERANK_TIMEOUT if timeout is None else timeout) as r:
             out = json.load(r)

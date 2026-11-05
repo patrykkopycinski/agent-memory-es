@@ -18,6 +18,7 @@ from typing import Optional
 from . import http_retry
 from .store import _es_url
 
+
 log = logging.getLogger("ames.embed")
 ES_ENDPOINT = os.environ.get("AMES_ES_INFERENCE", ".multilingual-e5-small-elasticsearch")
 OR_BASE = os.environ.get("AMES_EMBED_BASE", "http://localhost:20128/v1")
@@ -32,8 +33,12 @@ PROBE_TIMEOUT_S = 5
 
 
 def _post(url, body, headers=None, timeout=60):
+    hdrs = {"Content-Type": "application/json", **(headers or {})}
+    es_key = os.environ.get("AMES_ES_API_KEY")
+    if es_key and url.startswith(_es_url()):
+        hdrs.setdefault("Authorization", f"ApiKey {es_key}")
     req = urllib.request.Request(url, data=json.dumps(body).encode(), method="POST",
-                                 headers={"Content-Type": "application/json", **(headers or {})})
+                                 headers=hdrs)
     if getattr(_probe_ctx, "active", False):
         with urllib.request.urlopen(req, timeout=PROBE_TIMEOUT_S) as response:
             return json.load(response)
