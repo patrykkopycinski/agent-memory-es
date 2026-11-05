@@ -16,7 +16,7 @@ x-ames-r7-env: &ames-r7-env
 
 services:
   ames-backend-r7:
-    build: ..
+    build: .
     image: ames-r7:local
     container_name: ames-backend-r7
     restart: unless-stopped
