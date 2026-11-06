@@ -56,11 +56,31 @@ def _warm_embedder_in_background() -> None:
         logging.getLogger("ames.startup").warning("could not start embedder warm-up", exc_info=True)
 
 
-def caller(x_api_key: Optional[str] = Header(None)) -> dict:
+def _identify(x_api_key: Optional[str]) -> dict:
     who = auth.owner_of(x_api_key or "")
     if not who:
         raise HTTPException(401, "invalid or missing X-API-Key")
     return who
+
+
+def caller(x_api_key: Optional[str] = Header(None)) -> dict:
+    """Any key except an approver key: approving is a human act and an approver key is
+    good for the governance routes only, never for memory reads or writes."""
+    who = _identify(x_api_key)
+    if who.get("role") == "approver":
+        raise HTTPException(403, "approver keys are accepted on /governance/* only")
+    return who
+
+
+def any_key(x_api_key: Optional[str] = Header(None)) -> dict:
+    """Every valid key, approvers included (the read-only proposal list)."""
+    return _identify(x_api_key)
+
+
+def identity(who: dict) -> str:
+    """The human behind a key: its person when set, else its owner id. Authorship and approval
+    are compared on this, never on the key."""
+    return who.get("person") or who["owner_id"]
 
 
 class RetainIn(BaseModel):
@@ -140,7 +160,8 @@ class RejectIn(BaseModel):
 
 
 @app.post("/admin/keys")
-def mint_key(owner_id: str, role: str = "member", _admin: str = Header(None, alias="X-Admin-Token")):
+def mint_key(owner_id: str, role: str = "member", person: Optional[str] = None,
+             _admin: str = Header(None, alias="X-Admin-Token")):
     # No default token: an unset or empty AMES_ADMIN_TOKEN disables key minting
     # rather than accepting a guessable or empty header.
     expected = os.environ.get("AMES_ADMIN_TOKEN", "")
@@ -149,7 +170,9 @@ def mint_key(owner_id: str, role: str = "member", _admin: str = Header(None, ali
     if not _admin or not hmac.compare_digest(_admin.encode(), expected.encode()):
         raise HTTPException(403, "bad admin token")
     try:
-        return {"api_key": auth.create_key(owner_id, role), "owner_id": owner_id}
+        return {"api_key": auth.create_key(owner_id, role, person), "owner_id": owner_id}
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from None
     except auth.KeyStoreNotWritable as exc:
         # path/errno stay server-side; the client only learns the store is unavailable
         logging.getLogger("ames.auth").error("%s", exc)
@@ -211,7 +234,8 @@ def retain(body: RetainIn, who: dict = Depends(caller)):
     try:
         return memory.retain(who["owner_id"], body.kind, body.text, body.visibility,
                              body.occurred_at, body.doc_group, body.tags, body.labels,
-                             body.extract_facts, body.supersedes_decision)
+                             body.extract_facts, body.supersedes_decision,
+                             person=identity(who))
     except governance.GovernedError as e:
         raise HTTPException(409, str(e))
     except ValueError as e:
@@ -232,7 +256,8 @@ def delete_memory(kind: str, doc_id: str, retract: Literal["true", "false"] = "f
     # Literal, not bool: FastAPI's lax bool would read ?retract=yes/1/on as true, and a
     # misread flag here silently decides whether the text is blocked forever
     try:
-        return memory.delete(who["owner_id"], kind, doc_id, retract == "true")
+        return memory.delete(who["owner_id"], kind, doc_id, retract == "true",
+                             person=identity(who))
     except ValueError as e:
         raise HTTPException(422, str(e))
     except PermissionError:
@@ -271,7 +296,8 @@ def exists(body: ExistsIn, who: dict = Depends(caller)):
 @app.post("/memory/promote")
 def promote(body: PromoteIn, who: dict = Depends(caller)):
     try:
-        return memory.promote(who["owner_id"], body.kind, body.doc_id, body.to_visibility)
+        return memory.promote(who["owner_id"], body.kind, body.doc_id, body.to_visibility,
+                              person=identity(who))
     except governance.GovernedError as e:
         raise HTTPException(409, str(e))
     except LookupError as e:
@@ -287,7 +313,8 @@ def update(body: UpdateIn, who: dict = Depends(caller)):
         raise HTTPException(422, "nothing to update: pass at least one of text/tags/visibility/occurred_at")
     try:
         return memory.update(who["owner_id"], body.kind, body.doc_id, body.text,
-                             body.tags, body.visibility, body.occurred_at)
+                             body.tags, body.visibility, body.occurred_at,
+                             person=identity(who))
     except governance.GovernedError as e:
         raise HTTPException(409, str(e))
     except memory.SupersededError as e:
@@ -301,7 +328,8 @@ def update(body: UpdateIn, who: dict = Depends(caller)):
 @app.post("/memory/delete")
 def delete(body: DeleteIn, who: dict = Depends(caller)):
     try:
-        return memory.delete(who["owner_id"], body.kind, body.doc_id, body.retract)
+        return memory.delete(who["owner_id"], body.kind, body.doc_id, body.retract,
+                             person=identity(who))
     except governance.GovernedError as e:
         raise HTTPException(409, str(e))
     except memory.SupersededError as e:
@@ -439,11 +467,14 @@ def _exists_size(size) -> int:
     return size
 
 
-def approver(who: dict = Depends(caller)) -> dict:
+def approver(who: dict = Depends(any_key)) -> dict:
     """Approving or rejecting a decision is a human act: only keys minted with the `approver` role
-    pass. Agent keys (member / owner) are refused, and no MCP tool maps to these routes."""
+    pass, and only if they name a person (approvals are counted per person, not per key). Agent
+    keys (member / owner) are refused, and no MCP tool maps to these routes."""
     if who.get("role") != "approver":
         raise HTTPException(403, "approver role required")
+    if not who.get("person"):
+        raise HTTPException(403, "this approver key names no person; ask an admin to mint one with person=")
     return who
 
 
@@ -461,18 +492,18 @@ def _governance_call(fn, *args):
 
 
 @app.get("/governance/proposals")
-def governance_proposals(limit: int = 50, who: dict = Depends(caller)):
+def governance_proposals(limit: int = 50, who: dict = Depends(any_key)):
     return governance.list_proposals(max(1, min(limit, governance.MAX_LIST)))
 
 
 @app.post("/governance/approve")
 def governance_approve(body: ApproveIn, who: dict = Depends(approver)):
-    return _governance_call(governance.approve, who["owner_id"], body.doc_id, body.note)
+    return _governance_call(governance.approve, who["person"], body.doc_id, body.note)
 
 
 @app.post("/governance/reject")
 def governance_reject(body: RejectIn, who: dict = Depends(approver)):
-    return _governance_call(governance.reject, who["owner_id"], body.doc_id, body.reason)
+    return _governance_call(governance.reject, who["person"], body.doc_id, body.reason)
 
 
 @app.post("/admin/governance/backfill")
@@ -491,7 +522,8 @@ def mcp_tool(tool: str, body: dict, who: dict = Depends(caller)):
     handlers = {
         "retain": lambda b: memory.retain(who["owner_id"], b["kind"], b["text"],
                                           b.get("visibility", "private"),
-                                          b.get("occurred_at"), b.get("doc_group")),
+                                          b.get("occurred_at"), b.get("doc_group"),
+                                          person=identity(who)),
         "recall": lambda b: memory.recall(who["owner_id"], b["query"], b.get("kinds"),
                                           _bounded_size(b.get("size", 8)), b.get("min_score"),
                                           b.get("as_of"), b.get("per_doc"), b.get("rerank"),
@@ -500,12 +532,14 @@ def mcp_tool(tool: str, body: dict, who: dict = Depends(caller)):
         "exists": lambda b: memory.exists(who["owner_id"], b.get("kind"), b.get("tags"),
                                           b.get("text"), _exists_size(b.get("size", 5))),
         "reflect": lambda b: memory.reflect(who["owner_id"], b["question"]),
-        "promote": lambda b: memory.promote(who["owner_id"], b["kind"], b["doc_id"], b["to_visibility"]),
+        "promote": lambda b: memory.promote(who["owner_id"], b["kind"], b["doc_id"], b["to_visibility"],
+                                            person=identity(who)),
         "update": lambda b: memory.update(who["owner_id"], b["kind"], b["doc_id"],
                                           b.get("text"), b.get("tags"),
-                                          b.get("visibility"), b.get("occurred_at")),
+                                          b.get("visibility"), b.get("occurred_at"),
+                                          person=identity(who)),
         "delete": lambda b: memory.delete(who["owner_id"], b["kind"], b["doc_id"],
-                                          b.get("retract", False)),
+                                          b.get("retract", False), person=identity(who)),
         "unreject": lambda b: memory.unreject(who["owner_id"], b.get("text"), b.get("source_id")),
     }
     if tool not in handlers:

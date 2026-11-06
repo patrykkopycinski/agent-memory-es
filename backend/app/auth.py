@@ -150,9 +150,14 @@ def _save(keys: dict) -> None:
         raise
 
 
+ROLES = ("member", "owner", "approver")
+
+
 def create_key(owner_id: str, role: str = "member", person: Optional[str] = None) -> str:
     """Mint an API key for owner_id. Returns the plaintext key once. `person` names the human
     behind the key; governance counts people, not keys."""
+    if role not in ROLES:
+        raise ValueError(f"role must be one of {ROLES}")
     token = "ame_" + secrets.token_hex(32)
     digest = hashlib.sha256(token.encode()).hexdigest()
     entry = {"owner_id": owner_id, "role": role}
