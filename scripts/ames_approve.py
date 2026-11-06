@@ -107,6 +107,10 @@ def run(args, key: str, out=print) -> int:
             out(render(p))
         if args.cmd == "list":
             out(f"{res['total']} open proposal(s)")
+            for c in res.get("override_conflicts") or []:
+                out(f"WARNING: override {c['id']} is active but could not supersede "
+                    f"{c.get('proposal_for')}; both are in force until an operator resolves it")
+                out("  " + (c.get("text") or "").replace("\n", "\n  "))
         return 0
     if args.cmd == "approve":
         status, res = request(args.url, key, "POST", "/governance/approve",
@@ -118,6 +122,9 @@ def run(args, key: str, out=print) -> int:
         out(f"error {status}: {res.get('error')}")
         return 1
     out(json.dumps(res))
+    if res.get("conflict"):
+        out(f"WARNING: {res.get('warning') or 'override activated but its target is held by another decision'}")
+        return 2
     return 0
 
 
