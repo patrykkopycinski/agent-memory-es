@@ -652,8 +652,13 @@ def expire_stale_proposals(now: Optional[float] = None) -> dict:
     released = _release_orphaned_claims(now_iso)
     global _last_full_reconcile
     full = _now() - _last_full_reconcile >= full_reconcile_seconds()
-    completed, conflicts = _reconcile_overrides(full=full)
-    if full:                              # an exception above leaves the marker: retried next pass
+    try:
+        completed, conflicts = _reconcile_overrides(full=full)
+    except Exception:
+        if full:                          # back off: retry the full scan in an hour, not every pass
+            _last_full_reconcile = _now() - full_reconcile_seconds() + 3600
+        raise
+    if full:
         _last_full_reconcile = _now()
     return {"expired": expired, "completed_overrides": completed, "released_claims": released,
             "override_conflicts": conflicts}
