@@ -123,7 +123,11 @@ def dispatch(url: str, key: str, name: str, args: dict) -> dict:
         return label_proposals(http(url, key, "/memory/recall", body))
     if name == "memory_proposals":
         limit = min(max(int(args.get("limit", 50)), 1), 100)
-        return http_get(url, key, f"/governance/proposals?limit={limit}")
+        out = http_get(url, key, f"/governance/proposals?limit={limit}")
+        if out.get("override_conflicts"):
+            out["warning"] = ("override conflict: an active override could not supersede its target; "
+                              "both decisions are in force until an operator resolves it")
+        return out
     if name == "ames_retain":
         return http(url, key, "/memory/retain",
                     {"kind": args["kind"], "text": args["text"],
