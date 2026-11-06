@@ -35,6 +35,7 @@ KINDS = ("episodic", "semantic", "procedural")
 GOVERNANCE_PROPERTIES = {
     "decision_status": {"type": "keyword"},
     "proposed_by": {"type": "keyword"},
+    "proposed_by_persons": {"type": "keyword"},
     "proposal_for": {"type": "keyword"},
     "approvals": {"properties": {
         "by": {"type": "keyword"}, "at": {"type": "date"},
@@ -184,10 +185,11 @@ def _governance_mapped(index: str) -> bool:
     is "unknown", so False: the migration is then attempted."""
     try:
         got = es("GET", f"/{index}/_mapping")
-        props = next(iter(got.values()))["mappings"].get("properties", {})
-    except (RuntimeError, StopIteration, KeyError, AttributeError):
+        # an alias can span several indices: every one of them must map the fields
+        all_props = [v["mappings"].get("properties", {}) for v in got.values()]
+    except (RuntimeError, KeyError, AttributeError):
         return False
-    return _fields_mapped(GOVERNANCE_PROPERTIES, props)
+    return bool(all_props) and all(_fields_mapped(GOVERNANCE_PROPERTIES, p) for p in all_props)
 
 
 def ensure_indices() -> None:
