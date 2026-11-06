@@ -57,7 +57,21 @@ Approval is a human act. Keys carry a role from a fixed allowlist (`member`, `ow
 the key (`422` without one): `POST /admin/keys?owner_id=..&role=approver&person=alice`. Keys
 minted before `person` was required keep working as agent keys; name their person with
 `POST /admin/keys/person?owner_id=..&person=alice` (admin token; only keys with no person are
-changed). Only the `approver` role may call
+changed; the call is audited as a `key_set_person` row and logged, and returns `updated`, the number
+of keys changed).
+
+**One human, one person string.** Persons are trimmed and lowercased at mint time and in
+`set-person`, so `Alice` and `alice` are one person, and the author check compares them that way.
+Use the same string for every key of a human.
+
+**Governed writes need a person.** A key without one (minted before `person` was required) can
+still read, recall and write private or non-governed memories, but a team `kind:decision` retain,
+an override, or promoting a private decision to team answers `403` ("name the person first via
+/admin/keys/person"). The proposal also stores the author set at propose time
+(`proposed_by_persons`: the author and every person named on a key of the owner then), and the
+author check uses that stored set together with the current one, so revoking a sibling key later
+cannot make the author an eligible approver. An owner can edit or withdraw its earlier proposals
+whether `proposed_by` holds its person or its owner id. Only the `approver` role may call
 `/governance/approve` and `/governance/reject` (`member` and `owner` keys get `403`), and an
 approver key without a `person` cannot approve. Give the approver key and the person's agent keys
 the same `person`, so the author check works across all of them; an approver key must not share
@@ -84,8 +98,8 @@ scripts/ames_approve.py reject <doc_id> --reason TEXT
 | Route | Who | Notes |
 |---|---|---|
 | `POST /memory/retain` | any key | optional `supersedes_decision`; response carries `decision_status`, `approvals_needed` |
-| `GET /governance/proposals` | any key | open proposals with approvals so far |
-| `POST /governance/approve` `{doc_id, note?}` | `approver` | `403` author / non-approver; `409` not open or already approved |
+| `GET /governance/proposals` | any key | open proposals with approvals so far, plus `override_conflicts`: active overrides that could not supersede their target (still active in recall; an operator decides). The `memory_proposals` MCP tool shows both and adds a `warning` when there are conflicts |
+| `POST /governance/approve` `{doc_id, note?}` | `approver` | `403` author / non-approver; `409` not open or already approved. An override that activated but whose target another decision holds answers `200` with `activated: true, conflict: true` |
 | `POST /governance/reject` `{doc_id, reason}` | `approver` | veto owner rejects; others object |
 | `POST /admin/governance/backfill` | admin token | marks existing team decisions `active` (`approved_via: backfill`, `proposed_by` = the owner); compare-and-set per doc, idempotent |
 | `POST /memory/recall` | any key | `include_inactive_decisions: true` also returns rejected / expired / superseded |
@@ -101,6 +115,7 @@ script renders them as "PROPOSED, not in force"); closed decisions are hidden un
 | `AMES_GOV_OVERRIDE_APPROVALS` | `2` | approvals to activate an override (never below the new-decision value) |
 | `AMES_GOV_PROPOSAL_TTL_DAYS` | `14` | a proposal older than this expires; `0` disables expiry |
 | `AMES_GOV_VETO_OWNERS` | empty | comma-separated person ids whose rejection is final |
+| `AMES_GOV_RECONCILE_DAYS` | `7` | the worker re-checks linked overrides decided within this many days (unlinked ones are always checked) |
 
 ## Guarantees
 
@@ -115,13 +130,16 @@ script renders them as "PROPOSED, not in force"); closed decisions are hidden un
   restores a target claimed by an override that never activated, once the claim is older than five
   minutes and with no upper age limit. A target is restored only when its claimant is `proposed`,
   `rejected` or `expired` with no `approved_via`: never when the claimant is active or was itself
-  superseded (A -> B -> C leaves A superseded). It also reconciles every active override that went
-  live through approvals: one whose target is not superseded by it (or that lacks the `supersedes`
+  superseded (A -> B -> C leaves A superseded). After a restore the successor is read again: if it
+  became active in between, the target is claimed again. It also reconciles the active overrides
+  that went live through approvals and were decided within `AMES_GOV_RECONCILE_DAYS`, plus any
+  that lack the `supersedes` link: one whose target is not superseded by it (or that lacks the `supersedes`
   link) is completed. One that cannot be completed (the target is held by another decision or is
   gone) is logged as a warning, audited as `decision_override_conflict` with `outcome: conflict`
   and marked `approved_via: approvals_conflict`, which takes it out of later passes; an operator
   decides. Both passes read every page.
-- **Fail closed on schema.** At startup the index mapping is read first: when every governance
+- **Fail closed on schema.** At startup the index mapping is read first (every index behind an
+  alias is checked): when every governance
   field is already mapped with the right type nothing is written, so a role without
   `put_mapping` still starts. When a field is missing or has the wrong type the mapping is applied;
   if that fails the error is logged and the service refuses to serve retain/recall rather than run

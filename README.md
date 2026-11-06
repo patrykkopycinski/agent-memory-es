@@ -83,6 +83,15 @@ approval is restricted to a human-only `approver` key role that no MCP tool can 
 are counted per person (`person=` at mint time), and an approver key is accepted on `/governance/*`
 only. `scripts/ames_approve.py` is the approval CLI (https only, except loopback). See [docs/GOVERNANCE.md](docs/GOVERNANCE.md).
 
+### Release note: rollout step for existing keys
+
+Decision governance needs to know the human behind each key. Keys minted before `person` was
+required keep working, but they can no longer write team decisions (`403`). Before enabling it for
+a bank that has such keys, name the person once per owner:
+`POST /admin/keys/person?owner_id=<owner>&person=<name>` with the admin token (audited; persons
+are lowercased). The index mapping gains `proposed_by_persons` additively on startup, then run the
+backfill once so earlier team decisions are in force.
+
 ## Benchmarks
 
 Measured against [Hindsight](https://github.com/vectorize-io/hindsight) with the same harness, answer model and judge for both. Full method, per-type tables, development history and follow-ups: **[docs/BENCHMARKS.md](docs/BENCHMARKS.md)**.
