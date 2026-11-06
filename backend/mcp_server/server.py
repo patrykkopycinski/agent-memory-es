@@ -28,7 +28,7 @@ MAX_K = 50
 _TRUE = {"1", "true", "yes", "on"}
 
 # fields of a recalled item worth sending to the model (drops embeddings, rrf internals)
-_ITEM_FIELDS = ("id", "kind", "score", "visibility", "text", "occurred_at",
+_ITEM_FIELDS = ("id", "kind", "score", "confidence", "visibility", "text", "occurred_at",
                 "entities", "doc_group")
 
 
@@ -72,7 +72,8 @@ def build_server(client: AmesClient, allow_write: bool = False,
         scanned = len(items)
         if visibility is not None:
             items = [i for i in items if i.get("visibility") == visibility]
-        items = items[:k]
+        # Best confidence first, ties in backend order, no confidence last; before the cut to k.
+        items = sorted(items, key=lambda i: (i.get("confidence") is None, -(i.get("confidence") or 0.0)))[:k]
         out = {"query": query, "count": len(items),
                "results": [_slim(i) for i in items],
                "abstained": bool(resp.get("abstained"))}

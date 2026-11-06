@@ -101,7 +101,7 @@ AMES sends less context than Hindsight on every holdout question (median 17.3k v
 ## Design highlights
 
 - **Three indices**: episodic (raw events), semantic (facts), procedural (playbooks/skills)
-- **Recall**: hybrid BM25 + dense (`dense_vector` kNN) fused with RRF; token-budget cut
+- **Recall**: hybrid BM25 + dense (`dense_vector` kNN) fused with RRF; `results` come back sorted by per-hit `confidence`, highest first (stable on ties, hits without one last), and that sort runs before the size cut. With `rerank` applied the cross-encoder order is kept instead; token-budget cut
 - **Tenancy**: every doc carries `owner_id` + `visibility ∈ {private, team, common}`; the recall filter `owner_id == me OR visibility != private` is applied server-side — owner identity comes from the API key, never from a request argument
 - **Promotion guard**: deterministic sensitive-marker regex blocks private→shared promotion (and the same widening through `/memory/update`); retracting tombstones block re-learning values judged wrong (`delete` only removes; `retract=true` also tombstones; `POST /memory/unreject` lifts)
 - **Consolidation**: background worker dedups and supersedes semantic facts (propose-then-apply); audit history preserved
