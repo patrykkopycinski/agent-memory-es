@@ -299,8 +299,11 @@ if [ "$MODE" = run ]; then
   } | "${SSHI[@]}" "cat > $RUN/env.sh" || { echo "INFRA: writing env.sh failed"; exit 70; }
 
   # ---- 4. detach the driver: nothing below depends on this ssh session staying alive
-  "${SSH[@]}" "$PATHX; nohup bash $RUN/driver.sh $RUN > $RUN/driver.log 2>&1 < /dev/null & echo \$! > $RUN/driver.pid; echo started" >/dev/null \
-    || { echo "INFRA: could not start the host driver"; exit 70; }
+  # Re-check lock ownership in the SAME ssh call that launches the driver, immediately before the launch: if
+  # another runner replaced the lock since host_claim, exit 75 without starting anything.
+  "${SSH[@]}" "$PATHX; [ \"\$(cut -d' ' -f1 $LOCK_DIR/owner 2>/dev/null)\" = $ID ] || { echo 'lock not ours'; exit 75; }; nohup bash $RUN/driver.sh $RUN > $RUN/driver.log 2>&1 < /dev/null & echo \$! > $RUN/driver.pid; echo started" >/dev/null; lrc=$?
+  [ "$lrc" = 75 ] && { echo "lock $LOCK_DIR is no longer ours; not launching (busy)"; exit 75; }
+  [ "$lrc" = 0 ] || { echo "INFRA: could not start the host driver"; exit 70; }
   DRIVER_STARTED=1
   echo "driver detached on $HOST (run $ID). Recovery if this runner dies: $0 --host $HOST --collect $ID"
 fi
@@ -402,10 +405,13 @@ FIXED=$(comm -13 "$LOGDIR/fail-head.txt" "$LOGDIR/fail-base.txt")
 NEWSKIP=$(comm -23 "$LOGDIR/skip-head.txt" "$LOGDIR/skip-base.txt")
 # Skip gate (see skipgate above): tests that passed on base but are skipped on head.
 BADSKIP="" OKSKIP=""
+SG=$(skipgate "$HX" "$BX"); sgrc=$?
+# exit 2 = a junit file is missing/unparseable: that must not read as "no skips"
+[ "$sgrc" = 0 ] || { echo "===== RESULT INFRA: skip gate could not read the junit files (rc=$sgrc)"; exit 70; }
 while IFS=$'\t' read -r verdict t reason; do
   [ -n "$t" ] || continue
   if [ "$verdict" = OK ]; then OKSKIP="$OKSKIP$t  [$reason]"$'\n'; else BADSKIP="$BADSKIP$t  [$reason]"$'\n'; fi
-done < <(skipgate "$HX" "$BX")
+done <<< "$SG"
 echo "===== NEW failures/errors vs base (gate):"; indent "${NEW:-<none>}"
 echo "===== fixed vs base:"; indent "${FIXED:-<none>}"
 echo "===== pre-existing (fail on both):"; indent "$(comm -12 "$LOGDIR/fail-head.txt" "$LOGDIR/fail-base.txt" | grep . || echo "<none>")"

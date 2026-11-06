@@ -3,6 +3,7 @@
 
     skipgate.py HEAD.xml BASE.xml     one line per lost test: "OK<TAB>id<TAB>reason" or "BAD<TAB>id<TAB>reason"
     skipgate.py --self-test           offline fixture tests (pure Python, no ES, no host)
+    exit: 0 ok | 2 a junit file is missing or unparseable (infra: the caller must not read it as "no skips")
 
 A test is LOST when it passed on base and is skipped on head. A whole-file skip (module-level pytest.skip,
 importorskip, require_llm) is ONE junit entry with an empty classname and name="tests.test_x"; it is expanded
@@ -74,10 +75,8 @@ def analyze(head, base):
 
 
 def _load(path):
-    try:
-        return list(ET.parse(path).getroot().iter("testcase"))
-    except Exception:
-        return []
+    """A missing or unparseable junit file raises: reading it as 'no tests' would hide every lost test."""
+    return list(ET.parse(path).getroot().iter("testcase"))
 
 
 # ------------------------------------------------------------------ self test
@@ -163,6 +162,30 @@ def self_test():
         '<testcase classname="tests.test_g" name="t"/>',
         {"tests.test_g::t": "BAD"},
     )
+    # (g) missing / unparseable junit is an error (exit 2), never an empty result
+    import os
+    import subprocess
+    import tempfile
+    with tempfile.TemporaryDirectory() as d:
+        good = os.path.join(d, "good.xml")
+        bad = os.path.join(d, "bad.xml")
+        with open(good, "w") as fh:
+            fh.write("<testsuites><testsuite><testcase classname='tests.a' name='t'/></testsuite></testsuites>")
+        with open(bad, "w") as fh:
+            fh.write("<testsuites><testsuite>")
+        for label, args in (("missing head", [os.path.join(d, "nope.xml"), good]),
+                            ("missing base", [good, os.path.join(d, "nope.xml")]),
+                            ("unparseable head", [bad, good]),
+                            ("unparseable base", [good, bad])):
+            rc = subprocess.run([sys.executable, os.path.abspath(__file__)] + args,
+                                capture_output=True, text=True).returncode
+            good_rc = rc == 2
+            print(("PASS" if good_rc else "FAIL") + f"  (g) {label} junit -> exit 2 (got {rc})")
+            ok &= good_rc
+        rc = subprocess.run([sys.executable, os.path.abspath(__file__), good, good],
+                            capture_output=True, text=True).returncode
+        print(("PASS" if rc == 0 else "FAIL") + f"  (g) two valid junit files -> exit 0 (got {rc})")
+        ok &= rc == 0
     print("SELF-TEST " + ("OK" if ok else "FAILED"))
     return 0 if ok else 1
 
@@ -172,5 +195,10 @@ if __name__ == "__main__":
         sys.exit(self_test())
     if len(sys.argv) != 3:
         sys.exit("usage: skipgate.py HEAD.xml BASE.xml | --self-test")
-    for verdict, t, reason in analyze(_load(sys.argv[1]), _load(sys.argv[2])):
+    try:
+        head_tcs, base_tcs = _load(sys.argv[1]), _load(sys.argv[2])
+    except (OSError, ET.ParseError) as e:
+        print(f"skipgate: cannot read junit: {e}", file=sys.stderr)
+        sys.exit(2)
+    for verdict, t, reason in analyze(head_tcs, base_tcs):
         print(f"{verdict}\t{t}\t{reason}")
