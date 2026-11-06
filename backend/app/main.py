@@ -190,13 +190,19 @@ def set_key_person(owner_id: str, person: str, _admin: str = Header(None, alias=
         raise HTTPException(403, "bad admin token")
     try:
         person = auth.clean_person(person)
+        # audit BEFORE the change, strict: a change that cannot be audited does not happen
+        try:
+            memory._log_mutation("key_set_person", owner_id, "key", owner_id,
+                                 {"owner_id": owner_id, "person": person}, strict=True)
+        except Exception:  # noqa: BLE001 — any audit failure refuses the change
+            logging.getLogger("ames.auth").exception("set-person audit write failed for %s", owner_id)
+            raise HTTPException(503, "audit log unavailable: nothing was changed") from None
         updated = auth.set_person(owner_id, person)
         logging.getLogger("ames.auth").info(
             "set-person: owner=%s person=%s keys_changed=%d", owner_id, person, updated)
-        if memory._log_mutation("key_set_person", owner_id, "key", owner_id,
-                                {"owner_id": owner_id, "person": person,
-                                 "keys_changed": updated}) is None:
-            logging.getLogger("ames.auth").error("set-person audit row not written for %s", owner_id)
+        # the first row records the intent; this one records the outcome (best effort)
+        memory._log_mutation("key_set_person_done", owner_id, "key", owner_id,
+                             {"owner_id": owner_id, "person": person, "keys_changed": updated})
         return {"owner_id": owner_id, "person": person, "updated": updated}
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from None
