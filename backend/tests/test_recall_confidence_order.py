@@ -63,8 +63,10 @@ def test_results_are_confidence_descending_when_fused_order_disagrees(seeded, mo
     _inverted(monkeypatch)
     out = _recall(size=5)
     assert len(out["results"]) == 5
-    # subset, not equality: other owners' shared-visibility docs may also surface
-    assert set(seeded) <= {h["id"] for h in out["results"]}
+    # every seeded doc is recallable (subset, wide window: at k=5 shared-visibility docs
+    # from other owners can legitimately outrank the lowest-confidence seeded docs)
+    wide = {h["id"] for h in _recall(size=50)["results"]}
+    assert set(seeded) <= wide
     assert _confs(out) == sorted(_confs(out), reverse=True)
     # the fixture really disagrees: the fused (score) order is not the order returned
     assert [h["id"] for h in sorted(out["results"], key=lambda h: -h["score"])] != [h["id"] for h in out["results"]]
