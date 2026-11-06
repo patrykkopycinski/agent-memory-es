@@ -1635,13 +1635,13 @@ def test_round5_full_reconcile_picks_up_an_old_override_the_window_skips(monkeyp
     assert time.time() - governance._last_full_reconcile < 60         # marker advanced
 
 
-def test_round5_cli_warns_and_exits_2_on_an_override_conflict(monkeypatch):
+def test_round5_cli_warns_and_exits_3_on_an_override_conflict(monkeypatch):
     cli = _load_script("ames_approve")
     out = []
     monkeypatch.setattr(cli, "request", lambda *a, **k: (200, {
         "_id": "x", "activated": True, "conflict": True, "warning": "target held elsewhere"}))
     args = cli.build_parser().parse_args(["approve", "x"])
-    assert cli.run(args, "k", out=out.append) == 2
+    assert cli.run(args, "k", out=out.append) == 3        # 2 is argparse's usage error
     assert any(line.startswith("WARNING:") and "target held elsewhere" in line for line in out)
     monkeypatch.setattr(cli, "request", lambda *a, **k: (200, {"_id": "x", "activated": True}))
     out.clear()
@@ -1666,3 +1666,42 @@ def test_round5_cli_list_renders_override_conflicts_after_the_proposals(monkeypa
     out.clear()
     cli.run(cli.build_parser().parse_args(["list"]), "k", out=out.append)
     assert "WARNING" not in "\n".join(out)
+
+
+# ---- review round 6 (non-blocking nits) ----
+
+def test_round6_a_failed_full_reconcile_is_not_retried_for_an_hour(monkeypatch):
+    calls = []
+
+    def boom(full=False):
+        calls.append(full)
+        raise RuntimeError("es down")
+
+    monkeypatch.setattr(governance, "_reconcile_overrides", boom)
+    monkeypatch.setattr(governance, "_last_full_reconcile", time.time() - 25 * 3600)
+    with pytest.raises(RuntimeError):
+        governance.expire_stale_proposals()
+    assert calls == [True]
+    due_in = governance._last_full_reconcile + governance.full_reconcile_seconds() - time.time()
+    assert 3500 <= due_in <= 3700, due_in                         # about an hour, not at once
+    with pytest.raises(RuntimeError):
+        governance.expire_stale_proposals()
+    assert calls == [True, False]                                 # the retry is the window pass
+
+
+def test_round6_a_failed_outcome_row_does_not_fail_set_person(monkeypatch):
+    monkeypatch.setenv("AMES_ADMIN_TOKEN", "mint-token")
+    owner = f"gov_aud{uuid.uuid4().hex[:8]}"
+    legacy = _legacy_key(owner)
+    real = memory._log_mutation
+
+    def flaky(intent, *a, **k):
+        if intent == "key_set_person_done":
+            raise OSError("connection reset")
+        return real(intent, *a, **k)
+
+    monkeypatch.setattr(memory, "_log_mutation", flaky)
+    r = client.post(f"/admin/keys/person?owner_id={owner}&person=dana",
+                    headers={"X-Admin-Token": "mint-token"})
+    assert r.status_code == 200 and r.json()["updated"] == 1, r.text
+    assert auth.owner_of(legacy)["person"] == "dana"
