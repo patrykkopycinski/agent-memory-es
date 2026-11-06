@@ -16,6 +16,7 @@ Inactive decisions (rejected, expired, superseded) are stored with `active: fals
 existing "active only" path (recall, dedup, consolidation, near-duplicate linking) already
 ignores them; recall opts back in with `include_inactive_decisions`.
 """
+import calendar
 import os
 import time
 import urllib.parse
@@ -29,6 +30,8 @@ GOVERNED_MESSAGE = "governed decision: propose an override"
 MAX_NOTE_CHARS = 2000
 MAX_LIST = 100
 MAX_CAS_ATTEMPTS = 8
+PAGE = 200
+MAX_EXPIRY_PAGES = 1000
 PROPOSED, ACTIVE, REJECTED, EXPIRED, SUPERSEDED = (
     "proposed", "active", "rejected", "expired", "superseded")
 TERMINAL = (REJECTED, EXPIRED, SUPERSEDED)
@@ -108,13 +111,37 @@ def _q(doc_id: str) -> str:
     return urllib.parse.quote(str(doc_id), safe="")
 
 
-def _audit(intent: str, actor: str, doc_id: str, detail: dict) -> None:
+def _audit(intent: str, actor: str, doc_id: str, detail: dict) -> Optional[str]:
+    """Write the audit row; returns its id so a lost compare-and-set can mark it (see _lost)."""
     from . import memory
-    memory._log_mutation(intent, actor, "semantic", doc_id, detail, strict=True)
+    return memory._log_mutation(intent, actor, "semantic", doc_id, detail, strict=True)
+
+
+def _lost(*row_ids) -> None:
+    """Mark the audit rows of an attempt whose compare-and-set lost: the row exists (it was
+    written before the attempt, as required) but the transition it describes did not happen."""
+    from .store import PREFIX
+    for row_id in row_ids:
+        if not row_id:
+            continue
+        try:
+            es("POST", f"/{PREFIX}am_mutations/_update/{_q(row_id)}?refresh=true",
+               {"doc": {"detail": {"outcome": "conflict"}}})
+        except RuntimeError:
+            pass                          # best effort: the original row stays as written
 
 
 def _is_conflict(exc: RuntimeError) -> bool:
     return "-> 409:" in str(exc)
+
+
+def _scope(src: dict) -> list:
+    """Filters selecting the passages of THIS decision: its group, its owner and its text. A doc
+    group is only a label, so group alone could also match unrelated docs sharing the name."""
+    out = [{"term": {"doc_group": src["doc_group"]}}, {"term": {"owner_id": src["owner_id"]}}]
+    if src.get("text_hash"):
+        out.append({"term": {"text_hash": src["text_hash"]}})
+    return out
 
 
 def _load(doc_id: str) -> dict:
@@ -133,9 +160,7 @@ def _load(doc_id: str) -> dict:
         return {"id": r["_id"], "src": src, "seq": r["_seq_no"], "pt": r["_primary_term"]}
     hit = es("POST", f"/{idx('semantic')}/_search", {
         "size": 1, "seq_no_primary_term": True,
-        "query": {"bool": {"filter": [{"term": {"doc_group": src["doc_group"]}},
-                                      {"term": {"owner_id": src["owner_id"]}},
-                                      {"term": {"passage_index": 0}}]}}})["hits"]["hits"]
+        "query": {"bool": {"filter": _scope(src) + [{"term": {"passage_index": 0}}]}}})["hits"]["hits"]
     if not hit:
         raise LookupError(f"no such decision: {doc_id}")
     h = hit[0]
@@ -158,12 +183,11 @@ def _mirror(doc: dict, patch: dict) -> None:
     """Copy a head-passage patch to the other passages of the group."""
     from . import memory
     src = doc["src"]
-    group = src.get("doc_group")
-    if not group:
+    if not src.get("doc_group"):
         return
     r = es("POST", f"/{idx('semantic')}/_search", {
         "size": memory.MAX_PASSAGES, "_source": False,
-        "query": memory._owned_group_query(src["owner_id"], group)})
+        "query": {"bool": {"filter": _scope(src)}}})
     for h in r["hits"]["hits"]:
         if h["_id"] != doc["id"]:
             es("POST", f"/{idx('semantic')}/_update/{_q(h['_id'])}?refresh=true", {"doc": patch})
@@ -241,61 +265,120 @@ def _require_open(doc: dict) -> dict:
 
 def approve(person: str, doc_id: str, note: Optional[str] = None) -> dict:
     """Record `person`'s approval. PermissionError for the author, GovernedError (409) when the
-    proposal is not open or `person` already approved. Activates at the threshold."""
+    proposal is not open or `person` already approved. Activates at the threshold.
+
+    An override first CLAIMS its target (compare-and-set active -> superseded) and only then
+    activates itself, so two overrides of one decision cannot both activate: the loser's claim
+    fails, its proposal stays `proposed` and the approval returns 409."""
     if note is not None and (not isinstance(note, str) or len(note) > MAX_NOTE_CHARS):
         raise ValueError(f"note must be a string of at most {MAX_NOTE_CHARS} chars")
-    for attempt in range(MAX_CAS_ATTEMPTS):
-        doc = _load(doc_id)
-        src = _require_open(doc)
-        if person == src.get("proposed_by"):
-            raise PermissionError("the author's approval does not count")
-        valid = _valid_approvals(src)
-        if any(a["by"] == person for a in valid):
-            raise GovernedError("already approved by this person")
-        entry = {"by": person, "at": _iso(_now()), "text_hash": src["text_hash"]}
-        if note:
-            entry["note"] = note
-        approvals = valid + [entry]
-        activating = len(approvals) >= approvals_required(src)
-        target = src.get("proposal_for")
-        if activating and target:
-            if _load(target)["src"].get("decision_status") != ACTIVE:
-                raise GovernedError("override target is no longer an active decision")
-        patch = {"approvals": approvals}
-        detail = {"text_hash": src["text_hash"], "by": person, "attempt": attempt + 1,
-                  "approvals": len(approvals), "required": approvals_required(src)}
-        _audit("decision_approve", person, doc["id"], detail)
-        if activating:
-            patch.update({"decision_status": ACTIVE, "decided_at": _iso(_now()),
-                          "approved_via": "approvals"})
-            _audit("decision_activate", person, doc["id"], detail)
-        if not _cas(doc, patch):
-            continue                      # someone else changed it: re-read and recount
-        _mirror(doc, patch)
-        if activating and target:
-            _supersede_target(person, doc["id"], target, doc["src"])
-        return {"_id": doc["id"], "decision_status": patch.get("decision_status", PROPOSED),
-                "approvals": len(approvals), "approvals_needed": max(0, approvals_required(src) - len(approvals)),
-                "activated": activating}
-    raise GovernedError("could not record the approval after repeated conflicts; retry")
+    claimed = None                        # (new_id, target_id) once this call superseded the target
+    try:
+        for attempt in range(MAX_CAS_ATTEMPTS):
+            doc = _load(doc_id)
+            src = _require_open(doc)
+            if person == src.get("proposed_by"):
+                raise PermissionError("the author's approval does not count")
+            valid = _valid_approvals(src)
+            if any(a["by"] == person for a in valid):
+                raise GovernedError("already approved by this person")
+            entry = {"by": person, "at": _iso(_now()), "text_hash": src["text_hash"]}
+            if note:
+                entry["note"] = note
+            approvals = valid + [entry]
+            activating = len(approvals) >= approvals_required(src)
+            target = src.get("proposal_for")
+            patch = {"approvals": approvals}
+            detail = {"text_hash": src["text_hash"], "by": person, "attempt": attempt + 1,
+                      "approvals": len(approvals), "required": approvals_required(src)}
+            rows = [_audit("decision_approve", person, doc["id"], detail)]
+            if activating and target:
+                try:
+                    _claim_target(person, doc["id"], target)
+                except GovernedError:
+                    _lost(*rows)
+                    raise
+                claimed = (doc["id"], target)
+            if activating:
+                patch.update({"decision_status": ACTIVE, "decided_at": _iso(_now()),
+                              "approved_via": "approvals"})
+                rows.append(_audit("decision_activate", person, doc["id"], detail))
+            if not _cas(doc, patch):
+                _lost(*rows)
+                if claimed:               # the proposal changed under us: do not hold the target
+                    _release_target("system", *claimed)
+                    claimed = None
+                continue                  # someone else changed it: re-read and recount
+            claimed = None                # activated: the claim is now permanent
+            _mirror(doc, patch)
+            if activating and target:
+                _link_target(doc["id"], target)
+            return {"_id": doc["id"], "decision_status": patch.get("decision_status", PROPOSED),
+                    "approvals": len(approvals),
+                    "approvals_needed": max(0, approvals_required(src) - len(approvals)),
+                    "activated": activating}
+        raise GovernedError("could not record the approval after repeated conflicts; retry")
+    except Exception:
+        if claimed:
+            _release_target("system", *claimed)   # the override did not activate: give the target back
+        raise
+
+
+def _claim_target(person: str, new_id: str, target_id: str) -> None:
+    """Compare-and-set the overridden decision from active to superseded (by `new_id`). Already
+    superseded by `new_id` is success (a retry after the proposal's own CAS lost). Superseded by
+    anyone else, or no longer active: GovernedError, nothing changed."""
+    for _ in range(MAX_CAS_ATTEMPTS):
+        t = _load(target_id)
+        status = t["src"].get("decision_status")
+        if status == SUPERSEDED and t["src"].get("superseded_by") == new_id:
+            return
+        if status != ACTIVE:
+            raise GovernedError("override target is no longer an active decision")
+        patch = {"decision_status": SUPERSEDED, "active": False, "superseded_by": new_id,
+                 "decided_at": _iso(_now())}
+        row = _audit("decision_supersede", person, t["id"],
+                     {"text_hash": t["src"].get("text_hash"), "by": person, "superseded_by": new_id})
+        if _cas(t, patch):
+            _mirror(t, patch)
+            return
+        _lost(row)
+    raise GovernedError("could not supersede the override target after repeated conflicts; retry")
+
+
+def _release_target(actor: str, new_id: str, target_id: str) -> None:
+    """Undo a claim whose override did not become active (rejected, withdrawn, expired, or the
+    activation failed): the target is an active decision again. No-op unless the target is
+    superseded by exactly this proposal and the proposal is not active."""
+    try:
+        for _ in range(MAX_CAS_ATTEMPTS):
+            t = _load(target_id)
+            if t["src"].get("decision_status") != SUPERSEDED or t["src"].get("superseded_by") != new_id:
+                return
+            if _load(new_id)["src"].get("decision_status") == ACTIVE:
+                return
+            patch = {"decision_status": ACTIVE, "active": True, "superseded_by": None,
+                     "decided_at": _iso(_now())}
+            row = _audit("decision_restore", actor, t["id"],
+                         {"text_hash": t["src"].get("text_hash"), "by": actor, "released_from": new_id})
+            if _cas(t, patch):
+                _mirror(t, patch)
+                return
+            _lost(row)
+    except LookupError:
+        return
+
+
+def _link_target(new_id: str, target_id: str) -> None:
+    es("POST", f"/{idx('semantic')}/_update/{_q(new_id)}?refresh=true",
+       {"doc": {"supersedes": [target_id]}})
 
 
 def _supersede_target(person: str, new_id: str, target_id: str, new_src: dict) -> None:
-    """Move the overridden decision to superseded and link both ends. Runs once, after the
-    proposal's own activation CAS succeeded; the worker pass completes it if this is interrupted."""
-    for _ in range(MAX_CAS_ATTEMPTS):
-        t = _load(target_id)
-        if t["src"].get("decision_status") != ACTIVE:
-            break                         # already superseded elsewhere: converge on the link below
-        patch = {"decision_status": SUPERSEDED, "active": False, "superseded_by": new_id,
-                 "decided_at": _iso(_now())}
-        _audit("decision_supersede", person, t["id"],
-               {"text_hash": t["src"].get("text_hash"), "by": person, "superseded_by": new_id})
-        if _cas(t, patch):
-            _mirror(t, patch)
-            break
-    es("POST", f"/{idx('semantic')}/_update/{_q(new_id)}?refresh=true",
-       {"doc": {"supersedes": [target_id]}})
+    """Worker completion of an interrupted override: the proposal is active but never got its
+    `supersedes` link. Idempotent."""
+    _claim_target(person, new_id, target_id)
+    _link_target(new_id, target_id)
 
 
 def reject(person: str, doc_id: str, reason: str) -> dict:
@@ -316,35 +399,39 @@ def reject(person: str, doc_id: str, reason: str) -> dict:
         patch = {"objections": objections}
         if veto:
             patch.update({"decision_status": REJECTED, "active": False, "decided_at": _iso(_now())})
-        _audit("decision_reject", person, doc["id"],
-               {"text_hash": src["text_hash"], "by": person, "veto": veto, "attempt": attempt + 1})
+        row = _audit("decision_reject", person, doc["id"],
+                     {"text_hash": src["text_hash"], "by": person, "veto": veto,
+                      "attempt": attempt + 1})
         if _cas(doc, patch):
             _mirror(doc, patch)
             return {"_id": doc["id"], "decision_status": patch.get("decision_status", PROPOSED),
                     "veto": veto, "objections": len(objections)}
+        _lost(row)
     raise GovernedError("could not record the rejection after repeated conflicts; retry")
 
 
-def withdraw(owner_id: str, doc_id: str) -> dict:
-    """The author deleting a proposal: it becomes rejected (withdrawn), never hard-deleted."""
+def withdraw(author: str, doc_id: str) -> dict:
+    """The author (a person, or the owner id for a key without one) deleting a proposal: it
+    becomes rejected (withdrawn), never hard-deleted."""
     for _ in range(MAX_CAS_ATTEMPTS):
         doc = _load(doc_id)
         src = doc["src"]
-        if src.get("proposed_by") != owner_id:
+        if src.get("proposed_by") != author:
             raise PermissionError("only the creator can delete their memory")
         if src.get("decision_status") != PROPOSED:
             raise GovernedError()
         patch = {"decision_status": REJECTED, "active": False, "decided_at": _iso(_now()),
                  "objections": list(src.get("objections") or []) + [
-                     {"by": owner_id, "at": _iso(_now()), "text_hash": src["text_hash"],
+                     {"by": author, "at": _iso(_now()), "text_hash": src["text_hash"],
                       "reason": "withdrawn"}]}
-        _audit("decision_withdraw", owner_id, doc["id"],
-               {"text_hash": src["text_hash"], "by": owner_id, "reason": "withdrawn"})
+        row = _audit("decision_withdraw", author, doc["id"],
+                     {"text_hash": src["text_hash"], "by": author, "reason": "withdrawn"})
         if _cas(doc, patch):
             _mirror(doc, patch)
             return {"deleted": False, "withdrawn": True, "decision_status": REJECTED,
                     "doc_group": src.get("doc_group") or doc["id"], "kind": "semantic",
                     "doc_id": doc_id}
+        _lost(row)
     raise GovernedError("could not withdraw after repeated conflicts; retry")
 
 
@@ -377,28 +464,40 @@ def list_proposals(limit: int = MAX_LIST) -> dict:
 
 def expire_stale_proposals(now: Optional[float] = None) -> dict:
     """Worker pass: proposals past their TTL without enough approvals become `expired`; interrupted
-    overrides (activated, target not yet superseded) are completed."""
+    overrides (activated, target not yet superseded) are completed. Reads every page of stale
+    proposals: each round takes the next PAGE that is still `proposed`."""
     now_iso = _iso(_now() if now is None else now)
     expired = 0
-    r = es("POST", f"/{idx('semantic')}/_search", {
-        "size": 200, "_source": False,
-        "query": {"bool": {"filter": [{"term": {"decision_status": PROPOSED}},
-                                      {"term": {"passage_index": 0}},
-                                      {"range": {"proposal_expires_at": {"lte": now_iso}}}]}}})
-    for h in r["hits"]["hits"]:
-        for _ in range(MAX_CAS_ATTEMPTS):
-            doc = _load(h["_id"])
-            src = doc["src"]
-            if src.get("decision_status") != PROPOSED:
-                break
-            patch = {"decision_status": EXPIRED, "active": False, "decided_at": now_iso}
-            _audit("decision_expire", "system", doc["id"],
-                   {"text_hash": src.get("text_hash"), "by": "system",
-                    "expired_at": src.get("proposal_expires_at")})
-            if _cas(doc, patch):
-                _mirror(doc, patch)
-                expired += 1
-                break
+    skipped = []                          # could not be moved (repeated conflicts): not retried here
+    for _page in range(MAX_EXPIRY_PAGES):
+        must_not = [{"ids": {"values": skipped}}] if skipped else []
+        r = es("POST", f"/{idx('semantic')}/_search", {
+            "size": PAGE, "_source": False,
+            "query": {"bool": {"filter": [{"term": {"decision_status": PROPOSED}},
+                                          {"term": {"passage_index": 0}},
+                                          {"range": {"proposal_expires_at": {"lte": now_iso}}}],
+                               "must_not": must_not}}})
+        hits = r["hits"]["hits"]
+        if not hits:
+            break
+        for h in hits:
+            for _ in range(MAX_CAS_ATTEMPTS):
+                doc = _load(h["_id"])
+                src = doc["src"]
+                if src.get("decision_status") != PROPOSED:
+                    break
+                patch = {"decision_status": EXPIRED, "active": False, "decided_at": now_iso}
+                row = _audit("decision_expire", "system", doc["id"],
+                             {"text_hash": src.get("text_hash"), "by": "system",
+                              "expired_at": src.get("proposal_expires_at")})
+                if _cas(doc, patch):
+                    _mirror(doc, patch)
+                    expired += 1
+                    break
+                _lost(row)
+            else:
+                skipped.append(h["_id"])
+    released = _release_orphaned_claims(now_iso)
     completed = 0
     r = es("POST", f"/{idx('semantic')}/_search", {
         "size": 100, "_source": ["proposal_for"],
@@ -408,30 +507,74 @@ def expire_stale_proposals(now: Optional[float] = None) -> dict:
                                       {"exists": {"field": "proposal_for"}}],
                            "must_not": [{"exists": {"field": "supersedes"}}]}}})
     for h in r["hits"]["hits"]:
-        _supersede_target("system", h["_id"], h["_source"]["proposal_for"], {})
+        try:
+            _supersede_target("system", h["_id"], h["_source"]["proposal_for"], {})
+        except GovernedError:
+            continue
         completed += 1
-    return {"expired": expired, "completed_overrides": completed}
+    return {"expired": expired, "completed_overrides": completed, "released_claims": released}
+
+
+CLAIM_GRACE_SECONDS = 300
+CLAIM_WINDOW_SECONDS = 86400
+
+
+def _release_orphaned_claims(now_iso: str) -> int:
+    """An override claims its target before it activates. If the process died in between, the
+    target stays superseded by a proposal that never became active: after a grace period, give the
+    target back. Looks only at targets superseded in the last day."""
+    now = calendar.timegm(time.strptime(now_iso, "%Y-%m-%dT%H:%M:%SZ"))
+    lo, hi = _iso(now - CLAIM_WINDOW_SECONDS), _iso(now - CLAIM_GRACE_SECONDS)
+    r = es("POST", f"/{idx('semantic')}/_search", {
+        "size": PAGE, "_source": ["superseded_by"],
+        "query": {"bool": {"filter": [{"term": {"decision_status": SUPERSEDED}},
+                                      {"term": {"passage_index": 0}},
+                                      {"exists": {"field": "superseded_by"}},
+                                      {"range": {"decided_at": {"gte": lo, "lte": hi}}}]}}})
+    released = 0
+    for h in r["hits"]["hits"]:
+        new_id = h["_source"].get("superseded_by")
+        try:
+            if _load(new_id)["src"].get("decision_status") == ACTIVE:
+                continue
+        except (LookupError, ValueError):
+            continue
+        _release_target("system", new_id, h["_id"])
+        released += 1
+    return released
 
 
 def backfill(max_pages: int = 100) -> dict:
     """Admin: mark team `kind:decision` entries that predate governance as active
-    (`approved_via: backfill`). Idempotent: already-governed docs are skipped."""
+    (`approved_via: backfill`, `proposed_by` = the doc's owner). Compare-and-set per doc, so a
+    concurrent transition always wins and a doc that lost is skipped. Idempotent: already-governed
+    docs are skipped."""
     done = 0
+    skipped = []
     for _ in range(max_pages):
+        must_not = [{"exists": {"field": "decision_status"}}]
+        if skipped:
+            must_not.append({"ids": {"values": skipped}})
         r = es("POST", f"/{idx('semantic')}/_search", {
-            "size": 200, "_source": ["text_hash"],
+            "size": PAGE, "_source": ["text_hash", "owner_id"], "seq_no_primary_term": True,
             "query": {"bool": {"filter": [{"term": {"visibility": "team"}},
                                           {"term": {"tags": DECISION_TAG}},
                                           {"term": {"active": True}}],
-                               "must_not": [{"exists": {"field": "decision_status"}}]}}})
+                               "must_not": must_not}}})
         hits = r["hits"]["hits"]
         if not hits:
             break
         for h in hits:
-            _audit("decision_backfill", "admin", h["_id"],
-                   {"text_hash": h["_source"].get("text_hash"), "by": "admin"})
-            es("POST", f"/{idx('semantic')}/_update/{_q(h['_id'])}?refresh=true",
-               {"doc": {"decision_status": ACTIVE, "approved_via": "backfill",
-                        "decided_at": _iso(_now())}})
-            done += 1
+            owner = h["_source"].get("owner_id")
+            row = _audit("decision_backfill", "admin", h["_id"],
+                         {"text_hash": h["_source"].get("text_hash"), "by": "admin"})
+            patch = {"decision_status": ACTIVE, "approved_via": "backfill",
+                     "decided_at": _iso(_now())}
+            if owner:
+                patch["proposed_by"] = owner
+            if _cas({"id": h["_id"], "seq": h["_seq_no"], "pt": h["_primary_term"]}, patch):
+                done += 1
+            else:
+                _lost(row)
+                skipped.append(h["_id"])
     return {"backfilled": done}
