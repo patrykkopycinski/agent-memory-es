@@ -11,7 +11,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, StrictBool
 
-from . import auth, embeddings, memory, pages as pages_mod, mental_models as mm_mod, reranker, tagfilter, facts
+from . import auth, embeddings, governance, memory, pages as pages_mod, mental_models as mm_mod, reranker, tagfilter, facts
 from .store import KINDS, ensure_indices, is_doc_miss
 
 app = FastAPI(title="agent-memory-es", version="0.2.0")
@@ -74,6 +74,7 @@ class RetainIn(BaseModel):
     extract_facts: bool = True  # opt out of asynchronous fact extraction for bulk imports
     tags: Optional[list] = None       # caller-supplied "key:value" tags (stored as keywords)
     labels: Optional[list] = None     # label groups to LLM-extract into tags (off when absent)
+    supersedes_decision: Optional[str] = None   # team decision proposal that overrides this ACTIVE decision id
 
 
 class RecallIn(BaseModel):
@@ -88,6 +89,7 @@ class RecallIn(BaseModel):
     min_similarity: Optional[float] = Field(None, ge=-1.0, le=1.0)  # kNN cosine floor (default: AMES_KNN_MIN_SIMILARITY, off)
     filter: Optional[dict] = None   # {all, any, none, narrow_any}: tag filter applied inside ES;
                                     # a filter that matches nothing abstains (results [])
+    include_inactive_decisions: StrictBool = False   # also return rejected / expired / superseded decisions
 
 
 class PromoteIn(BaseModel):
@@ -125,6 +127,16 @@ class ExistsIn(BaseModel):
 
 class ReflectIn(BaseModel):
     question: str
+
+
+class ApproveIn(BaseModel):
+    doc_id: str = Field(..., max_length=memory.MAX_ID_CHARS)
+    note: Optional[str] = Field(None, max_length=governance.MAX_NOTE_CHARS)
+
+
+class RejectIn(BaseModel):
+    doc_id: str = Field(..., max_length=memory.MAX_ID_CHARS)
+    reason: str = Field(..., min_length=1, max_length=governance.MAX_NOTE_CHARS)
 
 
 @app.post("/admin/keys")
@@ -199,7 +211,9 @@ def retain(body: RetainIn, who: dict = Depends(caller)):
     try:
         return memory.retain(who["owner_id"], body.kind, body.text, body.visibility,
                              body.occurred_at, body.doc_group, body.tags, body.labels,
-                             body.extract_facts)
+                             body.extract_facts, body.supersedes_decision)
+    except governance.GovernedError as e:
+        raise HTTPException(409, str(e))
     except ValueError as e:
         raise HTTPException(422, str(e))
     except tagfilter.ExtractionError as e:
@@ -223,6 +237,8 @@ def delete_memory(kind: str, doc_id: str, retract: Literal["true", "false"] = "f
         raise HTTPException(422, str(e))
     except PermissionError:
         raise HTTPException(403, "only the creator can delete their memory")
+    except governance.GovernedError as e:
+        raise HTTPException(409, str(e)) from None
     except memory.SupersededError as e:
         raise _superseded_409(e) from None
     except LookupError as e:
@@ -238,7 +254,8 @@ def recall(body: RecallIn, who: dict = Depends(caller)):
     try:
         return memory.recall(who["owner_id"], body.query, body.kinds, body.size,
                              body.min_score, body.as_of, body.per_doc, body.rerank, body.filter,
-                             rerank_depth=body.rerank_depth, min_similarity=body.min_similarity)
+                             rerank_depth=body.rerank_depth, min_similarity=body.min_similarity,
+                             include_inactive_decisions=body.include_inactive_decisions)
     except tagfilter.FilterError as e:
         raise HTTPException(422, str(e))
 
@@ -255,6 +272,8 @@ def exists(body: ExistsIn, who: dict = Depends(caller)):
 def promote(body: PromoteIn, who: dict = Depends(caller)):
     try:
         return memory.promote(who["owner_id"], body.kind, body.doc_id, body.to_visibility)
+    except governance.GovernedError as e:
+        raise HTTPException(409, str(e))
     except LookupError as e:
         raise HTTPException(404, str(e))
     except (ValueError, PermissionError) as e:
@@ -269,6 +288,8 @@ def update(body: UpdateIn, who: dict = Depends(caller)):
     try:
         return memory.update(who["owner_id"], body.kind, body.doc_id, body.text,
                              body.tags, body.visibility, body.occurred_at)
+    except governance.GovernedError as e:
+        raise HTTPException(409, str(e))
     except memory.SupersededError as e:
         raise _superseded_409(e) from None
     except LookupError as e:
@@ -281,6 +302,8 @@ def update(body: UpdateIn, who: dict = Depends(caller)):
 def delete(body: DeleteIn, who: dict = Depends(caller)):
     try:
         return memory.delete(who["owner_id"], body.kind, body.doc_id, body.retract)
+    except governance.GovernedError as e:
+        raise HTTPException(409, str(e))
     except memory.SupersededError as e:
         raise _superseded_409(e) from None
     except LookupError as e:
@@ -416,6 +439,52 @@ def _exists_size(size) -> int:
     return size
 
 
+def approver(who: dict = Depends(caller)) -> dict:
+    """Approving or rejecting a decision is a human act: only keys minted with the `approver` role
+    pass. Agent keys (member / owner) are refused, and no MCP tool maps to these routes."""
+    if who.get("role") != "approver":
+        raise HTTPException(403, "approver role required")
+    return who
+
+
+def _governance_call(fn, *args):
+    try:
+        return fn(*args)
+    except governance.GovernedError as e:
+        raise HTTPException(409, str(e)) from None
+    except PermissionError as e:
+        raise HTTPException(403, str(e)) from None
+    except LookupError as e:
+        raise HTTPException(404, str(e)) from None
+    except ValueError as e:
+        raise HTTPException(422, str(e)) from None
+
+
+@app.get("/governance/proposals")
+def governance_proposals(limit: int = 50, who: dict = Depends(caller)):
+    return governance.list_proposals(max(1, min(limit, governance.MAX_LIST)))
+
+
+@app.post("/governance/approve")
+def governance_approve(body: ApproveIn, who: dict = Depends(approver)):
+    return _governance_call(governance.approve, who["owner_id"], body.doc_id, body.note)
+
+
+@app.post("/governance/reject")
+def governance_reject(body: RejectIn, who: dict = Depends(approver)):
+    return _governance_call(governance.reject, who["owner_id"], body.doc_id, body.reason)
+
+
+@app.post("/admin/governance/backfill")
+def governance_backfill(_admin: str = Header(None, alias="X-Admin-Token")):
+    expected = os.environ.get("AMES_ADMIN_TOKEN", "")
+    if not expected:
+        raise HTTPException(403, "backfill disabled: AMES_ADMIN_TOKEN is not set")
+    if not _admin or not hmac.compare_digest(_admin.encode(), expected.encode()):
+        raise HTTPException(403, "bad admin token")
+    return governance.backfill()
+
+
 @app.post("/mcp/tools/{tool}")
 def mcp_tool(tool: str, body: dict, who: dict = Depends(caller)):
     """Minimal MCP-style tools surface (JSON in/out) for coding-farm clients."""
@@ -443,6 +512,8 @@ def mcp_tool(tool: str, body: dict, who: dict = Depends(caller)):
         raise HTTPException(404, f"unknown tool {tool}; available: {sorted(handlers)}")
     try:
         return {"result": handlers[tool](body)}
+    except governance.GovernedError as e:
+        raise HTTPException(409, str(e)) from None
     except memory.SupersededError as e:
         raise _superseded_409(e) from None
     except KeyError as e:                         # KeyError is a LookupError: a missing body field is not a 404

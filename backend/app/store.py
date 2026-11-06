@@ -30,6 +30,25 @@ PREFIX = os.environ.get("AMES_INDEX_PREFIX", "")
 
 KINDS = ("episodic", "semantic", "procedural")
 
+# Decision-governance fields; also applied additively to pre-existing indices.
+GOVERNANCE_PROPERTIES = {
+    "decision_status": {"type": "keyword"},
+    "proposed_by": {"type": "keyword"},
+    "proposal_for": {"type": "keyword"},
+    "approvals": {"properties": {
+        "by": {"type": "keyword"}, "at": {"type": "date"},
+        "text_hash": {"type": "keyword"},
+        "note": {"type": "text", "index": False}}},
+    "objections": {"properties": {
+        "by": {"type": "keyword"}, "at": {"type": "date"},
+        "text_hash": {"type": "keyword"},
+        "note": {"type": "text", "index": False},
+        "reason": {"type": "text", "index": False}}},
+    "decided_at": {"type": "date"},
+    "proposal_expires_at": {"type": "date"},
+    "approved_via": {"type": "keyword"},
+}
+
 MAPPINGS = {
     "settings": {"number_of_shards": 1, "number_of_replicas": 0},
     "mappings": {
@@ -60,6 +79,7 @@ MAPPINGS = {
             "fact_requested": {"type": "boolean"},
             "valid_from": {"type": "date"},
             "valid_to": {"type": "date"},
+            **GOVERNANCE_PROPERTIES,
         },
     },
 }
@@ -169,6 +189,11 @@ def ensure_indices() -> None:
                                "valid_to": {"type": "date"}}})
         except RuntimeError:
             pass  # older cluster / no permission: exact-hash dedup degrades to kNN
+        # Governance fields in their own call so a failure above cannot skip them.
+        try:
+            es("PUT", f"/{idx(kind)}/_mapping", {"properties": GOVERNANCE_PROPERTIES})
+        except RuntimeError:
+            pass
     _indices_ready = True
 
 

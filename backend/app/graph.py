@@ -8,13 +8,18 @@ from .store import es, idx
 
 
 def graph_expand(owner_id: str, query: str, size: int = 10,
-                 vis_filter: dict = None) -> list:
+                 vis_filter: dict = None, include_inactive_decisions: bool = False) -> list:
     """Return hop-2 facts for the query's entities, visibility-filtered."""
     from .memory import extract_entities  # late import: shared tokenizer
     ents = extract_entities(query, limit=6)
     if not ents or vis_filter is None:
         return []
-    filt = [{"term": {"active": True}}, vis_filter]
+    active = {"term": {"active": True}}
+    if include_inactive_decisions:
+        active = {"bool": {"should": [
+            active, {"terms": {"decision_status": ["rejected", "expired", "superseded"]}}],
+            "minimum_should_match": 1}}
+    filt = [active, vis_filter]
     # hop 1: facts mentioning any query entity
     r1 = es("POST", f"/{idx('semantic')}/_search", {
         "size": 20,
