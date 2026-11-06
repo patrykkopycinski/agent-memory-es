@@ -201,8 +201,12 @@ def set_key_person(owner_id: str, person: str, _admin: str = Header(None, alias=
         logging.getLogger("ames.auth").info(
             "set-person: owner=%s person=%s keys_changed=%d", owner_id, person, updated)
         # the first row records the intent; this one records the outcome (best effort)
-        memory._log_mutation("key_set_person_done", owner_id, "key", owner_id,
-                             {"owner_id": owner_id, "person": person, "keys_changed": updated})
+        try:
+            memory._log_mutation("key_set_person_done", owner_id, "key", owner_id,
+                                 {"owner_id": owner_id, "person": person, "keys_changed": updated})
+        except Exception:  # noqa: BLE001 — the change is made: report it, do not turn it into a 500
+            logging.getLogger("ames.auth").exception(
+                "set-person outcome row not written for %s", owner_id)
         return {"owner_id": owner_id, "person": person, "updated": updated}
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from None
