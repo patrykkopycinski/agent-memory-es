@@ -150,13 +150,17 @@ def _save(keys: dict) -> None:
         raise
 
 
-def create_key(owner_id: str, role: str = "member") -> str:
-    """Mint an API key for owner_id. Returns the plaintext key once."""
+def create_key(owner_id: str, role: str = "member", person: Optional[str] = None) -> str:
+    """Mint an API key for owner_id. Returns the plaintext key once. `person` names the human
+    behind the key; governance counts people, not keys."""
     token = "ame_" + secrets.token_hex(32)
     digest = hashlib.sha256(token.encode()).hexdigest()
+    entry = {"owner_id": owner_id, "role": role}
+    if person:
+        entry["person"] = person
     with _guard():
         keys = _load()
-        keys[digest] = {"owner_id": owner_id, "role": role}
+        keys[digest] = entry
         _save(keys)
     return token
 
