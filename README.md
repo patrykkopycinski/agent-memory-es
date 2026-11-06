@@ -93,8 +93,9 @@ until their person is named. In this order:
 2. Immediately name the person behind each owner's keys:
    `POST /admin/keys/person?owner_id=<owner>&person=<name>` with the admin token (audited first;
    persons are lowercased). Until then, person-less agent keys get `403` on team-decision writes.
-   Offline alternative: for key-file entries in digest form (`<sha256 of the token>` mapped to
-   `{owner_id, role}`), add a `"person"` field before deploying (it is lowercased on load). Entries
+   Offline alternative: stop the service, edit the key file, then deploy. For entries in digest
+   form (`<sha256 of the token>` mapped to `{owner_id, role}`), add a `"person"` field, which must
+   be non-empty (it is lowercased on load). Entries
    still in the old plaintext form (`{"<owner>": "ame_..."}`) are converted to person-less digest
    entries on first read, so use the admin call for those.
 3. Run `POST /admin/governance/backfill` once, so earlier team decisions are in force.
