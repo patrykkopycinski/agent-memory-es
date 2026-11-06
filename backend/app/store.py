@@ -166,6 +166,30 @@ def es(method: str, path: str, body: Optional[dict] = None, timeout: float = 30)
 _indices_ready = False
 
 
+def _fields_mapped(expected: dict, actual: dict) -> bool:
+    """Every field of `expected` exists in `actual` with the same type (recursing into objects)."""
+    for name, spec in expected.items():
+        have = actual.get(name)
+        if not isinstance(have, dict):
+            return False
+        if "type" in spec and have.get("type") != spec["type"]:
+            return False
+        if "properties" in spec and not _fields_mapped(spec["properties"], have.get("properties") or {}):
+            return False
+    return True
+
+
+def _governance_mapped(index: str) -> bool:
+    """True when the index already maps every governance field with the right type. A failed read
+    is "unknown", so False: the migration is then attempted."""
+    try:
+        got = es("GET", f"/{index}/_mapping")
+        props = next(iter(got.values()))["mappings"].get("properties", {})
+    except (RuntimeError, StopIteration, KeyError, AttributeError):
+        return False
+    return _fields_mapped(GOVERNANCE_PROPERTIES, props)
+
+
 def ensure_indices() -> None:
     global _indices_ready
     for kind in KINDS:
@@ -192,6 +216,9 @@ def ensure_indices() -> None:
             pass  # older cluster / no permission: exact-hash dedup degrades to kNN
         # Fail closed: without these fields governed writes are rejected (dynamic: strict)
         # or stored without a status. _indices_ready stays False so retain/recall refuse too.
+        # Already mapped (a role without put_mapping, a blocked index): nothing to migrate.
+        if _governance_mapped(idx(kind)):
+            continue
         try:
             es("PUT", f"/{idx(kind)}/_mapping", {"properties": GOVERNANCE_PROPERTIES})
         except RuntimeError:
