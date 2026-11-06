@@ -153,10 +153,11 @@ def _save(keys: dict) -> None:
 ROLES = ("member", "owner", "approver")
 
 
-def _clean_person(person: Optional[str]) -> str:
+def clean_person(person: Optional[str]) -> str:
+    """Trimmed and lowercased: one human, one person string (`Alice` and `alice` are one person)."""
     if not isinstance(person, str) or not person.strip() or len(person) > 200:
         raise ValueError("person is required: the name of the human behind the key (1-200 chars)")
-    return person.strip()
+    return person.strip().lower()
 
 
 def create_key(owner_id: str, role: str = "member", person: Optional[str] = None) -> str:
@@ -167,7 +168,7 @@ def create_key(owner_id: str, role: str = "member", person: Optional[str] = None
     them one with set_person."""
     if role not in ROLES:
         raise ValueError(f"role must be one of {ROLES}")
-    person = _clean_person(person)
+    person = clean_person(person)
     token = "ame_" + secrets.token_hex(32)
     digest = hashlib.sha256(token.encode()).hexdigest()
     entry = {"owner_id": owner_id, "role": role, "person": person}
@@ -181,7 +182,7 @@ def create_key(owner_id: str, role: str = "member", person: Optional[str] = None
 def set_person(owner_id: str, person: str) -> int:
     """Admin: name the person behind every key of `owner_id` that has none (legacy keys). Keys that
     already name a person are left alone. Returns how many keys were updated."""
-    person = _clean_person(person)
+    person = clean_person(person)
     with _guard():
         keys = _load()
         n = 0

@@ -77,10 +77,10 @@ def any_key(x_api_key: Optional[str] = Header(None)) -> dict:
     return _identify(x_api_key)
 
 
-def identity(who: dict) -> str:
-    """The human behind a key: its person when set, else its owner id. Authorship and approval
-    are compared on this, never on the key."""
-    return who.get("person") or who["owner_id"]
+def person_of(who: dict) -> Optional[str]:
+    """The human behind a key, None for a key that predates `person`. Authorship and approval are
+    compared on this, never on the key; governed writes refuse a key without one."""
+    return who.get("person")
 
 
 class RetainIn(BaseModel):
@@ -189,8 +189,15 @@ def set_key_person(owner_id: str, person: str, _admin: str = Header(None, alias=
     if not _admin or not hmac.compare_digest(_admin.encode(), expected.encode()):
         raise HTTPException(403, "bad admin token")
     try:
-        return {"owner_id": owner_id, "person": person.strip(),
-                "updated": auth.set_person(owner_id, person)}
+        person = auth.clean_person(person)
+        updated = auth.set_person(owner_id, person)
+        logging.getLogger("ames.auth").info(
+            "set-person: owner=%s person=%s keys_changed=%d", owner_id, person, updated)
+        if memory._log_mutation("key_set_person", owner_id, "key", owner_id,
+                                {"owner_id": owner_id, "person": person,
+                                 "keys_changed": updated}) is None:
+            logging.getLogger("ames.auth").error("set-person audit row not written for %s", owner_id)
+        return {"owner_id": owner_id, "person": person, "updated": updated}
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from None
     except auth.KeyStoreNotWritable as exc:
@@ -254,9 +261,11 @@ def retain(body: RetainIn, who: dict = Depends(caller)):
         return memory.retain(who["owner_id"], body.kind, body.text, body.visibility,
                              body.occurred_at, body.doc_group, body.tags, body.labels,
                              body.extract_facts, body.supersedes_decision,
-                             person=identity(who))
+                             person=person_of(who))
     except governance.GovernedError as e:
         raise HTTPException(409, str(e))
+    except PermissionError as e:
+        raise HTTPException(403, str(e))
     except ValueError as e:
         raise HTTPException(422, str(e))
     except tagfilter.ExtractionError as e:
@@ -276,7 +285,7 @@ def delete_memory(kind: str, doc_id: str, retract: Literal["true", "false"] = "f
     # misread flag here silently decides whether the text is blocked forever
     try:
         return memory.delete(who["owner_id"], kind, doc_id, retract == "true",
-                             person=identity(who))
+                             person=person_of(who))
     except ValueError as e:
         raise HTTPException(422, str(e))
     except PermissionError:
@@ -316,7 +325,7 @@ def exists(body: ExistsIn, who: dict = Depends(caller)):
 def promote(body: PromoteIn, who: dict = Depends(caller)):
     try:
         return memory.promote(who["owner_id"], body.kind, body.doc_id, body.to_visibility,
-                              person=identity(who))
+                              person=person_of(who))
     except governance.GovernedError as e:
         raise HTTPException(409, str(e))
     except LookupError as e:
@@ -333,7 +342,7 @@ def update(body: UpdateIn, who: dict = Depends(caller)):
     try:
         return memory.update(who["owner_id"], body.kind, body.doc_id, body.text,
                              body.tags, body.visibility, body.occurred_at,
-                             person=identity(who))
+                             person=person_of(who))
     except governance.GovernedError as e:
         raise HTTPException(409, str(e))
     except memory.SupersededError as e:
@@ -348,7 +357,7 @@ def update(body: UpdateIn, who: dict = Depends(caller)):
 def delete(body: DeleteIn, who: dict = Depends(caller)):
     try:
         return memory.delete(who["owner_id"], body.kind, body.doc_id, body.retract,
-                             person=identity(who))
+                             person=person_of(who))
     except governance.GovernedError as e:
         raise HTTPException(409, str(e))
     except memory.SupersededError as e:
@@ -544,7 +553,7 @@ def mcp_tool(tool: str, body: dict, who: dict = Depends(caller)):
         "retain": lambda b: memory.retain(who["owner_id"], b["kind"], b["text"],
                                           b.get("visibility", "private"),
                                           b.get("occurred_at"), b.get("doc_group"),
-                                          person=identity(who)),
+                                          person=person_of(who)),
         "recall": lambda b: memory.recall(who["owner_id"], b["query"], b.get("kinds"),
                                           _bounded_size(b.get("size", 8)), b.get("min_score"),
                                           b.get("as_of"), b.get("per_doc"), b.get("rerank"),
@@ -554,13 +563,13 @@ def mcp_tool(tool: str, body: dict, who: dict = Depends(caller)):
                                           b.get("text"), _exists_size(b.get("size", 5))),
         "reflect": lambda b: memory.reflect(who["owner_id"], b["question"]),
         "promote": lambda b: memory.promote(who["owner_id"], b["kind"], b["doc_id"], b["to_visibility"],
-                                            person=identity(who)),
+                                            person=person_of(who)),
         "update": lambda b: memory.update(who["owner_id"], b["kind"], b["doc_id"],
                                           b.get("text"), b.get("tags"),
                                           b.get("visibility"), b.get("occurred_at"),
-                                          person=identity(who)),
+                                          person=person_of(who)),
         "delete": lambda b: memory.delete(who["owner_id"], b["kind"], b["doc_id"],
-                                          b.get("retract", False), person=identity(who)),
+                                          b.get("retract", False), person=person_of(who)),
         "unreject": lambda b: memory.unreject(who["owner_id"], b.get("text"), b.get("source_id")),
     }
     if tool not in handlers:
