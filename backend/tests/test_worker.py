@@ -21,8 +21,8 @@ def _seed(owner, text):
     return es("POST", f"/{idx('semantic')}/_doc?refresh=true", doc)["_id"]
 
 
-auth.create_key("w1")
-auth.create_key("w2")
+auth.create_key("w1", person="w1")
+auth.create_key("w2", person="w2")
 memory.retain("w1", "semantic", "Python toolchain for repo gates is python3.12 venv")
 _seed("w1", "Python toolchain for repo gates is python3.12 venv")
 memory.retain("w2", "semantic", "Worker two note: git identity uses committer dev@example.com")

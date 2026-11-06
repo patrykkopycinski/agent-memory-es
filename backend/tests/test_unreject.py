@@ -15,7 +15,7 @@ from app.store import es, idx, PREFIX
 
 client = TestClient(app)
 OWNERS = ("ur_alice", "ur_bob")
-ALICE, BOB = (auth.create_key(o) for o in OWNERS)
+ALICE, BOB = (auth.create_key(o, person=o) for o in OWNERS)
 H = lambda k: {"X-API-Key": k}  # noqa: E731
 
 tombstone._ensure_index()

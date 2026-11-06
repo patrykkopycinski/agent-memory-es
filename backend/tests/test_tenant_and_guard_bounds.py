@@ -24,7 +24,7 @@ from app.store import es, idx  # noqa: E402
 
 client = TestClient(app)
 VICTIM, MALLORY = "tgvictim", "tgmallory"
-VK, MK = auth.create_key(VICTIM), auth.create_key(MALLORY)
+VK, MK = auth.create_key(VICTIM, person=VICTIM), auth.create_key(MALLORY, person=MALLORY)
 H = lambda k: {"X-API-Key": k}  # noqa: E731
 
 
@@ -154,7 +154,7 @@ def test_admin_keys_has_no_default_token(monkeypatch):
     assert client.post("/admin/keys?owner_id=x").status_code == 403
     monkeypatch.setenv("AMES_ADMIN_TOKEN", "s3cret-tg")
     assert client.post("/admin/keys?owner_id=x", headers={"X-Admin-Token": "dev-admin"}).status_code == 403
-    ok = client.post("/admin/keys?owner_id=tgminted", headers={"X-Admin-Token": "s3cret-tg"})
+    ok = client.post("/admin/keys?owner_id=tgminted&person=tgminted", headers={"X-Admin-Token": "s3cret-tg"})
     assert ok.status_code == 200 and ok.json()["owner_id"] == "tgminted"
 
 
@@ -223,7 +223,7 @@ def test_admin_keys_maps_unwritable_key_store_to_503(tmp_path, monkeypatch):
     d.chmod(0o500)
     try:
         r = TestClient(app, raise_server_exceptions=False).post(
-            "/admin/keys?owner_id=x", headers={"X-Admin-Token": "s3cret-tg"})
+            "/admin/keys?owner_id=x&person=x", headers={"X-Admin-Token": "s3cret-tg"})
     finally:
         d.chmod(0o700)
     assert r.status_code == 503, r.text

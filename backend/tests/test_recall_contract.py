@@ -21,8 +21,8 @@ from app.store import es, idx  # noqa: E402
 OWNER = "p2contract"
 OTHER = "p2contractother"
 client = TestClient(app)
-H = {"X-API-Key": auth.create_key(OWNER)}
-HO = {"X-API-Key": auth.create_key(OTHER)}
+H = {"X-API-Key": auth.create_key(OWNER, person=OWNER)}
+HO = {"X-API-Key": auth.create_key(OTHER, person=OTHER)}
 
 
 def _clean():

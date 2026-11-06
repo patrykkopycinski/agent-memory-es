@@ -136,7 +136,7 @@ def test_http_recall_returns_timings_and_emits_log_line(caplog):
     from fastapi.testclient import TestClient
     from app import auth
     from app.main import app
-    key = auth.create_key(OWNER)
+    key = auth.create_key(OWNER, person=OWNER)
     with TestClient(app) as c, caplog.at_level(logging.INFO, logger="ames.recall"):
         r = c.post("/memory/recall", json={"query": QUERY, "rerank": False},
                    headers={"X-API-Key": key})

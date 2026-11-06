@@ -11,7 +11,7 @@ from app.hermes_provider import HermesMemoryProvider
 
 _llm_gate.require_llm(__name__)  # reflect() below needs a live gateway; skip at collection when down
 
-key = auth.create_key("hermes-default")
+key = auth.create_key("hermes-default", person="hermes-default")
 p = HermesMemoryProvider("hermes-default", api_key=key)
 
 p.retain("Kibana eval stacks must boot on dedicated per-worktree ports, never 5620 shared")
