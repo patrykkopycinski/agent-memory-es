@@ -8,7 +8,9 @@
 The approver key is read ONLY from an interactive terminal prompt (getpass). It is never taken
 from an argument, an environment variable or a file, and the tool refuses to run when stdin is
 not a TTY, so a script or an agent cannot drive it. The service URL may come from --url or
-AMES_SERVICE_URL (it is not a secret).
+AMES_SERVICE_URL (it is not a secret). Before the prompt the tool prints the target host and asks
+for confirmation, and it refuses plain http unless the host is loopback, so the key is never sent
+in the clear to a remote machine or to a URL you did not mean.
 """
 import argparse
 import getpass
@@ -16,8 +18,10 @@ import json
 import os
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 
+LOOPBACK = ("localhost", "127.0.0.1", "::1")
 DEFAULT_URL = "http://localhost:8123"
 
 
@@ -35,6 +39,32 @@ def request(url: str, key: str, method: str, path: str, body: dict = None):
         except Exception:
             detail = ""
         return e.code, {"error": detail or e.reason}
+
+
+def check_url(url: str) -> bool:
+    """https anywhere, or http to a loopback host only. SystemExit otherwise."""
+    try:
+        parts = urllib.parse.urlsplit(url)
+        host = parts.hostname
+    except ValueError:
+        raise SystemExit(f"ames_approve: not a valid service URL: {url!r}") from None
+    if parts.scheme not in ("http", "https") or not host:
+        raise SystemExit(f"ames_approve: the service URL needs an http(s) scheme and a host: {url!r}")
+    if parts.scheme == "http" and host not in LOOPBACK:
+        raise SystemExit(f"ames_approve: refusing to send the key over plain http to {host}; "
+                         "use an https URL (plain http is accepted for loopback only)")
+    return True
+
+
+def confirm_target(url: str, stdin=None, ask=input) -> None:
+    """Show where the key will go and require an explicit yes. Needs a TTY; returns None on yes."""
+    stdin = stdin if stdin is not None else sys.stdin
+    if not stdin.isatty():
+        raise SystemExit("ames_approve: refusing to run without an interactive terminal")
+    host = urllib.parse.urlsplit(url).hostname
+    print(f"ames_approve: the approver key will be sent to {host} ({url})")
+    if ask("Continue? [y/N] ").strip().lower() != "y":
+        raise SystemExit("ames_approve: aborted")
 
 
 def read_key(stdin=None, prompt=getpass.getpass) -> str:
@@ -108,6 +138,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
+    check_url(args.url)
+    confirm_target(args.url)
     return run(args, read_key())
 
 
