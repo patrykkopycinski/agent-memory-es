@@ -26,8 +26,14 @@ def _normalize_legacy(keys: dict) -> bool:
     entries 401 for every token. Normalize in place: add a digest entry for each
     plaintext token (the plaintext token is never persisted by create_key; the
     name-keyed copy stays so hand-managed file expectations don't break).
-    Returns whether anything was added. Pure: never touches the file."""
+    Also lowercases every stored `person` (one human, one person string, however the file was
+    written). Returns whether anything changed. Pure: never touches the file."""
     changed = False
+    for entry in keys.values():
+        p = entry.get("person") if isinstance(entry, dict) else None
+        if isinstance(p, str) and p != p.strip().lower():
+            entry["person"] = p.strip().lower()
+            changed = True
     for name, val in list(keys.items()):
         if isinstance(val, str) and val.startswith("ame_"):
             digest = hashlib.sha256(val.encode()).hexdigest()
@@ -197,8 +203,9 @@ def set_person(owner_id: str, person: str) -> int:
 
 def persons_of(owner_id: Optional[str]) -> set:
     """Every person named on a key of `owner_id` (read-only, like the worker's key view)."""
-    return {e["person"] for e in load_readonly().values()
-            if isinstance(e, dict) and e.get("owner_id") == owner_id and e.get("person")}
+    return {e["person"].lower() for e in load_readonly().values()
+            if isinstance(e, dict) and e.get("owner_id") == owner_id
+            and isinstance(e.get("person"), str) and e["person"]}
 
 
 # Best-effort legacy migration is attempted at most once per (file version, backoff window)
