@@ -475,6 +475,7 @@ def _retain(owner_id: str, kind: str, text: str, visibility: str = "private",
                          f"{governance.DECISION_TAG}")
     override_of = None
     if governed and _proposal is None:
+        governance.require_person(person)
         # fail closed BEFORE any write: a bad override target must leave nothing behind
         override_of = (governance.validate_override_target(supersedes_decision)
                        if supersedes_decision is not None else None)
@@ -493,7 +494,7 @@ def _retain(owner_id: str, kind: str, text: str, visibility: str = "private",
     gov_fields = None
     if governed:
         if _proposal is None:
-            gov_fields = governance.proposal_fields(author, override_of)
+            gov_fields = governance.proposal_fields(author, owner_id, override_of)
             governance.audit_propose(author, group, h, override_of)   # BEFORE the first write
         else:
             gov_fields = dict(_proposal)
@@ -743,8 +744,7 @@ def update(owner_id: str, kind: str, doc_id: str, text=None, tags=None,
         raise SupersededError(doc_id, _live_successor(kind, s))
     governance.check_mutable(s)         # active / closed decisions: 409, the creator included
     _assert_group_mutable(owner_id, kind, s)
-    author = person or owner_id
-    if governance.is_governed(s) and s.get("proposed_by") not in (None, author):
+    if governance.is_governed(s) and not governance.is_author(s, person, owner_id):
         raise PermissionError("only the creator can modify their memory")
     if visibility is not None and visibility not in VISIBILITIES:
         raise ValueError(f"visibility must be one of {VISIBILITIES}")
@@ -756,7 +756,8 @@ def update(owner_id: str, kind: str, doc_id: str, text=None, tags=None,
         if (visibility not in (None, "team") or
                 (tags is not None and governance.DECISION_TAG not in _tf.norm_tags(tags))):
             raise ValueError("a proposed decision stays a team decision; delete it to withdraw")
-        proposal = {k: s[k] for k in ("decision_status", "proposed_by", "proposal_for") if k in s}
+        proposal = {k: s[k] for k in ("decision_status", "proposed_by", "proposed_by_persons",
+                                          "proposal_for") if k in s}
         proposal["approvals"] = []
         if s.get("proposal_expires_at"):
             proposal["proposal_expires_at"] = s["proposal_expires_at"]   # an edit never extends the TTL
@@ -886,7 +887,7 @@ def delete(owner_id: str, kind: str, doc_id: str, retract: bool = False,
     _assert_group_mutable(owner_id, kind, s)
     if governance.is_governed(s):
         if s.get("decision_status") == governance.PROPOSED:
-            return governance.withdraw(person or owner_id, doc_id)   # author's delete = withdrawn
+            return governance.withdraw(person or owner_id, doc_id, owner_id)   # author's delete = withdrawn
         governance.check_mutable(s)
     group = s.get("doc_group")
     _log_mutation("delete", owner_id, kind, doc_id,
@@ -1432,10 +1433,11 @@ def promote(owner_id: str, kind: str, doc_id: str, to_visibility: str,
     governed = governance.is_governed_write(kind, to_visibility, copy.get(_tf.TAG_FIELD))
     if governed:
         # promoting a private decision to the team bank is a proposal, never an active decision
-        author = person or owner_id
+        governance.require_person(person)
+        author = person
         copy["doc_group"] = "dg_%s" % uuid.uuid4().hex     # the proposal gets its own group
         copy["passage_index"] = 0
-        copy.update(governance.proposal_fields(author))
+        copy.update(governance.proposal_fields(author, owner_id))
         governance.audit_propose(author, copy["doc_group"], copy.get("text_hash"), None)
     r = es("POST", f"/{idx(kind)}/_doc?refresh=true", copy)
     out = {"promoted_id": r["_id"], "visibility": to_visibility}

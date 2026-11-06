@@ -70,6 +70,11 @@ def proposal_ttl_days() -> float:
     return max(0.0, _env_num("AMES_GOV_PROPOSAL_TTL_DAYS", 14.0, float))
 
 
+def reconcile_days() -> float:
+    """How far back the worker re-checks overrides that are already linked and held."""
+    return max(0.0, _env_num("AMES_GOV_RECONCILE_DAYS", 7.0, float))
+
+
 def veto_owners() -> set:
     return {p.strip() for p in os.environ.get("AMES_GOV_VETO_OWNERS", "").split(",") if p.strip()}
 
@@ -234,8 +239,21 @@ def validate_override_target(target_id) -> str:
     return t["id"]
 
 
-def proposal_fields(owner_id: str, override_of: Optional[str] = None) -> dict:
-    fields = {"decision_status": PROPOSED, "proposed_by": owner_id, "approvals": []}
+def require_person(person: Optional[str]) -> None:
+    """A governed write must name the human behind the key: approvals are counted per person, and a
+    proposal authored by a bare owner id cannot be told apart from its author's approver key."""
+    if not person:
+        raise PermissionError("this key names no person: name the person first via "
+                              "/admin/keys/person (an admin step) before writing team decisions")
+
+
+def proposal_fields(author: str, owner_id: str, override_of: Optional[str] = None) -> dict:
+    """`proposed_by_persons` freezes the author set at propose time: the author and every person
+    named on a key of the owner then. Revoking a sibling key later cannot shrink it."""
+    from . import auth
+    persons = {author} | auth.persons_of(owner_id)
+    fields = {"decision_status": PROPOSED, "proposed_by": author, "approvals": [],
+              "proposed_by_persons": sorted(persons)}
     ttl = proposal_ttl_days()
     if ttl:
         fields["proposal_expires_at"] = _iso(_now() + ttl * 86400)
@@ -272,13 +290,20 @@ def _author_ids(src: dict) -> set:
     person attached to a key of that owner. A key minted without a person stores the owner id as
     the author, so the person behind it is found through the owner's other keys."""
     from . import auth
-    ids = {src.get("proposed_by"), src.get("owner_id")} | auth.persons_of(src.get("owner_id"))
+    ids = ({src.get("proposed_by"), src.get("owner_id")} | set(src.get("proposed_by_persons") or [])
+           | auth.persons_of(src.get("owner_id")))
     ids.discard(None)
-    return ids
+    return {i.lower() for i in ids if isinstance(i, str)}
+
+
+def is_author(src: dict, person: Optional[str], owner_id: str) -> bool:
+    """The caller wrote this proposal: `proposed_by` is its person or, for a key that had none when
+    it proposed (an admin may have named the person since), its owner id."""
+    return src.get("proposed_by") in (None, person, owner_id)
 
 
 def _refuse_author(src: dict, person: str, owner_id: Optional[str], message: str) -> None:
-    if person in _author_ids(src) or (owner_id and owner_id == src.get("owner_id")):
+    if person.lower() in _author_ids(src) or (owner_id and owner_id == src.get("owner_id")):
         raise PermissionError(message)
 
 
@@ -335,13 +360,21 @@ def approve(person: str, doc_id: str, note: Optional[str] = None,
                 continue                  # someone else changed it: re-read and recount
             claimed = None                # activated: the claim is now permanent
             _mirror(doc, patch)
+            conflict = False
             if activating and target:
-                _confirm_target(person, doc["id"], target)
-                _link_target(doc["id"], target)
-            return {"_id": doc["id"], "decision_status": patch.get("decision_status", PROPOSED),
-                    "approvals": len(approvals),
-                    "approvals_needed": max(0, approvals_required(src) - len(approvals)),
-                    "activated": activating}
+                try:
+                    _confirm_target(person, doc["id"], target)
+                    _link_target(doc["id"], target)
+                except GovernedError:
+                    conflict = True       # already active and flagged: report it, do not fail the call
+            out = {"_id": doc["id"], "decision_status": patch.get("decision_status", PROPOSED),
+                   "approvals": len(approvals),
+                   "approvals_needed": max(0, approvals_required(src) - len(approvals)),
+                   "activated": activating}
+            if conflict:
+                out["conflict"] = True
+                out["warning"] = "override activated but its target is held by another decision"
+            return out
         raise GovernedError("could not record the approval after repeated conflicts; retry")
     except Exception:
         if claimed:
@@ -392,11 +425,24 @@ def _release_target(actor: str, new_id: str, target_id: str) -> bool:
                          {"text_hash": t["src"].get("text_hash"), "by": actor, "released_from": new_id})
             if _cas(t, patch):
                 _mirror(t, patch)
-                return True
+                return not _reclaim_if_activated(new_id, target_id)
             _lost(row)
     except LookupError:
         return False
     return False
+
+
+def _reclaim_if_activated(new_id: str, target_id: str) -> bool:
+    """The successor was read BEFORE the target was written: an approver may have activated and
+    confirmed it in between, and would then find the target already active. Look again after the
+    restore and take the claim back when it is active (or became so)."""
+    try:
+        if _load(new_id)["src"].get("decision_status") != ACTIVE:
+            return False
+        _claim_target("system", new_id, target_id)
+    except (GovernedError, LookupError):
+        _flag_conflict(new_id, target_id, "override target was restored while its override activated")
+    return True
 
 
 def _release_quietly(actor: str, new_id: str, target_id: Optional[str]) -> None:
@@ -483,13 +529,13 @@ def reject(person: str, doc_id: str, reason: str, owner_id: Optional[str] = None
     raise GovernedError("could not record the rejection after repeated conflicts; retry")
 
 
-def withdraw(author: str, doc_id: str) -> dict:
+def withdraw(author: str, doc_id: str, owner_id: Optional[str] = None) -> dict:
     """The author (a person, or the owner id for a key without one) deleting a proposal: it
     becomes rejected (withdrawn), never hard-deleted."""
     for _ in range(MAX_CAS_ATTEMPTS):
         doc = _load(doc_id)
         src = doc["src"]
-        if src.get("proposed_by") != author:
+        if src.get("proposed_by") not in (author, owner_id):
             raise PermissionError("only the creator can delete their memory")
         if src.get("decision_status") != PROPOSED:
             raise GovernedError()
@@ -531,7 +577,23 @@ def list_proposals(limit: int = MAX_LIST) -> dict:
             "approvals_required": approvals_required(s), "approvals_needed": approvals_needed(s),
             "objections": [{"by": o.get("by"), "reason": o.get("reason"), "at": o.get("at")}
                            for o in s.get("objections") or []]})
-    return {"proposals": out, "total": r["hits"]["total"]["value"]}
+    return {"proposals": out, "total": r["hits"]["total"]["value"],
+            "override_conflicts": _list_conflicts(limit)}
+
+
+def _list_conflicts(limit: int) -> list:
+    """Active overrides that could not supersede their target (`approved_via: approvals_conflict`).
+    They stay active in recall; this is how an operator finds them."""
+    r = es("POST", f"/{idx('semantic')}/_search", {
+        "size": limit, "_source": ["doc_group", "text", "proposal_for", "decided_at", "proposed_by"],
+        "query": {"bool": {"filter": [{"term": {"decision_status": ACTIVE}},
+                                      {"term": {"approved_via": CONFLICT_VIA}},
+                                      {"term": {"passage_index": 0}}]}},
+        "sort": [{"decided_at": {"order": "asc", "unmapped_type": "date"}}]})
+    return [{"id": h["_id"], "doc_group": h["_source"].get("doc_group"),
+             "text": h["_source"].get("text"), "proposal_for": h["_source"].get("proposal_for"),
+             "decided_at": h["_source"].get("decided_at"),
+             "proposed_by": h["_source"].get("proposed_by")} for h in r["hits"]["hits"]]
 
 
 # ---- maintenance ----
@@ -621,16 +683,22 @@ def _reconcile_overrides() -> tuple:
     carry the `supersedes` link. Completes an interrupted override (claim missing or link missing).
     One that cannot be completed because its target is held by another decision or gone is
     flagged (_flag_conflict, `approved_via: approvals_conflict`) and so leaves this query for good.
+    Only overrides decided within `AMES_GOV_RECONCILE_DAYS` (default 7) are scanned, plus every one
+    that is not yet linked (`supersedes` missing): a settled one is not read again on every pass.
     Reads every page. Returns (completed, conflicts)."""
     completed = conflicts = 0
     after = None
+    since = _iso(_now() - reconcile_days() * 86400)
     for _page in range(MAX_EXPIRY_PAGES):
         body = {"size": PAGE, "_source": ["proposal_for", "supersedes"],
                 "sort": [{"decided_at": "asc"}, {"_seq_no": "asc"}],
                 "query": {"bool": {"filter": [{"term": {"decision_status": ACTIVE}},
                                               {"term": {"approved_via": "approvals"}},
                                               {"term": {"passage_index": 0}},
-                                              {"exists": {"field": "proposal_for"}}]}}}
+                                              {"exists": {"field": "proposal_for"}}],
+                                   "should": [{"range": {"decided_at": {"gte": since}}},
+                                              {"bool": {"must_not": {"exists": {"field": "supersedes"}}}}],
+                                   "minimum_should_match": 1}}}
         if after:
             body["search_after"] = after
         hits = es("POST", f"/{idx('semantic')}/_search", body)["hits"]["hits"]
