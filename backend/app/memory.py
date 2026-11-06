@@ -156,6 +156,7 @@ MAX_TEXT_CHARS = int(os.environ.get("AMES_MAX_TEXT_CHARS", "100000"))
 MAX_PASSAGES = 100              # group lookups read at most this many passages
 MAX_RECALL_SIZE = 50
 MAX_PER_DOC = 50
+MAX_ID_CHARS = 512            # caller-supplied ids (unreject source_id); no earlier bound existed, 512 = ES's _id limit
 
 import re as _re
 _PRIVATE_MARKERS = _re.compile(
@@ -738,14 +739,18 @@ def update(owner_id: str, kind: str, doc_id: str, text=None, tags=None,
             "passages": len(old_ids), "updated": bool(patch)}
 
 
-def delete(owner_id: str, kind: str, doc_id: str) -> dict:
+def delete(owner_id: str, kind: str, doc_id: str, retract: bool = False) -> dict:
     """Delete a memory (the whole doc_group) by id. Owner-scoped: another owner's
     doc is a PermissionError (HTTP 403), matching promote. Intent (who/when/what)
-    is logged to am_mutations BEFORE the delete runs. Deleted semantic text is
-    tombstoned so the same content cannot be re-retained (retain() consults
-    is_rejected for semantic kind only, so other kinds write no tombstone)."""
+    is logged to am_mutations BEFORE the delete runs. A plain delete only removes
+    (duplicate, stale wording, test write): the text can be retained again. With
+    retract=True the semantic text is also tombstoned ("wrong, never record it
+    again": retain() consults is_rejected for semantic kind only, so other kinds
+    write no tombstone). tombstone.lift / unreject() undoes a retraction."""
     if kind not in KINDS:
         raise ValueError(f"kind must be one of {KINDS}")
+    if not isinstance(retract, bool):
+        raise ValueError("retract must be a boolean")
     s = _get_source(kind, doc_id)
     if s["owner_id"] != owner_id:
         raise PermissionError("only the creator can delete their memory")
@@ -754,14 +759,14 @@ def delete(owner_id: str, kind: str, doc_id: str) -> dict:
     group = s.get("doc_group")
     _log_mutation("delete", owner_id, kind, doc_id,
                   {"text": s["text"], "doc_group": group,
-                   "visibility": s.get("visibility")})
+                   "visibility": s.get("visibility"), "retract": retract})
     ids = _group_docs(owner_id, kind, doc_id)
     if len(ids) == 1:
         es("DELETE", f"/{idx(kind)}/_doc/{_q(ids[0])}?refresh=true")
     else:
         es("POST", f"/{idx(kind)}/_delete_by_query?refresh=true",
            {"query": _owned_group_query(owner_id, group)})
-    tombstoned = kind == "semantic" and tombstone.reject(
+    tombstoned = retract and kind == "semantic" and tombstone.reject(
         owner_id, s.get("text", ""), reason="deleted by owner", source_id=doc_id) is not None
     # Unified return shape: REST contract (test_delete.py, a96df78) pins
     # deleted=bool + group_deleted + deleted_ids; the POST suite uses
@@ -770,6 +775,36 @@ def delete(owner_id: str, kind: str, doc_id: str) -> dict:
             "kind": kind, "doc_id": doc_id,
             "group_deleted": bool(ids), "deleted_ids": ids,
             "tombstoned": tombstoned}
+
+
+def unreject(owner_id: str, text: Optional[str] = None, source_id: Optional[str] = None) -> dict:
+    """Lift this owner's tombstones so the value can be retained again: every tombstone that
+    would block `text` (the same rule as retain's is_rejected check), or those recorded for
+    `source_id` (the doc id a retracting delete came from). Exactly one selector. Intent is
+    logged to am_mutations BEFORE the lift, with the lifted tombstones' source_ids; lifting
+    nothing is a success with lifted=0."""
+    if (text is None) == (source_id is None):
+        raise ValueError("unreject needs exactly one of text or source_id")
+    if text is not None:
+        if not isinstance(text, str) or not text.strip():
+            raise ValueError("text must be a non-empty string")
+        _check_text_size(text)
+        found = tombstone.blockers(owner_id, text)
+    else:
+        if not isinstance(source_id, str) or not source_id.strip():
+            raise ValueError("source_id must be a non-empty string")
+        if len(source_id) > MAX_ID_CHARS:
+            raise ValueError(f"source_id too long: {len(source_id)} chars (max {MAX_ID_CHARS})")
+        found = tombstone.by_source(owner_id, source_id)
+    # value_key stands in for tombstones written without a source_id
+    lifted_ids = [t.get("source_id") or t["value_key"] for t in found]
+    detail = {"by": "text" if text is not None else "source_id", "matched": len(found),
+              "source_ids": lifted_ids}
+    if text is not None:
+        detail["text"] = text
+    _log_mutation("unreject", owner_id, "semantic", source_id or "", detail)
+    return {"lifted": tombstone.lift(owner_id, [t["_id"] for t in found]),
+            "source_ids": lifted_ids, "by": detail["by"]}
 
 
 MAX_EXISTS_TAGS = 16
@@ -862,7 +897,8 @@ def rrf_fuse(ranked_lists: list, rank_constant: int = RANK_CONSTANT,
     """Reciprocal rank fusion with ES `retriever.rrf` semantics: each input is a best-first list
     of ids; only its top `window` entries count; a doc scores sum(1 / (rank_constant + rank))
     over the lists it appears in, rank being 1-based. Returns [(id, score)] best-first. Ties
-    break on the best rank in any list, then on the earlier list, then id (deterministic)."""
+    break on the best rank in any list, then on the earlier list, then id. The id step is stable
+    only within one index: ES assigns random ids, so it is not a reproducible order across runs."""
     score, best, first_list = {}, {}, {}
     for li, ids in enumerate(ranked_lists):
         for rank, doc_id in enumerate(ids[:window], start=1):
@@ -1371,6 +1407,6 @@ def _delete_superseded_note():
     than) the unified delete() above after the feat/memory-mutation-api merge.
     Both call surfaces (REST DELETE /memory/{kind}/{doc_id} and POST
     /memory/delete) now use that single delete() with superset semantics:
-    intent log (am_mutations) + tombstone (semantic only) + group cascade + owner check + 404
+    intent log (am_mutations) + optional tombstone (retract=True, semantic only) + group cascade + owner check + 404
     via LookupError. Contracts pinned by test_delete.py and test_update_delete.py."""
     return None

@@ -111,31 +111,34 @@ def test_recency_boost_orders_recent_first(monkeypatch):
     _wipe()
     old = "The nightly capacity report lists shard rebalance targets for the cluster"
     new = "Capacity planning notes: shard rebalance target moved after the incident review"
-    # Timestamps are relative to NOW: recall scores recency against the current clock, so fixed dates
-    # would decay (a 2026-10-03 doc is ~0 boost by 2027) and the assertion would degrade to a tie-break.
+    # Timestamps are relative to NOW: recall scores recency against the current clock, so fixed dates would
+    # decay (a 2026-10-03 doc is ~0 boost by 2027) and both docs would end up with ~0 recency and an unordered tie.
     now = dt.datetime.now(dt.timezone.utc)
-    fmt = "%Y-%m-%dT%H:%M:%SZ"
-    memory.retain(OWNER, "semantic", old, occurred_at=(now - dt.timedelta(days=800)).strftime(fmt))
-    memory.retain(OWNER, "semantic", new, occurred_at=(now - dt.timedelta(days=1)).strftime(fmt))
+    stamp = lambda days: (now - dt.timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")  # noqa: E731
+    memory.retain(OWNER, "semantic", old, occurred_at=stamp(800))
+    memory.retain(OWNER, "semantic", new, occurred_at=stamp(1))
 
     monkeypatch.setattr(memory, "RECENCY_WEIGHT", 5.0)
-    # the recency arm only orders the FUSED list; the (default-on) cross-encoder rerank replaces
-    # that order by relevance, so this contract is tested on the fused path (rerank=False).
+    # rerank=False: the recency arm only orders the FUSED list; a cross-encoder rerank replaces
+    # that order by relevance, so this contract is tested on the fused path.
     boosted = memory.recall(OWNER, "shard rebalance targets", size=8, rerank=False)["results"]
     monkeypatch.setattr(memory, "RECENCY_WEIGHT", 0.0)
     flat = memory.recall(OWNER, "shard rebalance targets", size=8, rerank=False)["results"]
 
-    # The two docs' RRF scores nearly tie, so list ORDER can follow a tie-break. Assert the score
-    # arithmetic instead: the weight-5 vs weight-0 score gap between the docs is exactly the
-    # recency gap, and that gap favours the recent doc.
     b = {h["text"]: h for h in boosted}
     f = {h["text"]: h for h in flat}
     assert old in b and new in b and old in f and new in f, [h["text"] for h in boosted]
-    assert f[new]["recency"] == 0.0 and f[old]["recency"] == 0.0
+    # weight 5: the recent doc leads, by a margin far above the 1-rank RRF gap
+    assert [h["text"] for h in boosted if h["text"] in (old, new)] == [new, old], [h["text"] for h in boosted]
+    # weight 0: the per-arm RRF scores tie exactly in _hybrid_app_fusion (BM25 favours one doc, kNN the
+    # other), so the flat ORDER is decided by the random ES doc id. Assert the deterministic part, and
+    # check the score arithmetic instead of the order: the weight-5 vs weight-0 score gap between the
+    # docs is exactly the recency gap, and that gap favours the recent doc.
+    assert all(f[t]["recency"] == 0.0 and f[t]["score"] == f[t]["rrf"] for t in (old, new)), f
     assert b[new]["recency"] > b[old]["recency"] >= 0.0
     d_boost = b[new]["score"] - b[old]["score"]
     d_flat = f[new]["score"] - f[old]["score"]
-    assert abs((d_boost - d_flat) - (b[new]["recency"] - b[old]["recency"])) < 1e-9
+    assert abs((d_boost - d_flat) - (b[new]["recency"] - b[old]["recency"])) < 1e-9, (d_boost, d_flat)
     # `new` is 1 day old: decay ~0.999, so its boost is ~5/61 = 0.082 whatever today's date is, while the
     # RRF gap between two docs is ~1e-3. Require a margin so this can never be a tie-break again.
     assert b[new]["recency"] > 0.9 * 5.0 / (memory.RANK_CONSTANT + 1), b[new]["recency"]

@@ -108,7 +108,7 @@ A: Deploys go through OmniRoute catchup branches [ames-semantic:Zu3f...]
   <ul class="chain">
     <li><b>Deterministic guard</b> — <span>regex over sensitive markers (api key, token, secret, credential, ssh key…); a hit blocks shared promotion</span> <code>memory.py:guard_promotion</code></li>
     <li><b>Same text, same decision</b> — <span>no classifier, no LLM in the path</span></li>
-    <li><b>Rejection tombstones</b> — <span>"forget this" survives as a block on re-learning</span> <code>tombstone.py</code></li>
+    <li><b>Rejection tombstones</b> — <span>a retracting delete (<code>retract=true</code>) blocks re-learning the value; a plain delete only removes it, and <code>POST /memory/unreject</code> lifts the block</span> <code>tombstone.py</code></li>
   </ul>
   <div class="demo">
     <label>Try promoting this private memory to team:</label>
