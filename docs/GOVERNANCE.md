@@ -57,11 +57,16 @@ Approval is a human act. Keys carry a role from a fixed allowlist (`member`, `ow
 the key (`422` without one): `POST /admin/keys?owner_id=..&role=approver&person=alice`. Keys
 minted before `person` was required keep working as agent keys; name their person with
 `POST /admin/keys/person?owner_id=..&person=alice` (admin token; only keys with no person are
-changed; the call is audited as a `key_set_person` row and logged, and returns `updated`, the number
-of keys changed).
+changed). The audit row `key_set_person` (what was asked: owner and person) is written first, in
+strict mode, and a failed audit write answers `503` with nothing changed. A second row,
+`key_set_person_done`, records the outcome (`keys_changed`) on a best-effort basis, so the first row
+means "intended", the second "done". The call returns `updated`, the number of keys changed.
+Persons already stored in the key file are lowercased when it is read, so a hand-edited `Alice`
+is the person `alice`.
 
-**One human, one person string.** Persons are trimmed and lowercased at mint time and in
-`set-person`, so `Alice` and `alice` are one person, and the author check compares them that way.
+**One human, one person string.** Persons are trimmed and lowercased at mint time, in
+`set-person` and when the key file is read. Every comparison (author check, one approval per
+person, objections, withdraw, veto list) is case-insensitive, so `Alice` and `alice` are one person.
 Use the same string for every key of a human.
 
 **Governed writes need a person.** A key without one (minted before `person` was required) can
@@ -93,6 +98,10 @@ scripts/ames_approve.py approve <doc_id> [--note TEXT]
 scripts/ames_approve.py reject <doc_id> --reason TEXT
 ```
 
+`list` prints the open proposals and then a `WARNING:` line for every entry of
+`override_conflicts`. `approve` prints a `WARNING:` line and exits `2` when the approval activated
+an override whose target another decision holds (exit `1` is an error, `0` a clean success).
+
 ## API
 
 | Route | Who | Notes |
@@ -114,8 +123,9 @@ script renders them as "PROPOSED, not in force"); closed decisions are hidden un
 | `AMES_GOV_NEW_APPROVALS` | `1` | approvals to activate a new decision |
 | `AMES_GOV_OVERRIDE_APPROVALS` | `2` | approvals to activate an override (never below the new-decision value) |
 | `AMES_GOV_PROPOSAL_TTL_DAYS` | `14` | a proposal older than this expires; `0` disables expiry |
-| `AMES_GOV_VETO_OWNERS` | empty | comma-separated person ids whose rejection is final |
+| `AMES_GOV_VETO_OWNERS` | empty | comma-separated person ids whose rejection is final (case-insensitive) |
 | `AMES_GOV_RECONCILE_DAYS` | `7` | the worker re-checks linked overrides decided within this many days (unlinked ones are always checked) |
+| `AMES_GOV_FULL_RECONCILE_HOURS` | `24` | once per this many hours the worker scans every approved override whatever its age (minimum 1 minute); the marker is per worker process, so a restart triggers one full scan |
 
 ## Guarantees
 
@@ -133,7 +143,8 @@ script renders them as "PROPOSED, not in force"); closed decisions are hidden un
   superseded (A -> B -> C leaves A superseded). After a restore the successor is read again: if it
   became active in between, the target is claimed again. It also reconciles the active overrides
   that went live through approvals and were decided within `AMES_GOV_RECONCILE_DAYS`, plus any
-  that lack the `supersedes` link: one whose target is not superseded by it (or that lacks the `supersedes`
+  that lack the `supersedes` link; once per `AMES_GOV_FULL_RECONCILE_HOURS` the window is dropped
+  and every approved override is checked, so an old one whose claim was lost is found too: one whose target is not superseded by it (or that lacks the `supersedes`
   link) is completed. One that cannot be completed (the target is held by another decision or is
   gone) is logged as a warning, audited as `decision_override_conflict` with `outcome: conflict`
   and marked `approved_via: approvals_conflict`, which takes it out of later passes; an operator

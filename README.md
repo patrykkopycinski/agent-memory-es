@@ -83,14 +83,23 @@ approval is restricted to a human-only `approver` key role that no MCP tool can 
 are counted per person (`person=` at mint time), and an approver key is accepted on `/governance/*`
 only. `scripts/ames_approve.py` is the approval CLI (https only, except loopback). See [docs/GOVERNANCE.md](docs/GOVERNANCE.md).
 
-### Release note: rollout step for existing keys
+### Release note: rollout steps for existing keys
 
-Decision governance needs to know the human behind each key. Keys minted before `person` was
-required keep working, but they can no longer write team decisions (`403`). Before enabling it for
-a bank that has such keys, name the person once per owner:
-`POST /admin/keys/person?owner_id=<owner>&person=<name>` with the admin token (audited; persons
-are lowercased). The index mapping gains `proposed_by_persons` additively on startup, then run the
-backfill once so earlier team decisions are in force.
+There is no switch to enable decision governance: it is on once the new build runs. Keys minted
+before `person` was required keep working, but they can no longer write team decisions (`403`)
+until their person is named. In this order:
+
+1. Deploy. Startup adds the `proposed_by_persons` mapping field (additive).
+2. Immediately name the person behind each owner's keys:
+   `POST /admin/keys/person?owner_id=<owner>&person=<name>` with the admin token (audited first;
+   persons are lowercased). Until then, person-less agent keys get `403` on team-decision writes.
+   Offline alternative: for key-file entries in digest form (`<sha256 of the token>` mapped to
+   `{owner_id, role}`), add a `"person"` field before deploying (it is lowercased on load). Entries
+   still in the old plaintext form (`{"<owner>": "ame_..."}`) are converted to person-less digest
+   entries on first read, so use the admin call for those.
+3. Run `POST /admin/governance/backfill` once, so earlier team decisions are in force.
+4. Mint approver keys with `person=` set to the same person as the matching agent keys.
+5. Set `AMES_GOV_VETO_OWNERS` to person ids (case-insensitive), if you use veto owners.
 
 ## Benchmarks
 
