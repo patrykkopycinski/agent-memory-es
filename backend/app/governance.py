@@ -75,8 +75,19 @@ def reconcile_days() -> float:
     return max(0.0, _env_num("AMES_GOV_RECONCILE_DAYS", 7.0, float))
 
 
+def full_reconcile_seconds() -> float:
+    """How often the worker re-checks EVERY approved override, whatever its age."""
+    return max(60.0, _env_num("AMES_GOV_FULL_RECONCILE_HOURS", 24.0, float) * 3600)
+
+
 def veto_owners() -> set:
-    return {p.strip() for p in os.environ.get("AMES_GOV_VETO_OWNERS", "").split(",") if p.strip()}
+    """Person ids whose rejection is final, lowercased like every stored person."""
+    return {p.strip().lower() for p in os.environ.get("AMES_GOV_VETO_OWNERS", "").split(",")
+            if p.strip()}
+
+
+def _lc(value) -> str:
+    return value.lower() if isinstance(value, str) else ""
 
 
 # ---- classification ----
@@ -207,8 +218,8 @@ def _valid_approvals(src: dict) -> list:
     per person."""
     seen, out = set(), []
     for a in src.get("approvals") or []:
-        who = a.get("by")
-        if (a.get("text_hash") == src.get("text_hash") and who and who != src.get("proposed_by")
+        who = _lc(a.get("by"))
+        if (a.get("text_hash") == src.get("text_hash") and who and who != _lc(src.get("proposed_by"))
                 and who not in seen):
             seen.add(who)
             out.append(a)
@@ -299,11 +310,12 @@ def _author_ids(src: dict) -> set:
 def is_author(src: dict, person: Optional[str], owner_id: str) -> bool:
     """The caller wrote this proposal: `proposed_by` is its person or, for a key that had none when
     it proposed (an admin may have named the person since), its owner id."""
-    return src.get("proposed_by") in (None, person, owner_id)
+    by = src.get("proposed_by")
+    return by is None or _lc(by) in {_lc(person), _lc(owner_id)} - {""}
 
 
 def _refuse_author(src: dict, person: str, owner_id: Optional[str], message: str) -> None:
-    if person.lower() in _author_ids(src) or (owner_id and owner_id == src.get("owner_id")):
+    if person.lower() in _author_ids(src) or (owner_id and _lc(owner_id) == _lc(src.get("owner_id"))):
         raise PermissionError(message)
 
 
@@ -322,6 +334,7 @@ def approve(person: str, doc_id: str, note: Optional[str] = None,
     a claim released in between is taken again."""
     if note is not None and (not isinstance(note, str) or len(note) > MAX_NOTE_CHARS):
         raise ValueError(f"note must be a string of at most {MAX_NOTE_CHARS} chars")
+    person = person.strip().lower()
     claimed = None                        # (new_id, target_id) when THIS call created the claim
     try:
         for attempt in range(MAX_CAS_ATTEMPTS):
@@ -329,7 +342,7 @@ def approve(person: str, doc_id: str, note: Optional[str] = None,
             src = _require_open(doc)
             _refuse_author(src, person, owner_id, "the author's approval does not count")
             valid = _valid_approvals(src)
-            if any(a["by"] == person for a in valid):
+            if any(_lc(a["by"]) == person for a in valid):
                 raise GovernedError("already approved by this person")
             entry = {"by": person, "at": _iso(_now()), "text_hash": src["text_hash"]}
             if note:
@@ -503,13 +516,14 @@ def reject(person: str, doc_id: str, reason: str, owner_id: Optional[str] = None
     override gives back a claim it may hold on its target."""
     if not isinstance(reason, str) or not reason.strip() or len(reason) > MAX_NOTE_CHARS:
         raise ValueError(f"reason must be a non-empty string of at most {MAX_NOTE_CHARS} chars")
+    person = person.strip().lower()
     for attempt in range(MAX_CAS_ATTEMPTS):
         doc = _load(doc_id)
         src = _require_open(doc)
         _refuse_author(src, person, owner_id, "the author withdraws a proposal by deleting it")
         veto = person in veto_owners()
         objections = list(src.get("objections") or [])
-        if not veto and any(o.get("by") == person for o in objections):
+        if not veto and any(_lc(o.get("by")) == person for o in objections):
             raise GovernedError("already objected by this person")
         objections.append({"by": person, "at": _iso(_now()), "text_hash": src["text_hash"],
                            "reason": reason})
@@ -532,10 +546,11 @@ def reject(person: str, doc_id: str, reason: str, owner_id: Optional[str] = None
 def withdraw(author: str, doc_id: str, owner_id: Optional[str] = None) -> dict:
     """The author (a person, or the owner id for a key without one) deleting a proposal: it
     becomes rejected (withdrawn), never hard-deleted."""
+    author = author.strip().lower()
     for _ in range(MAX_CAS_ATTEMPTS):
         doc = _load(doc_id)
         src = doc["src"]
-        if src.get("proposed_by") not in (author, owner_id):
+        if _lc(src.get("proposed_by")) not in {author, _lc(owner_id)} - {""}:
             raise PermissionError("only the creator can delete their memory")
         if src.get("decision_status") != PROPOSED:
             raise GovernedError()
@@ -635,7 +650,11 @@ def expire_stale_proposals(now: Optional[float] = None) -> dict:
             else:
                 skipped.append(h["_id"])
     released = _release_orphaned_claims(now_iso)
-    completed, conflicts = _reconcile_overrides()
+    global _last_full_reconcile
+    full = _now() - _last_full_reconcile >= full_reconcile_seconds()
+    completed, conflicts = _reconcile_overrides(full=full)
+    if full:                              # an exception above leaves the marker: retried next pass
+        _last_full_reconcile = _now()
     return {"expired": expired, "completed_overrides": completed, "released_claims": released,
             "override_conflicts": conflicts}
 
@@ -678,14 +697,19 @@ def _release_orphaned_claims(now_iso: str) -> int:
     return released
 
 
-def _reconcile_overrides() -> tuple:
+_last_full_reconcile = 0.0   # when this process last scanned every approved override (0: never)
+
+
+def _reconcile_overrides(full: bool = False) -> tuple:
     """Every active override that went live through approvals must have superseded its target and
     carry the `supersedes` link. Completes an interrupted override (claim missing or link missing).
     One that cannot be completed because its target is held by another decision or gone is
     flagged (_flag_conflict, `approved_via: approvals_conflict`) and so leaves this query for good.
     Only overrides decided within `AMES_GOV_RECONCILE_DAYS` (default 7) are scanned, plus every one
     that is not yet linked (`supersedes` missing): a settled one is not read again on every pass.
-    Reads every page. Returns (completed, conflicts)."""
+    `full=True` drops the window and scans every approved override (expire_stale_proposals does that
+    once per `AMES_GOV_FULL_RECONCILE_HOURS`, default 24), so an old override whose claim was lost
+    is found eventually. Reads every page. Returns (completed, conflicts)."""
     completed = conflicts = 0
     after = None
     since = _iso(_now() - reconcile_days() * 86400)
@@ -696,9 +720,10 @@ def _reconcile_overrides() -> tuple:
                                               {"term": {"approved_via": "approvals"}},
                                               {"term": {"passage_index": 0}},
                                               {"exists": {"field": "proposal_for"}}],
-                                   "should": [{"range": {"decided_at": {"gte": since}}},
-                                              {"bool": {"must_not": {"exists": {"field": "supersedes"}}}}],
-                                   "minimum_should_match": 1}}}
+                                   **({} if full else {
+                                       "should": [{"range": {"decided_at": {"gte": since}}},
+                                                  {"bool": {"must_not": {"exists": {"field": "supersedes"}}}}],
+                                       "minimum_should_match": 1})}}}
         if after:
             body["search_after"] = after
         hits = es("POST", f"/{idx('semantic')}/_search", body)["hits"]["hits"]
