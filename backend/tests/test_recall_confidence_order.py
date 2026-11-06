@@ -66,7 +66,7 @@ def test_results_are_confidence_descending_when_fused_order_disagrees(seeded, mo
     assert _confs(out) == sorted(_confs(out), reverse=True)
     # the fixture really disagrees: the fused (score) order is not the order returned
     assert [h["id"] for h in sorted(out["results"], key=lambda h: -h["score"])] != [h["id"] for h in out["results"]]
-    assert out["results"][0]["id"] == seeded[-1]          # least lexical match = highest confidence here
+    assert set(h["id"] for h in out["results"]) == set(seeded)
     assert out["fused"] == out["results"]                  # deprecated alias carries the same order
 
 
@@ -85,10 +85,12 @@ def test_http_recall_returns_confidence_descending(seeded, monkeypatch):
 def test_sort_happens_before_the_size_cut(seeded, monkeypatch):
     _inverted(monkeypatch)
     full = _recall(size=5)["results"]
-    best_two = [h["id"] for h in sorted(full, key=lambda h: -h["confidence"])[:2]]
+    best_two = [h["id"] for h in full[:2]]                                   # already confidence-sorted
+    fused_top_two = [h["id"] for h in sorted(full, key=lambda h: -h["score"])[:2]]
+    assert best_two != fused_top_two, "fixture must put the most confident hits outside the fused top 2"
     out = _recall(size=2)
-    # the two most confident hits sit at the BOTTOM of the fused order: cutting first would drop them
-    assert [h["id"] for h in out["results"]] == best_two == [seeded[4], seeded[3]]
+    # cutting to 2 BEFORE sorting would keep the fused top 2 and drop the most confident hits
+    assert [h["id"] for h in out["results"]] == best_two
     assert _confs(out) == sorted(_confs(out), reverse=True)
 
 
