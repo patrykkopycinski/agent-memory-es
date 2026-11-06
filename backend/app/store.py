@@ -1,5 +1,6 @@
 """Elasticsearch client + index management for agent-memory-es."""
 import json
+import logging
 import os
 import re
 import urllib.error
@@ -190,10 +191,16 @@ def ensure_indices() -> None:
         except RuntimeError:
             pass  # older cluster / no permission: exact-hash dedup degrades to kNN
         # Governance fields in their own call so a failure above cannot skip them.
+        # Fail closed: without these fields every governed write is rejected (dynamic: strict)
+        # or, worse, stored without its status. Leave _indices_ready False so retain/recall
+        # refuse too, and let startup fail.
         try:
             es("PUT", f"/{idx(kind)}/_mapping", {"properties": GOVERNANCE_PROPERTIES})
         except RuntimeError:
-            pass
+            logging.getLogger("ames.store").error(
+                "governance mapping migration FAILED for %s; refusing to serve", idx(kind),
+                exc_info=True)
+            raise
     _indices_ready = True
 
 
