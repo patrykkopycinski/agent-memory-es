@@ -124,7 +124,7 @@ def run(args, key: str, out=print) -> int:
     out(json.dumps(res))
     if res.get("conflict"):
         out(f"WARNING: {res.get('warning') or 'override activated but its target is held by another decision'}")
-        return 2
+        return 3
     return 0
 
 
