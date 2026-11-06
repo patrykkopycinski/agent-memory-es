@@ -1166,7 +1166,7 @@ def test_round3_sweep_never_restores_a_decision_a_later_override_replaced():
     c = _propose(ALICE, supersedes_decision=b["_id"])
     assert _approve(BOB, c["_id"]).status_code == 200 and _approve(CAROL, c["_id"]).status_code == 200
     assert _src(b["_id"])["decision_status"] == "superseded"
-    governance._release_orphaned_claims(_far(3))
+    governance._release_orphaned_claims(_far(0.01))                 # past the grace, inside the old 24h window
     assert _src(a["_id"])["decision_status"] == "superseded"        # B is superseded, not an orphan
     assert _src(b["_id"])["decision_status"] == "superseded"
     assert _src(c["_id"])["decision_status"] == "active"
