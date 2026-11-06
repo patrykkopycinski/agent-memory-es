@@ -1259,7 +1259,7 @@ def recall(owner_id: str, query: str, kinds=None, size: int = 8,
     }
     # True when nothing in the window is confidently relevant: the caller should say "I don't
     # know" instead of presenting the top hit as an answer. A hint, not a filter: results stay.
-    out["abstain_hint"] = max((h["confidence"] for h in window), default=0.0) < ABSTAIN_CONFIDENCE
+    out["abstain_hint"] = max((h.get("confidence") or 0.0 for h in window), default=0.0) < ABSTAIN_CONFIDENCE
     if embed_error:
         out["embed_error"] = embed_error
     if rerank_info is not None:
