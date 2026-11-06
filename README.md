@@ -79,8 +79,9 @@ Beyond the hybrid core:
 Team memories tagged `kind:decision` are written as *proposals* and only take effect once people
 other than the author approve them (one approval for a new decision, two for an override of an
 active one). Active decisions are read-only, every transition is audited before it happens, and
-approval is restricted to a human-only `approver` key role that no MCP tool can reach.
-`scripts/ames_approve.py` is the approval CLI. See [docs/GOVERNANCE.md](docs/GOVERNANCE.md).
+approval is restricted to a human-only `approver` key role that no MCP tool can reach. Approvers
+are counted per person (`person=` at mint time), and an approver key is accepted on `/governance/*`
+only. `scripts/ames_approve.py` is the approval CLI (https only, except loopback). See [docs/GOVERNANCE.md](docs/GOVERNANCE.md).
 
 ## Benchmarks
 
@@ -126,6 +127,7 @@ docker compose up -d          # ames-backend :8123, ames-worker, Elasticsearch
 
 # mint a key (owner identity is bound to it)
 curl -s -X POST "localhost:8123/admin/keys?owner_id=alice" -H "X-Admin-Token: $AMES_ADMIN_TOKEN"
+# optional: role=member|owner|approver, person=<the human behind the key> (needed to approve)
 
 # remember something, then recall it
 curl -s -X POST localhost:8123/memory/retain -H "X-API-Key: $KEY" \
