@@ -63,6 +63,8 @@ def test_results_are_confidence_descending_when_fused_order_disagrees(seeded, mo
     _inverted(monkeypatch)
     out = _recall(size=5)
     assert len(out["results"]) == 5
+    # subset, not equality: other owners' shared-visibility docs may also surface
+    assert set(seeded) <= {h["id"] for h in out["results"]}
     assert _confs(out) == sorted(_confs(out), reverse=True)
     # the fixture really disagrees: the fused (score) order is not the order returned
     assert [h["id"] for h in sorted(out["results"], key=lambda h: -h["score"])] != [h["id"] for h in out["results"]]

@@ -6,7 +6,7 @@ Thin HTTP wrapper over the AMES REST API; adds no ranking/dedup logic and does n
 ## Tools
 | tool | notes |
 |---|---|
-| `memory_recall(query, k=8, visibility?, kinds?, as_of?)` | read-only. k clamped 1-50. Results are confidence-descending (the first hit is the best one) and carry `confidence`. |
+| `memory_recall(query, k=8, visibility?, kinds?, as_of?)` | read-only. k clamped 1-50. Results are confidence-descending (the first hit is the best one) and carry `confidence`; when a cross-encoder rerank ran (hits carry `rerank_rank`) the backend's rerank order is kept. |
 | `memory_reflect(question)` | read-only; backend may call an LLM, slower. |
 | `memory_stats()` | read-only; counts/models/pages visible to the key. |
 | `memory_retain(text, kind="semantic", visibility="private", occurred_at?)` | WRITE. Only registered when `ALLOW_WRITE=1`; otherwise it does not exist in `tools/list`. |

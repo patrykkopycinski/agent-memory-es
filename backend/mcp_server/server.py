@@ -72,8 +72,14 @@ def build_server(client: AmesClient, allow_write: bool = False,
         scanned = len(items)
         if visibility is not None:
             items = [i for i in items if i.get("visibility") == visibility]
-        # Best confidence first, ties in backend order, no confidence last; before the cut to k.
-        items = sorted(items, key=lambda i: (i.get("confidence") is None, -(i.get("confidence") or 0.0)))[:k]
+        # The backend order is the answer order: confidence-descending, unless a cross-encoder
+        # rerank ran (its order wins). The filter above can only drop items, never reorder,
+        # so the client re-sorts only to restore the backend order for the cut to k — sorting
+        # by confidence here would discard the rerank order on default deployments.
+        if not any("rerank_rank" in i for i in items):
+            items = sorted(items, key=lambda i: (i.get("confidence") is None,
+                                                 -(i.get("confidence") or 0.0)))
+        items = items[:k]
         out = {"query": query, "count": len(items),
                "results": [_slim(i) for i in items],
                "abstained": bool(resp.get("abstained"))}
