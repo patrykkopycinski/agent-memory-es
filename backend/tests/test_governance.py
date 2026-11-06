@@ -27,7 +27,7 @@ PEOPLE = ("gov_alice", "gov_bob", "gov_carol", "gov_dave")
 ALICE, BOB, CAROL, DAVE = PEOPLE
 AGENT = {p: auth.create_key(p, "member", person=p) for p in PEOPLE}          # what an agent holds
 APPROVER = {p: auth.create_key(p, "approver", person=p) for p in PEOPLE}     # minted for the same person
-WIPE = list(PEOPLE) + ["gov_owner", "gov_alice2", "gov_alice3", "gov_legacy", "gov_other", "system", "admin"]
+WIPE = list(PEOPLE) + ["gov_owner", "gov_alice2", "gov_alice3", "gov_legacy", "gov_other", "gov_sib", "gov_case", "system", "admin"]
 OWNER_KEY = auth.create_key("gov_owner", "owner", person="gov_owner")
 H = lambda k: {"X-API-Key": k}  # noqa: E731
 DECISION = "kind:decision"
@@ -676,7 +676,7 @@ def test_case15_pre_governance_team_decisions_are_never_consolidated_before_back
 def test_governance_mapping_fields_exist():
     props = es("GET", f"/{idx('semantic')}/_mapping")[idx("semantic")]["mappings"]["properties"]
     for f in ("decision_status", "proposed_by", "proposal_for", "approvals", "objections",
-              "decided_at", "proposal_expires_at", "approved_via"):
+              "decided_at", "proposal_expires_at", "approved_via", "proposed_by_persons"):
         assert f in props, f
     assert tagfilter.TAG_FIELD in props
 
@@ -1322,13 +1322,15 @@ def test_round3_worker_reconcile_reads_every_page():
     assert flagged == n
 
 
+def _preexisting_proposal(owner, **extra):
+    """An open proposal written before `person` existed: authored by the owner id, no stored set."""
+    return _stray(owner, f"dg_{uuid.uuid4().hex}", f"decision {_tok()} written before persons existed",
+                  visibility="team", tags=[DECISION], decision_status="proposed",
+                  proposed_by=owner, approvals=[], **extra)
+
+
 def test_round3_approver_key_of_the_proposals_owner_is_refused_whatever_its_person():
-    legacy = _legacy_key("gov_legacy", "member")
-    r = client.post("/memory/retain", headers=H(legacy), json={
-        "kind": "semantic", "text": f"decision {_tok()} from a key without a person",
-        "visibility": "team", "tags": [DECISION], "extract_facts": False})
-    assert r.status_code == 200, r.text
-    doc = r.json()["_id"]
+    doc = _preexisting_proposal("gov_legacy")
     assert _src(doc)["proposed_by"] == "gov_legacy"                   # no person: the owner id
     mine = auth.create_key("gov_legacy", "approver", person=CAROL)    # same owner, another person
     for path, body in (("/governance/approve", {"doc_id": doc}),
@@ -1340,13 +1342,8 @@ def test_round3_approver_key_of_the_proposals_owner_is_refused_whatever_its_pers
 
 
 def test_round3_the_person_behind_a_person_less_agent_key_cannot_approve_its_proposals():
-    legacy = _legacy_key("gov_other", "member")
+    doc = _preexisting_proposal("gov_other")
     auth.create_key("gov_other", "member", person=ALICE)              # the owner's other key names her
-    r = client.post("/memory/retain", headers=H(legacy), json={
-        "kind": "semantic", "text": f"decision {_tok()} from the person-less key",
-        "visibility": "team", "tags": [DECISION], "extract_facts": False})
-    assert r.status_code == 200, r.text
-    doc = r.json()["_id"]
     assert _approve(ALICE, doc).status_code == 403
     assert _reject(ALICE, doc).status_code == 403
     assert _approve(BOB, doc).status_code == 200
@@ -1372,3 +1369,177 @@ def test_round3_person_is_required_to_mint_and_can_be_set_on_a_legacy_key(monkey
         "tags": [DECISION], "extract_facts": False}).json()
     assert _src(p["_id"])["proposed_by"] == CAROL
     assert _approve(CAROL, p["_id"]).status_code == 403
+
+
+# ---- review round 4 ----
+
+def test_round4_governed_writes_from_a_person_less_key_are_refused():
+    legacy = _legacy_key("gov_legacy", "member")
+    body = {"kind": "semantic", "text": f"decision {_tok()} from a key without a person",
+            "visibility": "team", "tags": [DECISION], "extract_facts": False}
+    r = client.post("/memory/retain", headers=H(legacy), json=body)
+    assert r.status_code == 403 and "/admin/keys/person" in r.text, r.text
+    old = _active()
+    r = client.post("/memory/retain", headers=H(legacy), json={
+        **body, "text": f"decision {_tok()} override", "supersedes_decision": old["_id"]})
+    assert r.status_code == 403, r.text
+    priv = client.post("/memory/retain", headers=H(legacy), json={
+        "kind": "semantic", "text": f"private decision {_tok()}", "tags": [DECISION],
+        "extract_facts": False})
+    assert priv.status_code == 200, priv.text                        # private writes keep working
+    r = client.post("/memory/promote", headers=H(legacy), json={
+        "kind": "semantic", "doc_id": priv.json()["_id"], "to_visibility": "team"})
+    assert r.status_code == 403, r.text
+    howto = client.post("/memory/retain", headers=H(legacy), json={
+        "kind": "semantic", "text": f"how to restart {_tok()}", "visibility": "team",
+        "tags": ["kind:howto"], "extract_facts": False})
+    assert howto.status_code == 200, howto.text                      # not governed
+
+
+def test_round4_the_author_set_is_stored_and_survives_revoking_a_sibling_key():
+    k1 = auth.create_key("gov_sib", "member", person=ALICE)
+    k2 = auth.create_key("gov_sib", "member", person=BOB)
+    r = client.post("/memory/retain", headers=H(k1), json={
+        "kind": "semantic", "text": f"decision {_tok()} from a shared owner", "visibility": "team",
+        "tags": [DECISION], "extract_facts": False})
+    assert r.status_code == 200, r.text
+    doc = r.json()["_id"]
+    assert {ALICE, BOB} <= set(_src(doc)["proposed_by_persons"])
+    assert auth.delete_key(k2)
+    assert _approve(BOB, doc).status_code == 403                     # still one of the authors
+    assert _approve(CAROL, doc).status_code == 200
+
+
+def test_round4_author_comparison_ignores_case():
+    doc = _stray("gov_case", f"dg_{uuid.uuid4().hex}", f"decision {_tok()} cased author",
+                 visibility="team", tags=[DECISION], decision_status="proposed",
+                 proposed_by=ALICE.upper(), approvals=[])
+    assert _approve(ALICE, doc).status_code == 403
+
+
+def test_round4_release_reclaims_a_target_whose_successor_activated_meanwhile(monkeypatch):
+    old, new = _override()
+    _orphan_claim(old, new)
+    real = governance._audit
+
+    def audit(intent, actor, doc_id, detail):
+        if intent == "decision_restore":                              # between the read and the write
+            es("POST", f"/{idx('semantic')}/_update/{new['_id']}?refresh=true",
+               {"doc": {"decision_status": "active", "approved_via": "approvals"}})
+        return real(intent, actor, doc_id, detail)
+
+    monkeypatch.setattr(governance, "_audit", audit)
+    assert governance._release_target("system", new["_id"], old["_id"]) is False
+    o = _src(old["_id"])
+    assert o["decision_status"] == "superseded" and o["superseded_by"] == new["_id"], o
+
+
+def _conflicted_override(monkeypatch):
+    """(old, new, response): an override that activates but whose target another decision took."""
+    old, new = _override()
+    assert _approve(BOB, new["_id"]).status_code == 200
+    real, calls = governance._claim_target, []
+
+    def claim(person, new_id, target_id):
+        out = real(person, new_id, target_id)
+        if not calls:
+            calls.append(1)
+            es("POST", f"/{idx('semantic')}/_update/{old['_id']}?refresh=true",
+               {"doc": {"superseded_by": f"someone-else-{uuid.uuid4().hex}"}})
+        return out
+
+    monkeypatch.setattr(governance, "_claim_target", claim)
+    return old, new, _approve(CAROL, new["_id"])
+
+
+def test_round4_approve_that_activated_reports_a_target_conflict_as_200(monkeypatch):
+    _old, new, r = _conflicted_override(monkeypatch)
+    assert r.status_code == 200, r.text
+    assert r.json()["activated"] is True and r.json()["conflict"] is True
+    s = _src(new["_id"])
+    assert s["decision_status"] == "active" and s["approved_via"] == governance.CONFLICT_VIA
+
+
+def test_round4_conflicting_overrides_are_listed_with_the_proposals(monkeypatch):
+    old, new, r = _conflicted_override(monkeypatch)
+    assert r.status_code == 200, r.text
+    got = client.get("/governance/proposals?limit=100", headers=H(AGENT[BOB])).json()
+    hit = [c for c in got["override_conflicts"] if c["id"] == new["_id"]]
+    assert hit and hit[0]["proposal_for"] == old["_id"], got["override_conflicts"][:3]
+    assert _src(new["_id"])["decision_status"] == "active"           # no silent status change
+
+
+def test_round4_mcp_proposals_tool_warns_about_override_conflicts(monkeypatch):
+    mod = _load_script("ames_mcp_server")
+    payload = {"proposals": [], "total": 0, "override_conflicts": [{"id": "x", "proposal_for": "y"}]}
+    monkeypatch.setattr(mod, "http_get", lambda *a, **k: payload)
+    out = mod.dispatch("http://x", "k", "memory_proposals", {})
+    assert out["override_conflicts"] and "override" in out["warning"]
+    monkeypatch.setattr(mod, "http_get", lambda *a, **k: {"proposals": [], "total": 0,
+                                                          "override_conflicts": []})
+    assert "warning" not in mod.dispatch("http://x", "k", "memory_proposals", {})
+
+
+def test_round4_set_person_is_audited_and_persons_are_lowercased(monkeypatch):
+    monkeypatch.setenv("AMES_ADMIN_TOKEN", "mint-token")
+    adm = {"X-Admin-Token": "mint-token"}
+    owner = f"gov_aud{uuid.uuid4().hex[:8]}"
+    legacy = _legacy_key(owner)
+    r = client.post(f"/admin/keys/person?owner_id={owner}&person=%20Dana%20", headers=adm)
+    assert r.status_code == 200 and r.json()["person"] == "dana" and r.json()["updated"] == 1, r.text
+    assert auth.owner_of(legacy)["person"] == "dana"
+    rows = [x for x in _rows(owner) if x["intent"] == "key_set_person"]
+    assert len(rows) == 1 and rows[0]["detail"] == {"owner_id": owner, "person": "dana", "keys_changed": 1}
+    assert auth.owner_of(auth.create_key(owner, "member", person="  Erin "))["person"] == "erin"
+
+
+def test_round4_owner_edits_and_withdraws_its_earlier_proposals_after_set_person():
+    owner = "gov_legacy"
+    named = auth.create_key(owner, "member", person=CAROL)           # the key an admin just named
+
+    def mk():
+        return _preexisting_proposal(owner)
+
+    r = client.post("/memory/update", headers=H(named), json={
+        "kind": "semantic", "doc_id": mk(), "text": f"decision {_tok()} reworded"})
+    assert r.status_code == 200, r.text
+    r = client.post("/memory/delete", headers=H(named), json={"kind": "semantic", "doc_id": mk()})
+    assert r.status_code == 200 and r.json()["withdrawn"] is True, r.text
+
+
+def test_round4_mapping_check_reads_every_index_of_an_alias(monkeypatch):
+    import copy
+    from app import store
+    good = es("GET", f"/{idx('semantic')}/_mapping")[idx("semantic")]
+    bad = copy.deepcopy(good)
+    bad["mappings"]["properties"].pop("decision_status")
+    monkeypatch.setattr(store, "es", lambda *a, **k: {"a": good, "b": bad})
+    assert store._governance_mapped("alias") is False
+    monkeypatch.setattr(store, "es", lambda *a, **k: {"a": good, "b": good})
+    assert store._governance_mapped("alias") is True
+
+
+def _decided_override(days_ago):
+    """A linked, active override whose target is NOT superseded (a regression the pass would fix)."""
+    target = _stray(ALICE, f"dg_{uuid.uuid4().hex}", f"target {_tok()}", visibility="team",
+                    tags=[DECISION], decision_status="active", proposed_by=ALICE, approvals=[])
+    new = _stray(ALICE, f"dg_{uuid.uuid4().hex}", f"override {_tok()}", visibility="team",
+                 tags=[DECISION], decision_status="active", proposed_by=ALICE, approvals=[],
+                 approved_via="approvals", proposal_for=target, supersedes=[target],
+                 decided_at=governance._iso(time.time() - days_ago * 86400))
+    return target, new
+
+
+def test_round4_reconcile_only_rescans_recent_or_unlinked_overrides():
+    old_target, _ = _decided_override(30)
+    recent_target, _ = _decided_override(0)
+    governance.expire_stale_proposals()
+    assert _src(old_target)["decision_status"] == "active"           # outside the window: not rescanned
+    assert _src(recent_target)["decision_status"] == "superseded"
+
+
+def test_round4_reconcile_window_is_configurable(monkeypatch):
+    monkeypatch.setenv("AMES_GOV_RECONCILE_DAYS", "60")
+    target, _ = _decided_override(30)
+    governance.expire_stale_proposals()
+    assert _src(target)["decision_status"] == "superseded"
