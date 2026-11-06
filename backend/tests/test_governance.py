@@ -40,6 +40,18 @@ for _name in (idx("semantic"), f"{PREFIX}am_mutations"):
         pass
 
 
+def _wipe_owners():
+    es("POST", f"/{idx('semantic')}/_delete_by_query?refresh=true&ignore_unavailable=true&conflicts=proceed",
+       {"query": {"terms": {"owner_id": list(PEOPLE) + ["gov_owner", "system", "admin"]}}})
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _cleanup_team_docs():
+    """Team docs are visible to every owner, so leave none behind for other modules' recall tests."""
+    yield
+    _wipe_owners()
+
+
 def _tok(label="t"):
     return f"gv{label}{uuid.uuid4().hex[:8]}"
 
