@@ -190,10 +190,8 @@ def ensure_indices() -> None:
                                "valid_to": {"type": "date"}}})
         except RuntimeError:
             pass  # older cluster / no permission: exact-hash dedup degrades to kNN
-        # Governance fields in their own call so a failure above cannot skip them.
-        # Fail closed: without these fields every governed write is rejected (dynamic: strict)
-        # or, worse, stored without its status. Leave _indices_ready False so retain/recall
-        # refuse too, and let startup fail.
+        # Fail closed: without these fields governed writes are rejected (dynamic: strict)
+        # or stored without a status. _indices_ready stays False so retain/recall refuse too.
         try:
             es("PUT", f"/{idx(kind)}/_mapping", {"properties": GOVERNANCE_PROPERTIES})
         except RuntimeError:
