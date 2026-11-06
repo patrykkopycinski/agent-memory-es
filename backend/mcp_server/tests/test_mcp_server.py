@@ -120,6 +120,19 @@ def test_recall_sends_key_header_and_slims_results():
     assert all("embedding" not in r and "rrf" not in r for r in out["results"])
 
 
+def test_recall_orders_by_confidence_before_the_cut_and_exposes_it():
+    items = [{"id": "lo", "kind": "semantic", "score": 0.9, "confidence": 0.1, "visibility": "private", "text": "a"},
+             {"id": "none", "kind": "semantic", "score": 0.8, "visibility": "private", "text": "b"},
+             {"id": "hi", "kind": "semantic", "score": 0.7, "confidence": 0.9, "visibility": "private", "text": "c"},
+             {"id": "mid", "kind": "semantic", "score": 0.6, "confidence": 0.5, "visibility": "private", "text": "d"}]
+    mcp = build_server(_client([], results=items))
+    out = _call(mcp, "memory_recall", {"query": "q", "k": 2})
+    assert [r["id"] for r in out["results"]] == ["hi", "mid"]
+    assert [r["confidence"] for r in out["results"]] == [0.9, 0.5]
+    out = _call(mcp, "memory_recall", {"query": "q", "k": 4})
+    assert [r["id"] for r in out["results"]] == ["hi", "mid", "lo", "none"]
+
+
 def test_recall_visibility_filter_is_client_side_and_overfetches():
     calls = []
     mcp = build_server(_client(calls, results=ITEMS))
