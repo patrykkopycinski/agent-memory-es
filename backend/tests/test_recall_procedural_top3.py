@@ -83,7 +83,9 @@ def _no_env_floor(monkeypatch):
 
 def _in_top3(query, floor):
     res = memory.recall(OWNER, query, size=8, rerank=False, min_similarity=floor)["results"]
-    return any(h.get("doc_group") == GROUP for h in res[:3])
+    # the floor acts on the kNN arm, i.e. the FUSED rank; `results` itself is confidence-ordered
+    fused = sorted(res, key=lambda h: -h["score"])
+    return any(h.get("doc_group") == GROUP for h in fused[:3])
 
 
 def test_without_floor_long_procedural_doc_is_top3_for_nonsense():
