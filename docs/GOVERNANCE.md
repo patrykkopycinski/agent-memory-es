@@ -145,7 +145,8 @@ script renders them as "PROPOSED, not in force"); closed decisions are hidden un
   that went live through approvals and were decided within `AMES_GOV_RECONCILE_DAYS`, plus any
   that lack the `supersedes` link; once per `AMES_GOV_FULL_RECONCILE_HOURS` the window is dropped
   and every approved override is checked, so an old one whose claim was lost is found too. If that
-  full scan fails, the next one is due in an hour rather than on the next pass. An override whose
+  full scan fails, the next one is due within an hour, or one interval if shorter,
+  rather than on the next pass. An override whose
   target is not superseded by it (or that lacks the `supersedes` link) is completed. One that
   cannot be completed (the target is held by another decision or is gone) is logged as a warning, audited as `decision_override_conflict` with `outcome: conflict`
   and marked `approved_via: approvals_conflict`, which takes it out of later passes; an operator

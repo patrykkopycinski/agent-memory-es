@@ -95,9 +95,9 @@ until their person is named. In this order:
    persons are lowercased). Until then, person-less agent keys get `403` on team-decision writes.
    Offline alternative: stop the service, edit the key file, then deploy. For entries in digest
    form (`<sha256 of the token>` mapped to `{owner_id, role}`), add a `"person"` field, which must
-   be non-empty (it is lowercased on load). Entries
-   still in the old plaintext form (`{"<owner>": "ame_..."}`) are converted to person-less digest
-   entries on first read, so use the admin call for those.
+   be non-empty (it is lowercased on load). Entries still in the old plaintext form
+   (`{"<owner>": "ame_..."}`) are converted to person-less digest entries on first read, so use
+   the admin call for those.
 3. Run `POST /admin/governance/backfill` once, so earlier team decisions are in force.
 4. Mint approver keys with `person=` set to the same person as the matching agent keys.
 5. Set `AMES_GOV_VETO_OWNERS` to person ids (case-insensitive), if you use veto owners.

@@ -1705,3 +1705,20 @@ def test_round6_a_failed_outcome_row_does_not_fail_set_person(monkeypatch):
                     headers={"X-Admin-Token": "mint-token"})
     assert r.status_code == 200 and r.json()["updated"] == 1, r.text
     assert auth.owner_of(legacy)["person"] == "dana"
+
+
+def test_round7_failed_full_reconcile_backoff_never_lands_in_the_future(monkeypatch):
+    monkeypatch.setenv("AMES_GOV_FULL_RECONCILE_HOURS", "0.05")        # 180 s, under the 1 h backoff
+    interval = governance.full_reconcile_seconds()
+    assert interval == pytest.approx(180)
+
+    def boom(full=False):
+        raise RuntimeError("es down")
+
+    monkeypatch.setattr(governance, "_reconcile_overrides", boom)
+    monkeypatch.setattr(governance, "_last_full_reconcile", time.time() - 3 * interval)
+    with pytest.raises(RuntimeError):
+        governance.expire_stale_proposals()
+    assert governance._last_full_reconcile <= time.time()
+    due_in = governance._last_full_reconcile + interval - time.time()
+    assert 0 <= due_in <= interval, due_in                              # within one interval

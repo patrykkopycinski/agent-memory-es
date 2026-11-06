@@ -655,8 +655,8 @@ def expire_stale_proposals(now: Optional[float] = None) -> dict:
     try:
         completed, conflicts = _reconcile_overrides(full=full)
     except Exception:
-        if full:                          # back off: retry the full scan in an hour, not every pass
-            _last_full_reconcile = _now() - full_reconcile_seconds() + 3600
+        if full:                          # back off: retry after min(1 h, interval), never in the future
+            _last_full_reconcile = _now() - full_reconcile_seconds() + min(3600.0, full_reconcile_seconds())
         raise
     if full:
         _last_full_reconcile = _now()
