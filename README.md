@@ -74,6 +74,14 @@ Beyond the hybrid core:
 - **Write-time fact extraction** — every episodic `retain` queues an async job; a worker (`python -m app.worker --facts`) extracts up to 12 dated, source-linked facts into `semantic`. Contradicted facts get `valid_to`/`superseded_by` (kept for audit, excluded from recall after expiry). Durable lease-based queue with retries; `GET /memory/facts/drain`, `POST /memory/facts/backfill` (+ `--backfill` worker) for existing memory; `"extract_facts": false` opts out on bulk imports.
 - **Label filters** — caller tags + optional LLM label extraction on retain; recall `filter` (`all`/`any`/`none`/`narrow_any`) abstains instead of returning off-topic memories.
 
+## Decision governance
+
+Team memories tagged `kind:decision` are written as *proposals* and only take effect once people
+other than the author approve them (one approval for a new decision, two for an override of an
+active one). Active decisions are read-only, every transition is audited before it happens, and
+approval is restricted to a human-only `approver` key role that no MCP tool can reach.
+`scripts/ames_approve.py` is the approval CLI. See [docs/GOVERNANCE.md](docs/GOVERNANCE.md).
+
 ## Benchmarks
 
 Measured against [Hindsight](https://github.com/vectorize-io/hindsight) with the same harness, answer model and judge for both. Full method, per-type tables, development history and follow-ups: **[docs/BENCHMARKS.md](docs/BENCHMARKS.md)**.
