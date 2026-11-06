@@ -25,8 +25,9 @@ from app.store import es, idx, PREFIX
 client = TestClient(app)
 PEOPLE = ("gov_alice", "gov_bob", "gov_carol", "gov_dave")
 ALICE, BOB, CAROL, DAVE = PEOPLE
-AGENT = {p: auth.create_key(p, "member") for p in PEOPLE}          # what an agent holds
-APPROVER = {p: auth.create_key(p, "approver") for p in PEOPLE}     # minted for the same person
+AGENT = {p: auth.create_key(p, "member", person=p) for p in PEOPLE}          # what an agent holds
+APPROVER = {p: auth.create_key(p, "approver", person=p) for p in PEOPLE}     # minted for the same person
+WIPE = list(PEOPLE) + ["gov_owner", "gov_alice2", "gov_alice3", "system", "admin"]
 OWNER_KEY = auth.create_key("gov_owner", "owner")
 H = lambda k: {"X-API-Key": k}  # noqa: E731
 DECISION = "kind:decision"
@@ -35,14 +36,14 @@ SCRIPTS = os.path.join(os.path.dirname(__file__), "..", "..", "scripts")
 for _name in (idx("semantic"), f"{PREFIX}am_mutations"):
     try:
         es("POST", f"/{_name}/_delete_by_query?refresh=true&ignore_unavailable=true",
-           {"query": {"terms": {"owner_id": list(PEOPLE) + ["gov_owner", "system", "admin"]}}})
+           {"query": {"terms": {"owner_id": WIPE}}})
     except RuntimeError:
         pass
 
 
 def _wipe_owners():
     es("POST", f"/{idx('semantic')}/_delete_by_query?refresh=true&ignore_unavailable=true&conflicts=proceed",
-       {"query": {"terms": {"owner_id": list(PEOPLE) + ["gov_owner", "system", "admin"]}}})
+       {"query": {"terms": {"owner_id": WIPE}}})
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -159,8 +160,11 @@ def test_case3_agent_keys_get_403_on_approve_and_reject(key):
 
 @pytest.mark.parametrize("tool", ["approve", "reject"])
 def test_case3_no_mcp_http_tool_for_approval(tool):
-    r = client.post(f"/mcp/tools/{tool}", headers=H(APPROVER[BOB]), json={"doc_id": "x"})
+    r = client.post(f"/mcp/tools/{tool}", headers=H(AGENT[BOB]), json={"doc_id": "x"})
     assert r.status_code == 404
+    # an approver key never reaches the tools surface at all (case 22)
+    assert client.post(f"/mcp/tools/{tool}", headers=H(APPROVER[BOB]),
+                       json={"doc_id": "x"}).status_code == 403
 
 
 def test_case3_public_mcp_server_has_no_approve_or_reject_tool():
@@ -383,12 +387,25 @@ def test_case9_near_duplicate_retain_never_links_a_governed_entry():
         "text": f"decision {t} use the shared queue rotate the signing material every quarter "
                 "without exception ok"}).json()
     assert howto.get("dedup_reason") != "near_duplicate_linked"
-    s = _src(d["_id"])
-    assert s["active"] is True and "superseded_by" not in s
-    assert "supersedes" not in _src(howto["_id"]) or d["_id"] not in _src(howto["_id"])["supersedes"]
-    # and a governed write never links a plain neighbour either
+
+    def untouched(doc_id, status):
+        s = _src(doc_id)
+        assert s["active"] is True and s.get("decision_status") == status, (doc_id, s)
+        assert "superseded_by" not in s and "supersedes" not in s, (doc_id, s)
+
+    def plain_side_clean(doc_id, governed_ids):
+        s = _src(doc_id)
+        assert "decision_status" not in s and s["active"] is True
+        assert not set(s.get("supersedes") or []) & set(governed_ids), s
+        assert s.get("superseded_by") not in governed_ids, s
+
+    untouched(d["_id"], "active")                     # the governed side of the pair
+    plain_side_clean(howto["_id"], [d["_id"]])        # the plain side of the pair
+    # and a governed write never links a plain neighbour either: both sides stay clean
     p = _propose(token=t, extra="rotate the signing material every quarter without exception now")
-    assert "supersedes" not in _src(p["_id"])
+    untouched(p["_id"], "proposed")
+    untouched(d["_id"], "active")
+    plain_side_clean(howto["_id"], [d["_id"], p["_id"]])
 
 
 # ---- case 10 ----
@@ -550,16 +567,19 @@ def test_case14_every_transition_is_audited_before_it_takes_effect(monkeypatch):
     monkeypatch.setattr(governance, "_cas", checking)
 
     # propose: the row exists, keyed by the doc group, and no passage had been written yet
-    group = f"gov-grp-{uuid.uuid4().hex[:8]}"
+    groups = []
     real_prop = governance.audit_propose
 
-    def propose_first(owner, grp, text_hash, override_of):
+    def propose_first(owner, grp, *a, **k):
         n = es("POST", f"/{idx('semantic')}/_count", {"query": {"term": {"doc_group": grp}}})
         assert n["count"] == 0, "state was written before the propose audit row"
-        return real_prop(owner, grp, text_hash, override_of)
+        groups.append(grp)
+        return real_prop(owner, grp, *a, **k)
 
     monkeypatch.setattr(governance, "audit_propose", propose_first)
-    p = _propose(doc_group=group)
+    p = _propose()
+    group = p["doc_group"]
+    assert groups == [group]
     rows = _rows(group)
     assert [r["intent"] for r in rows] == ["decision_propose"]
     assert rows[0]["owner_id"] == ALICE and rows[0]["detail"]["text_hash"] == _src(p["_id"])["text_hash"]
@@ -659,3 +679,423 @@ def test_governance_mapping_fields_exist():
               "decided_at", "proposal_expires_at", "approved_via"):
         assert f in props, f
     assert tagfilter.TAG_FIELD in props
+
+
+# ---- review round 2: cases 16-22 + findings 9-13 ----
+
+def _stray(owner, group, text, **extra):
+    """A doc of `owner` in `group`, written straight to the index (what a caller-chosen doc_group
+    or pre-governance data can produce)."""
+    doc = {"kind": "semantic", "owner_id": owner, "visibility": "private", "text": text,
+           "text_hash": memory.text_hash(text), "doc_group": group, "passage_index": 0,
+           "passages_total": 1, "entities": extract_entities(text),
+           "occurred_at": "2026-01-01T00:00:00Z", "active": True, **extra}
+    return es("POST", f"/{idx('semantic')}/_doc?refresh=true", doc)["_id"]
+
+
+def _retain_private(who, text, **body):
+    r = client.post("/memory/retain", headers=H(AGENT[who]), json={
+        "kind": "semantic", "text": text, "extract_facts": False, **body})
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
+# ---- case 16 ----
+
+def test_case16_approving_a_proposal_never_changes_a_sibling_in_a_caller_chosen_group():
+    group = f"shared-{uuid.uuid4().hex[:8]}"
+    sibling = _retain_private(ALICE, f"plain note {_tok()}", doc_group=group)
+    assert sibling["doc_group"] == group
+    p = _propose(ALICE, doc_group=group)            # same caller-chosen group
+    assert p["doc_group"] != group, "a governed write gets its own server-generated group"
+    assert _approve(BOB, p["_id"]).status_code == 200
+    s = _src(sibling["_id"])
+    assert "decision_status" not in s and "proposed_by" not in s and s["active"] is True
+
+
+def test_case16_mirror_and_load_are_scoped_to_the_approved_text():
+    p = _propose()
+    stray = _stray(ALICE, p["doc_group"], f"stray passage {_tok()}", passage_index=1)
+    assert _approve(BOB, p["_id"]).status_code == 200
+    assert "decision_status" not in _src(stray)
+    reject_target = _propose()
+    stray2 = _stray(ALICE, reject_target["doc_group"], f"stray two {_tok()}", passage_index=1)
+    assert _reject(BOB, reject_target["_id"]).status_code == 200
+    assert _src(stray2)["active"] is True and "decision_status" not in _src(stray2)
+    # a stray doc that sits at passage 0 must never be mistaken for the head
+    p2 = _propose()
+    _stray(ALICE, p2["doc_group"], f"stray head {_tok()}", passage_index=0)
+    mid = es("POST", f"/{idx('semantic')}/_search", {"size": 5, "query": {"bool": {"filter": [
+        {"term": {"doc_group": p2["doc_group"]}}, {"term": {"decision_status": "proposed"}}]}}})
+    assert [h["_id"] for h in mid["hits"]["hits"]] == [p2["_id"]]
+
+
+def test_case16_promoting_a_private_decision_gets_its_own_group():
+    group = f"shared-{uuid.uuid4().hex[:8]}"
+    private = _retain_private(ALICE, f"private decision {_tok()}", doc_group=group,
+                              tags=[DECISION])
+    other = _retain_private(ALICE, f"private neighbour {_tok()}", doc_group=group)
+    r = client.post("/memory/promote", headers=H(AGENT[ALICE]), json={
+        "kind": "semantic", "doc_id": private["_id"], "to_visibility": "team"})
+    assert r.status_code == 200, r.text
+    copy = r.json()["promoted_id"]
+    assert _src(copy)["doc_group"] != group
+    assert _rows(_src(copy)["doc_group"])[0]["intent"] == "decision_propose"
+    assert _approve(BOB, copy).status_code == 200
+    for doc_id in (private["_id"], other["_id"]):
+        assert "decision_status" not in _src(doc_id)
+
+
+# ---- case 17 ----
+
+def test_case17_an_active_decision_cannot_be_changed_through_a_sibling_doc():
+    d = _active()
+    sibling = _retain_private(ALICE, f"sibling {_tok()}", doc_group=d["doc_group"])
+    h = H(AGENT[ALICE])
+    u = client.post("/memory/update", headers=h, json={
+        "kind": "semantic", "doc_id": sibling["_id"], "text": f"overwrite {_tok()}"})
+    x = client.post("/memory/delete", headers=h, json={"kind": "semantic", "doc_id": sibling["_id"]})
+    x2 = client.delete(f"/memory/semantic/{sibling['_id']}", headers=h)
+    t = client.post("/mcp/tools/delete", headers=h, json={"kind": "semantic", "doc_id": sibling["_id"]})
+    p = client.post("/memory/promote", headers=h, json={
+        "kind": "semantic", "doc_id": sibling["_id"], "to_visibility": "common"})
+    for r in (u, x, x2, t, p):
+        assert r.status_code == 409, r.text
+    s = _src(d["_id"])
+    assert s["decision_status"] == "active" and s["active"] is True
+    assert _src(sibling["_id"])["active"] is True
+
+
+def test_case17_a_proposal_cannot_be_hard_deleted_through_a_sibling_doc():
+    p = _propose()
+    sibling = _retain_private(ALICE, f"sibling {_tok()}", doc_group=p["doc_group"])
+    for path, body in (("/memory/delete", {}), ("/memory/update", {"text": f"x {_tok()}"})):
+        r = client.post(path, headers=H(AGENT[ALICE]), json={
+            "kind": "semantic", "doc_id": sibling["_id"], **body})
+        assert r.status_code == 409, r.text
+    assert _src(p["_id"])["decision_status"] == "proposed"
+
+
+# ---- case 18 ----
+
+def test_case18_edit_that_collides_with_another_team_doc_leaves_the_proposal_intact():
+    mine = _propose(ALICE)
+    theirs = _propose(BOB)
+    r = client.post("/memory/update", headers=H(AGENT[ALICE]), json={
+        "kind": "semantic", "doc_id": mine["_id"], "text": _src(theirs["_id"])["text"]})
+    assert r.status_code in (409, 422), r.text
+    s = _src(mine["_id"])
+    assert s["decision_status"] == "proposed" and s["text_hash"] == mine["text_hash"]
+    assert s["doc_group"] == mine["doc_group"]
+
+
+def test_case18_edit_that_fails_midway_leaves_the_original_proposal_intact(monkeypatch):
+    mine = _propose(ALICE)
+    real = embeddings.embed_safe
+    calls = []
+
+    def flaky(texts):
+        calls.append(1)
+        if len(calls) > 1:
+            raise RuntimeError("embedder down")
+        return real(texts)
+
+    monkeypatch.setattr(embeddings, "embed_safe", flaky)
+    long_text = f"decision {mine['token']} rewritten. " + ("Sentence about the queue. " * 120)
+    with pytest.raises(RuntimeError):
+        memory.update(ALICE, "semantic", mine["_id"], text=long_text, person=ALICE)
+    monkeypatch.undo()
+    s = _src(mine["_id"])
+    assert s["decision_status"] == "proposed" and s["text_hash"] == mine["text_hash"]
+    heads = es("POST", f"/{idx('semantic')}/_count", {"query": {"bool": {"filter": [
+        {"term": {"doc_group": mine["doc_group"]}}]}}})
+    assert heads["count"] == 1, "a failed edit left partial passages behind"
+    assert _approve(BOB, mine["_id"]).status_code == 200
+
+
+# ---- case 19 ----
+
+def test_case19_editing_a_proposal_keeps_its_original_deadline():
+    p = _propose()
+    fixed = "2031-01-01T00:00:00Z"
+    es("POST", f"/{idx('semantic')}/_update/{p['_id']}?refresh=true",
+       {"doc": {"proposal_expires_at": fixed}})
+    r = client.post("/memory/update", headers=H(AGENT[ALICE]), json={
+        "kind": "semantic", "doc_id": p["_id"], "text": f"decision {p['token']} reworded"})
+    assert r.status_code == 200, r.text
+    assert _src(r.json()["_id"])["proposal_expires_at"] == fixed
+
+
+# ---- case 20 ----
+
+def test_case20_two_overrides_of_one_decision_cannot_both_activate(monkeypatch):
+    old = _active()
+    n1 = _propose(ALICE, supersedes_decision=old["_id"])
+    n2 = _propose(ALICE, supersedes_decision=old["_id"])
+    assert _approve(BOB, n1["_id"]).status_code == 200
+    assert _approve(BOB, n2["_id"]).status_code == 200
+    barrier = threading.Barrier(2, timeout=30)
+    gated_threads, lock = set(), threading.Lock()
+    real_audit = governance._audit
+
+    def gated(intent, actor, doc_id, detail):
+        # both overrides have read the target as active before either one moves it
+        if intent == "decision_supersede" and doc_id == old["_id"]:
+            with lock:
+                first = threading.get_ident() not in gated_threads
+                gated_threads.add(threading.get_ident())
+            if first:
+                try:
+                    barrier.wait()
+                except threading.BrokenBarrierError:
+                    pass
+        return real_audit(intent, actor, doc_id, detail)
+
+    monkeypatch.setattr(governance, "_audit", gated)
+    out = {}
+
+    def go(who, doc):
+        out[doc] = _approve(who, doc)
+
+    threads = [threading.Thread(target=go, args=(CAROL, n1["_id"])),
+               threading.Thread(target=go, args=(DAVE, n2["_id"]))]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(60)
+    monkeypatch.undo()
+    codes = sorted(r.status_code for r in out.values())
+    assert codes == [200, 409], {k: v.text for k, v in out.items()}
+    states = {n["_id"]: _src(n["_id"]) for n in (n1, n2)}
+    winners = [i for i, s in states.items() if s["decision_status"] == "active"]
+    assert len(winners) == 1, {i: s["decision_status"] for i, s in states.items()}
+    loser = next(i for i in states if i != winners[0])
+    assert states[loser]["decision_status"] == "proposed"
+    assert "override target is no longer an active decision" in out[loser].text
+    o = _src(old["_id"])
+    assert o["decision_status"] == "superseded" and o["superseded_by"] == winners[0]
+    assert states[winners[0]]["supersedes"] == [old["_id"]]
+    assert "supersedes" not in states[loser]
+    assert _approve(DAVE if loser == n2["_id"] else CAROL, loser).status_code == 409
+
+
+# ---- case 21 ----
+
+def test_case21_two_keys_of_one_person_count_as_one_and_cannot_self_approve():
+    second_alice = auth.create_key("gov_alice2", "approver", person=ALICE)
+    second_bob = auth.create_key("gov_alice3", "approver", person=BOB)
+    old = _active()
+    mine = _propose(ALICE)
+    r = client.post("/governance/approve", headers=H(second_alice), json={"doc_id": mine["_id"]})
+    assert r.status_code == 403, r.text
+    assert _src(mine["_id"])["decision_status"] == "proposed"
+
+    new = _propose(ALICE, supersedes_decision=old["_id"])
+    assert _approve(BOB, new["_id"]).status_code == 200
+    again = client.post("/governance/approve", headers=H(second_bob), json={"doc_id": new["_id"]})
+    assert again.status_code == 409, again.text
+    s = _src(new["_id"])
+    assert s["decision_status"] == "proposed" and len(s["approvals"]) == 1
+    assert _approve(CAROL, new["_id"]).json()["decision_status"] == "active"
+
+
+def test_case21_an_approver_key_without_a_person_cannot_approve():
+    anonymous = auth.create_key("gov_alice3", "approver")
+    p = _propose()
+    r = client.post("/governance/approve", headers=H(anonymous), json={"doc_id": p["_id"]})
+    assert r.status_code == 403, r.text
+    r = client.post("/governance/reject", headers=H(anonymous),
+                    json={"doc_id": p["_id"], "reason": "x"})
+    assert r.status_code == 403, r.text
+    assert _src(p["_id"])["approvals"] == []
+
+
+def test_case21_the_author_is_the_person_not_the_key_owner():
+    # alice's agent key belongs to another owner id but carries her person
+    other = auth.create_key("gov_alice2", "member", person=ALICE)
+    r = client.post("/memory/retain", headers=H(other), json={
+        "kind": "semantic", "text": f"decision {_tok()} by the other key", "visibility": "team",
+        "tags": [DECISION], "extract_facts": False})
+    assert r.status_code == 200, r.text
+    assert _src(r.json()["_id"])["proposed_by"] == ALICE
+    assert _approve(ALICE, r.json()["_id"]).status_code == 403
+
+
+def test_case21_key_roles_are_an_allowlist_and_person_is_set_at_mint_time(monkeypatch):
+    with pytest.raises(ValueError):
+        auth.create_key("gov_alice2", "root")
+    monkeypatch.setenv("AMES_ADMIN_TOKEN", "mint-token")
+    bad = client.post("/admin/keys?owner_id=gov_alice2&role=root", headers={"X-Admin-Token": "mint-token"})
+    assert bad.status_code == 422, bad.text
+    ok = client.post(f"/admin/keys?owner_id=gov_alice2&role=approver&person={BOB}",
+                     headers={"X-Admin-Token": "mint-token"})
+    assert ok.status_code == 200, ok.text
+    assert auth.owner_of(ok.json()["api_key"]) == {
+        "owner_id": "gov_alice2", "role": "approver", "person": BOB}
+    plain = client.post("/admin/keys?owner_id=gov_alice2", headers={"X-Admin-Token": "mint-token"})
+    assert auth.owner_of(plain.json()["api_key"]) == {"owner_id": "gov_alice2", "role": "member"}
+
+
+# ---- case 22 ----
+
+def test_case22_an_approver_key_is_refused_everywhere_but_governance():
+    p = _propose()
+    h = H(APPROVER[BOB])
+    mine = _retain_private(BOB, f"bob note {_tok()}")
+    calls = [
+        client.post("/memory/retain", headers=h, json={"kind": "semantic", "text": f"x {_tok()}"}),
+        client.post("/memory/update", headers=h, json={
+            "kind": "semantic", "doc_id": mine["_id"], "text": f"y {_tok()}"}),
+        client.post("/memory/delete", headers=h, json={"kind": "semantic", "doc_id": mine["_id"]}),
+        client.post("/memory/recall", headers=h, json={"query": p["token"]}),
+        client.post("/memory/promote", headers=h, json={
+            "kind": "semantic", "doc_id": mine["_id"], "to_visibility": "team"}),
+        client.post("/mcp/tools/retain", headers=h, json={"kind": "semantic", "text": f"z {_tok()}"}),
+        client.post("/mcp/tools/recall", headers=h, json={"query": p["token"]}),
+        client.post("/mcp/tools/delete", headers=h, json={"kind": "semantic", "doc_id": mine["_id"]}),
+    ]
+    assert [c.status_code for c in calls] == [403] * len(calls), [c.text for c in calls]
+    assert _src(mine["_id"])["active"] is True
+    # the governance surface stays open to it
+    assert client.get("/governance/proposals", headers=h).status_code == 200
+    assert _approve(BOB, p["_id"]).status_code == 200
+
+
+# ---- finding 8: the approval CLI ----
+
+def test_cli_refuses_to_send_the_key_over_plain_http_to_a_remote_host():
+    cli = _load_script("ames_approve")
+    for url in ("http://example.com:8123", "http://localhost.example.com", "http://10.0.0.5:8123",
+                "ftp://localhost", "http://", "localhost:8123"):
+        with pytest.raises(SystemExit):
+            cli.check_url(url)
+    for url in ("http://localhost:8123", "http://127.0.0.1:8123", "http://[::1]:8123",
+                "https://example.com", "https://example.com:8443/base"):
+        assert cli.check_url(url)
+
+
+def test_cli_confirms_the_target_before_prompting_and_refuses_without_a_tty(monkeypatch, capsys):
+    cli = _load_script("ames_approve")
+
+    class NoTty:
+        def isatty(self):
+            return False
+
+    class Tty:
+        def isatty(self):
+            return True
+
+    with pytest.raises(SystemExit):
+        cli.confirm_target("https://example.com", stdin=NoTty(),
+                           ask=lambda _p: pytest.fail("asked without a TTY"))
+    with pytest.raises(SystemExit):
+        cli.confirm_target("https://example.com", stdin=Tty(), ask=lambda _p: "n")
+    assert cli.confirm_target("https://example.com", stdin=Tty(), ask=lambda _p: "y") is None
+    assert "example.com" in capsys.readouterr().out
+    # refusal happens before the key is read, with no TTY: main() never reaches the prompt
+    monkeypatch.setattr(cli.sys, "stdin", NoTty())
+    monkeypatch.setattr(cli.getpass, "getpass", lambda _p: pytest.fail("prompted for the key"))
+    for url in ("http://example.com:8123", "http://localhost:8123"):
+        with pytest.raises(SystemExit):
+            cli.main(["--url", url, "list"])
+
+
+# ---- finding 9: governance mapping migration fails closed ----
+
+def test_governance_mapping_failure_fails_closed(monkeypatch):
+    from app import store
+    real = store.es
+
+    def broken(method, path, body=None, *a, **k):
+        if path.endswith("/_mapping") and body and "decision_status" in body.get("properties", {}):
+            raise RuntimeError("ES PUT mapping -> 400: boom")
+        return real(method, path, body, *a, **k)
+
+    monkeypatch.setattr(store, "es", broken)
+    monkeypatch.setattr(store, "_indices_ready", False)
+    with pytest.raises(RuntimeError):
+        store.ensure_indices()
+    assert store._indices_ready is False
+    with pytest.raises(RuntimeError):                  # so retain / recall fail too, not just startup
+        memory.retain(ALICE, "semantic", f"fail closed {_tok()}")
+
+
+# ---- finding 10: audit rows of lost compare-and-set attempts ----
+
+def test_finding10_audit_rows_of_a_lost_cas_are_marked_conflict(monkeypatch):
+    old = _active()
+    new = _propose(ALICE, supersedes_decision=old["_id"])
+    barrier = threading.Barrier(2, timeout=30)
+    real_audit = governance._audit
+
+    def gated(intent, actor, doc_id, detail):
+        if intent == "decision_approve" and detail.get("attempt") == 1:
+            try:
+                barrier.wait()
+            except threading.BrokenBarrierError:
+                pass
+        return real_audit(intent, actor, doc_id, detail)
+
+    monkeypatch.setattr(governance, "_audit", gated)
+    out = {}
+    threads = [threading.Thread(target=lambda w=w: out.setdefault(w, _approve(w, new["_id"])))
+               for w in (BOB, CAROL)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(60)
+    monkeypatch.undo()
+    assert {r.status_code for r in out.values()} == {200}
+    rows = [r for r in _rows(new["_id"]) if r["intent"] == "decision_approve"]
+    lost = [r for r in rows if r["detail"].get("outcome") == "conflict"]
+    won = [r for r in rows if r["detail"].get("outcome") != "conflict"]
+    assert len(lost) == 1 and lost[0]["detail"]["attempt"] == 1, rows
+    assert len(won) == 2, rows                        # the winner's attempt 1 and the retry
+    assert len(_src(new["_id"])["approvals"]) == 2
+
+
+# ---- finding 11: backfill is compare-and-set and records an author ----
+
+def test_finding11_backfill_does_not_overwrite_a_concurrent_transition(monkeypatch):
+    t = _tok()
+    text = f"legacy decision {t} racing"
+    doc_id = _stray(ALICE, f"dg_{uuid.uuid4().hex}", text, visibility="team", tags=[DECISION])
+    real_audit = governance._audit
+
+    def interfering(intent, actor, did, detail):
+        if intent == "decision_backfill" and did == doc_id:
+            es("POST", f"/{idx('semantic')}/_update/{doc_id}?refresh=true",
+               {"doc": {"decision_status": "rejected", "active": False}})
+        return real_audit(intent, actor, did, detail)
+
+    monkeypatch.setattr(governance, "_audit", interfering)
+    governance.backfill()
+    monkeypatch.undo()
+    s = _src(doc_id)
+    assert s["decision_status"] == "rejected" and s["active"] is False
+
+
+def test_finding11_backfilled_decisions_record_proposed_by():
+    doc_id = _stray(ALICE, f"dg_{uuid.uuid4().hex}", f"legacy decision {_tok()}",
+                    visibility="team", tags=[DECISION])
+    governance.backfill()
+    s = _src(doc_id)
+    assert s["decision_status"] == "active" and s["proposed_by"] == ALICE
+    assert governance.backfill()["backfilled"] == 0 or _src(doc_id)["decision_status"] == "active"
+
+
+# ---- finding 12: the expiry pass reads every page ----
+
+def test_finding12_expiry_pass_paginates_past_one_page():
+    n = governance.PAGE + 5
+    ids = []
+    for i in range(n):
+        text = f"bulk proposal {_tok()} {i}"
+        ids.append(_stray(ALICE, f"dg_{uuid.uuid4().hex}", text, visibility="team",
+                          tags=[DECISION], decision_status="proposed", proposed_by=ALICE,
+                          approvals=[], proposal_expires_at="2000-01-01T00:00:00Z"))
+    out = governance.expire_stale_proposals()
+    assert out["expired"] >= n
+    left = es("POST", f"/{idx('semantic')}/_count", {"query": {"bool": {"filter": [
+        {"terms": {"_id": ids}}, {"term": {"decision_status": "proposed"}}]}}})["count"]
+    assert left == 0
