@@ -179,6 +179,25 @@ def mint_key(owner_id: str, role: str = "member", person: Optional[str] = None,
         raise HTTPException(503, "key store not writable") from None
 
 
+@app.post("/admin/keys/person")
+def set_key_person(owner_id: str, person: str, _admin: str = Header(None, alias="X-Admin-Token")):
+    """Name the person behind the legacy (person-less) keys of an owner; they keep working as
+    agent keys either way."""
+    expected = os.environ.get("AMES_ADMIN_TOKEN", "")
+    if not expected:
+        raise HTTPException(403, "key admin disabled: AMES_ADMIN_TOKEN is not set")
+    if not _admin or not hmac.compare_digest(_admin.encode(), expected.encode()):
+        raise HTTPException(403, "bad admin token")
+    try:
+        return {"owner_id": owner_id, "person": person.strip(),
+                "updated": auth.set_person(owner_id, person)}
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from None
+    except auth.KeyStoreNotWritable as exc:
+        logging.getLogger("ames.auth").error("%s", exc)
+        raise HTTPException(503, "key store not writable") from None
+
+
 @app.get("/memory/facts/drain")
 def fact_drain(who: dict = Depends(caller)):
     result = facts.status(who["owner_id"])
@@ -498,12 +517,14 @@ def governance_proposals(limit: int = 50, who: dict = Depends(any_key)):
 
 @app.post("/governance/approve")
 def governance_approve(body: ApproveIn, who: dict = Depends(approver)):
-    return _governance_call(governance.approve, who["person"], body.doc_id, body.note)
+    return _governance_call(governance.approve, who["person"], body.doc_id, body.note,
+                            who["owner_id"])
 
 
 @app.post("/governance/reject")
 def governance_reject(body: RejectIn, who: dict = Depends(approver)):
-    return _governance_call(governance.reject, who["person"], body.doc_id, body.reason)
+    return _governance_call(governance.reject, who["person"], body.doc_id, body.reason,
+                            who["owner_id"])
 
 
 @app.post("/admin/governance/backfill")

@@ -153,21 +153,51 @@ def _save(keys: dict) -> None:
 ROLES = ("member", "owner", "approver")
 
 
+def _clean_person(person: Optional[str]) -> str:
+    if not isinstance(person, str) or not person.strip() or len(person) > 200:
+        raise ValueError("person is required: the name of the human behind the key (1-200 chars)")
+    return person.strip()
+
+
 def create_key(owner_id: str, role: str = "member", person: Optional[str] = None) -> str:
-    """Mint an API key for owner_id. Returns the plaintext key once. `person` names the human
-    behind the key; governance counts people, not keys."""
+    """Mint an API key for owner_id. Returns the plaintext key once. `person` is REQUIRED: it names
+    the human behind the key, and governance counts people, not keys (a key with no person would
+    store the owner id as the author of its proposals, which an approver key could not tell from
+    its own person). Keys that predate this carry no person and keep working as agent keys; give
+    them one with set_person."""
     if role not in ROLES:
         raise ValueError(f"role must be one of {ROLES}")
+    person = _clean_person(person)
     token = "ame_" + secrets.token_hex(32)
     digest = hashlib.sha256(token.encode()).hexdigest()
-    entry = {"owner_id": owner_id, "role": role}
-    if person:
-        entry["person"] = person
+    entry = {"owner_id": owner_id, "role": role, "person": person}
     with _guard():
         keys = _load()
         keys[digest] = entry
         _save(keys)
     return token
+
+
+def set_person(owner_id: str, person: str) -> int:
+    """Admin: name the person behind every key of `owner_id` that has none (legacy keys). Keys that
+    already name a person are left alone. Returns how many keys were updated."""
+    person = _clean_person(person)
+    with _guard():
+        keys = _load()
+        n = 0
+        for entry in keys.values():
+            if isinstance(entry, dict) and entry.get("owner_id") == owner_id and not entry.get("person"):
+                entry["person"] = person
+                n += 1
+        if n:
+            _save(keys)
+    return n
+
+
+def persons_of(owner_id: Optional[str]) -> set:
+    """Every person named on a key of `owner_id` (read-only, like the worker's key view)."""
+    return {e["person"] for e in load_readonly().values()
+            if isinstance(e, dict) and e.get("owner_id") == owner_id and e.get("person")}
 
 
 # Best-effort legacy migration is attempted at most once per (file version, backoff window)

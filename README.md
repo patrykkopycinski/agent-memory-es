@@ -20,7 +20,7 @@ cd backend && docker compose -f docker-compose.quickstart.yml up -d
 export AMES_ES_URL=http://localhost:19200
 # 2. mint a key:
 curl -X POST -H "X-Admin-Token: $AMES_ADMIN_TOKEN" \
-  'http://localhost:8123/admin/keys?owner_id=you'
+  'http://localhost:8123/admin/keys?owner_id=you&person=you'
 # 3. preflight:
 python ../scripts/ames_doctor.py
 # 4. import your existing memory (governance stores / Hindsight / CLAUDE.md):
@@ -126,8 +126,8 @@ export AMES_ADMIN_TOKEN=change-me
 docker compose up -d          # ames-backend :8123, ames-worker, Elasticsearch
 
 # mint a key (owner identity is bound to it)
-curl -s -X POST "localhost:8123/admin/keys?owner_id=alice" -H "X-Admin-Token: $AMES_ADMIN_TOKEN"
-# optional: role=member|owner|approver, person=<the human behind the key> (needed to approve)
+curl -s -X POST "localhost:8123/admin/keys?owner_id=alice&person=alice" -H "X-Admin-Token: $AMES_ADMIN_TOKEN"
+# person=<the human behind the key> is required; optional role=member|owner|approver (approving needs approver)
 
 # remember something, then recall it
 curl -s -X POST localhost:8123/memory/retain -H "X-API-Key: $KEY" \
