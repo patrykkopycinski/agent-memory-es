@@ -27,7 +27,7 @@ PEOPLE = ("gov_alice", "gov_bob", "gov_carol", "gov_dave")
 ALICE, BOB, CAROL, DAVE = PEOPLE
 AGENT = {p: auth.create_key(p, "member", person=p) for p in PEOPLE}          # what an agent holds
 APPROVER = {p: auth.create_key(p, "approver", person=p) for p in PEOPLE}     # minted for the same person
-WIPE = list(PEOPLE) + ["gov_owner", "gov_alice2", "gov_alice3", "gov_legacy", "gov_other", "gov_sib", "gov_case", "system", "admin"]
+WIPE = list(PEOPLE) + ["gov_owner", "gov_alice2", "gov_alice3", "gov_legacy", "gov_other", "gov_sib", "gov_case", "gov_case2", "gov_mix", "system", "admin"]
 OWNER_KEY = auth.create_key("gov_owner", "owner", person="gov_owner")
 H = lambda k: {"X-API-Key": k}  # noqa: E731
 DECISION = "kind:decision"
@@ -1488,8 +1488,9 @@ def test_round4_set_person_is_audited_and_persons_are_lowercased(monkeypatch):
     r = client.post(f"/admin/keys/person?owner_id={owner}&person=%20Dana%20", headers=adm)
     assert r.status_code == 200 and r.json()["person"] == "dana" and r.json()["updated"] == 1, r.text
     assert auth.owner_of(legacy)["person"] == "dana"
-    rows = [x for x in _rows(owner) if x["intent"] == "key_set_person"]
-    assert len(rows) == 1 and rows[0]["detail"] == {"owner_id": owner, "person": "dana", "keys_changed": 1}
+    rows = {x["intent"]: x for x in _rows(owner)}
+    assert rows["key_set_person"]["detail"] == {"owner_id": owner, "person": "dana"}
+    assert rows["key_set_person_done"]["detail"]["keys_changed"] == 1
     assert auth.owner_of(auth.create_key(owner, "member", person="  Erin "))["person"] == "erin"
 
 
@@ -1530,7 +1531,8 @@ def _decided_override(days_ago):
     return target, new
 
 
-def test_round4_reconcile_only_rescans_recent_or_unlinked_overrides():
+def test_round4_reconcile_only_rescans_recent_or_unlinked_overrides(monkeypatch):
+    monkeypatch.setattr(governance, "_last_full_reconcile", time.time())     # no full scan due
     old_target, _ = _decided_override(30)
     recent_target, _ = _decided_override(0)
     governance.expire_stale_proposals()
@@ -1539,7 +1541,128 @@ def test_round4_reconcile_only_rescans_recent_or_unlinked_overrides():
 
 
 def test_round4_reconcile_window_is_configurable(monkeypatch):
+    monkeypatch.setattr(governance, "_last_full_reconcile", time.time())
     monkeypatch.setenv("AMES_GOV_RECONCILE_DAYS", "60")
     target, _ = _decided_override(30)
     governance.expire_stale_proposals()
     assert _src(target)["decision_status"] == "superseded"
+
+
+# ---- review round 5 ----
+
+def _key_with_stored_person(owner, person, role="member"):
+    """A key whose person was written straight into the key file (the offline route), as typed."""
+    import hashlib
+    token = "ame_" + uuid.uuid4().hex * 2
+    with auth._guard():
+        keys = auth._load()
+        keys[hashlib.sha256(token.encode()).hexdigest()] = {"owner_id": owner, "role": role,
+                                                            "person": person}
+        auth._save(keys)
+    return token
+
+
+def test_round5_veto_list_is_case_insensitive(monkeypatch):
+    monkeypatch.setenv("AMES_GOV_VETO_OWNERS", f" {CAROL.upper()} , Nobody ")
+    assert governance.veto_owners() == {CAROL, "nobody"}
+    p = _propose(ALICE)
+    r = _reject(CAROL, p["_id"], "vetoed")
+    assert r.status_code == 200 and r.json()["veto"] is True, r.text
+    assert _src(p["_id"])["decision_status"] == "rejected"
+
+
+def test_round5_stored_persons_are_lowercased_on_load():
+    tok = _key_with_stored_person("gov_mix", "Gov_Mixed")
+    assert auth.owner_of(tok)["person"] == "gov_mixed"
+    assert "gov_mixed" in auth.persons_of("gov_mix")
+
+
+def test_round5_one_human_approving_as_alice_then_alice_counts_once():
+    p = _propose(ALICE, supersedes_decision=_active()["_id"])           # needs two approvals
+    assert governance.approve(BOB.upper(), p["_id"])["approvals"] == 1
+    with pytest.raises(governance.GovernedError):
+        governance.approve(BOB, p["_id"])
+    assert _src(p["_id"])["decision_status"] == "proposed"
+    # a stored mixed-case approval also counts once, and the author's own never counts
+    stored = [{"by": BOB.upper(), "text_hash": _src(p["_id"])["text_hash"]},
+              {"by": BOB, "text_hash": _src(p["_id"])["text_hash"]},
+              {"by": ALICE.upper(), "text_hash": _src(p["_id"])["text_hash"]}]
+    assert len(governance._valid_approvals({**_src(p["_id"]), "approvals": stored,
+                                            "proposed_by": ALICE})) == 1
+
+
+def test_round5_an_author_stored_with_capitals_can_edit_and_withdraw():
+    tok = auth.create_key("gov_case2", "member", person="gov_case2")
+
+    def mk():
+        return _stray("gov_case2", f"dg_{uuid.uuid4().hex}", f"decision {_tok()} capital author",
+                      visibility="team", tags=[DECISION], decision_status="proposed",
+                      proposed_by="Gov_Case2", approvals=[])
+
+    r = client.post("/memory/update", headers=H(tok), json={
+        "kind": "semantic", "doc_id": mk(), "text": f"decision {_tok()} reworded"})
+    assert r.status_code == 200, r.text
+    r = client.post("/memory/delete", headers=H(tok), json={"kind": "semantic", "doc_id": mk()})
+    assert r.status_code == 200 and r.json()["withdrawn"] is True, r.text
+
+
+def test_round5_set_person_audit_failure_refuses_and_changes_nothing(monkeypatch):
+    monkeypatch.setenv("AMES_ADMIN_TOKEN", "mint-token")
+    owner = f"gov_aud{uuid.uuid4().hex[:8]}"
+    legacy = _legacy_key(owner)
+    seen = {}
+
+    def boom(intent, owner_id, kind, doc_id, detail, strict=False):
+        seen["strict"] = strict
+        raise RuntimeError("es down")
+
+    monkeypatch.setattr(memory, "_log_mutation", boom)
+    r = client.post(f"/admin/keys/person?owner_id={owner}&person=dana",
+                    headers={"X-Admin-Token": "mint-token"})
+    assert r.status_code == 503, r.text
+    assert seen["strict"] is True
+    assert not auth.owner_of(legacy).get("person")
+
+
+def test_round5_full_reconcile_picks_up_an_old_override_the_window_skips(monkeypatch):
+    target, _new = _decided_override(60)                      # old, linked, target still active
+    monkeypatch.setattr(governance, "_last_full_reconcile", time.time())
+    governance.expire_stale_proposals()
+    assert _src(target)["decision_status"] == "active"        # window pass: skipped
+    monkeypatch.setattr(governance, "_last_full_reconcile", time.time() - 25 * 3600)
+    out = governance.expire_stale_proposals()
+    assert _src(target)["decision_status"] == "superseded" and out["completed_overrides"] >= 1
+    assert time.time() - governance._last_full_reconcile < 60         # marker advanced
+
+
+def test_round5_cli_warns_and_exits_2_on_an_override_conflict(monkeypatch):
+    cli = _load_script("ames_approve")
+    out = []
+    monkeypatch.setattr(cli, "request", lambda *a, **k: (200, {
+        "_id": "x", "activated": True, "conflict": True, "warning": "target held elsewhere"}))
+    args = cli.build_parser().parse_args(["approve", "x"])
+    assert cli.run(args, "k", out=out.append) == 2
+    assert any(line.startswith("WARNING:") and "target held elsewhere" in line for line in out)
+    monkeypatch.setattr(cli, "request", lambda *a, **k: (200, {"_id": "x", "activated": True}))
+    out.clear()
+    assert cli.run(args, "k", out=out.append) == 0
+    assert not any("WARNING" in line for line in out)
+
+
+def test_round5_cli_list_renders_override_conflicts_after_the_proposals(monkeypatch):
+    cli = _load_script("ames_approve")
+    prop = {"id": "p1", "proposed_by": "alice", "approved_by": [], "approvals_required": 1,
+            "approvals_needed": 1, "text": "a proposal"}
+    conflict = {"id": "c1", "proposal_for": "t1", "text": "an override", "decided_at": "2026-01-01"}
+    monkeypatch.setattr(cli, "request", lambda *a, **k: (200, {
+        "proposals": [prop], "total": 1, "override_conflicts": [conflict]}))
+    out = []
+    assert cli.run(cli.build_parser().parse_args(["list"]), "k", out=out.append) == 0
+    text = "\n".join(out)
+    assert "WARNING" in text and "c1" in text and "t1" in text
+    assert text.index("p1") < text.index("c1")
+    monkeypatch.setattr(cli, "request", lambda *a, **k: (200, {
+        "proposals": [prop], "total": 1, "override_conflicts": []}))
+    out.clear()
+    cli.run(cli.build_parser().parse_args(["list"]), "k", out=out.append)
+    assert "WARNING" not in "\n".join(out)
