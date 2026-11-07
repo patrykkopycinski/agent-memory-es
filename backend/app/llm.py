@@ -23,6 +23,18 @@ def _sampling(default):
     return {"temperature": float(value)}
 
 
+def _template_kwargs():
+    """AMES_LLM_DISABLE_THINKING=1 => disable the chat template's thinking phase
+    (chat_template_kwargs.enable_thinking=false). Needed for thinking-by-default
+    local lanes (oMLX Groot/Nemotron): without it the model spends the entire
+    max_tokens budget on reasoning and returns empty content. Harmless elsewhere:
+    the gateway drops the field for providers that reject it (claude whitelist
+    translator; glm verified tolerant)."""
+    if os.environ.get("AMES_LLM_DISABLE_THINKING") == "1":
+        return {"chat_template_kwargs": {"enable_thinking": False}}
+    return {}
+
+
 SYSTEM = (
     "You answer strictly from the EVIDENCE memories provided. "
     "Cite the memory ids you used like [am_xxx]. If the evidence does not "
@@ -76,7 +88,7 @@ def chat_json(system: str, user: str, timeout: int = 120) -> dict:
     """One temperature-0 chat completion that must return a JSON object (label extraction).
     Raises on transport errors, empty content or a non-object body: the caller decides policy."""
     body = json.dumps({
-        "model": MODEL, **_sampling(0),
+        "model": MODEL, **_sampling(0), **_template_kwargs(),
         "response_format": {"type": "json_object"},
         "messages": [{"role": "system", "content": system},
                      {"role": "user", "content": "Return a json object.\n\n" + user}],

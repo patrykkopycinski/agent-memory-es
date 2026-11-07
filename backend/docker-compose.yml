@@ -42,6 +42,7 @@ services:
       AMES_LLM_KEY: ${AMES_LLM_KEY:?set in .env}
       AMES_LLM_MODEL: ames-extract
       AMES_LLM_TEMPERATURE: omit
+      AMES_LLM_DISABLE_THINKING: "1"
     volumes:
       - ~/ames-data:/data
     command: python -m app.worker --facts
@@ -57,6 +58,7 @@ services:
       AMES_LLM_KEY: ${AMES_LLM_KEY:?set in .env}
       AMES_LLM_MODEL: ames-extract
       AMES_LLM_TEMPERATURE: omit
+      AMES_LLM_DISABLE_THINKING: "1"
     volumes:
       - ~/ames-data:/data
     command: python -m app.worker --backfill
