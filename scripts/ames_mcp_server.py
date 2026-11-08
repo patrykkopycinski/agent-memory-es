@@ -13,8 +13,19 @@ import argparse
 import json
 import os
 import sys
+import time
 import urllib.error
 import urllib.request
+
+# Tracing reuses the backend's telemetry module (same gate, exporter and privacy
+# scrubber) when it is importable, i.e. this script runs from a repo checkout or
+# the backend package is on PYTHONPATH. Otherwise the server runs untraced.
+try:
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                    "..", "backend"))
+    from app import telemetry as _otel
+except Exception:  # pragma: no cover - minimal install
+    _otel = None
 
 MAX_RECALL_SIZE = 50   # keep equal to backend app.memory.MAX_RECALL_SIZE (a test pins it)
 
@@ -76,17 +87,22 @@ TOOLS = [
 ]
 
 
+def _headers(base: dict) -> dict:
+    """Add W3C traceparent for the active MCP span so the backend trace joins it."""
+    return _otel.inject_headers(base) if _otel is not None else base
+
+
 def http(url: str, key: str, path: str, body: dict) -> dict:
     req = urllib.request.Request(
         url.rstrip("/") + path, data=json.dumps(body).encode(), method="POST",
-        headers={"Content-Type": "application/json", "X-API-Key": key})
+        headers=_headers({"Content-Type": "application/json", "X-API-Key": key}))
     with urllib.request.urlopen(req, timeout=60) as r:
         return json.load(r)
 
 
 def http_get(url: str, key: str, path: str) -> dict:
     req = urllib.request.Request(url.rstrip("/") + path, method="GET",
-                                 headers={"X-API-Key": key})
+                                 headers=_headers({"X-API-Key": key}))
     with urllib.request.urlopen(req, timeout=60) as r:
         return json.load(r)
 
@@ -115,6 +131,24 @@ def label_proposals(res: dict) -> dict:
 
 
 def dispatch(url: str, key: str, name: str, args: dict) -> dict:
+    """Run one tool call inside an `mcp.tool_call` span (tool name, latency, result
+    counts; never arguments or result text)."""
+    if _otel is None:
+        return _dispatch(url, key, name, args)
+    known = name in {t["name"] for t in TOOLS}
+    t0 = time.perf_counter()
+    with _otel.span("mcp.tool_call", {"mcp.tool.name": name if known else "unknown",
+                                       "mcp.transport": "stdio"},
+                    otel_kind="server"):
+        try:
+            res = _dispatch(url, key, name, args)
+        finally:
+            _otel.set_attrs({"mcp.latency_ms": round((time.perf_counter() - t0) * 1000.0, 3)})
+        _otel.set_attrs(_otel.mcp_result_attrs(res))
+        return res
+
+
+def _dispatch(url: str, key: str, name: str, args: dict) -> dict:
     if name == "ames_recall":
         body = {"query": args["query"], "kinds": args.get("kinds"),
                 "size": min(max(int(args.get("size", 8)), 1), MAX_RECALL_SIZE)}
@@ -185,6 +219,8 @@ def main():
     if not a.api_key:
         print("ames-mcp: AMES_SERVICE_KEY or --api-key required", file=sys.stderr)
         sys.exit(2)
+    if _otel is not None:
+        _otel.configure_for_cli("ames-mcp")
     rpc(a.url, a.api_key)
 
 

@@ -297,3 +297,41 @@ def test_max_k_matches_backend_fetch_cap():
     import app.memory as mem
     from mcp_server import server as srv
     assert srv.MAX_K == mem.RECALL_FETCH_CAP == 50
+
+
+# --- tracing: mcp.tool_call span + traceparent to the backend ---------------------
+
+def test_fastmcp_tool_call_emits_span_and_propagates_traceparent():
+    otel_mod = pytest.importorskip("app.telemetry")
+    pytest.importorskip("opentelemetry.sdk")
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+
+    exp = InMemorySpanExporter()
+    saved = dict(otel_mod._state)
+    otel_mod.reset()
+    otel_mod.configure(tracer_provider=otel_mod.build_provider(SimpleSpanProcessor(exp)))
+    try:
+        seen = []
+
+        def handler(req: httpx.Request) -> httpx.Response:
+            seen.append(req.headers.get("traceparent"))
+            return httpx.Response(200, json={"results": ITEMS, "abstained": False})
+        client = AmesClient("http://ames.test", KEY, transport=httpx.MockTransport(handler))
+        mcp = build_server(client)
+        out = _call(mcp, "memory_recall", {"query": "CANARY-mcp-q", "k": 2})
+        assert out["count"] == 2
+        spans = [s for s in exp.get_finished_spans() if s.name == "mcp.tool_call"]
+        assert len(spans) == 1
+        a = dict(spans[0].attributes)
+        assert a["mcp.tool.name"] == "memory_recall" and a["mcp.result.results"] == 2
+        assert a["memory.recall.quality.hit_count"] == 2 and a["mcp.latency_ms"] >= 0
+        _, trace_id, span_id, _f = seen[0].split("-")
+        assert int(trace_id, 16) == spans[0].context.trace_id
+        assert int(span_id, 16) == spans[0].context.span_id
+        blob = " ".join(f"{k}={v}" for s in exp.get_finished_spans()
+                        for k, v in (s.attributes or {}).items())
+        assert "CANARY-mcp-q" not in blob and KEY not in blob
+    finally:
+        otel_mod.reset()
+        otel_mod._state.update(saved)
