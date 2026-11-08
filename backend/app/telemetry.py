@@ -106,6 +106,29 @@ def _otlp_traces_endpoint() -> Optional[str]:
 _EXC_ATTRS = ("exception.message", "exception.stacktrace")
 _URL_ATTRS = ("http.target", "http.url", "url.full", "url.query")
 _IDENT = re.compile(r"^[A-Za-z_][\w.]{0,80}$")
+UNMATCHED_ROUTE = "/<unmatched>"
+_MAX_ATTR_CHARS = 256
+
+
+def _is_server(span) -> bool:
+    kind = getattr(span, "kind", None)
+    return getattr(kind, "name", None) == "SERVER"
+
+
+def _templated_url(key: str, value: str, route) -> str:
+    """Server-span URL attribute with the path replaced by the route template.
+
+    Path segments are chosen by the caller (`/memory/pages/{scope}`), so the raw
+    path is as sensitive as a query string. A request that matched no route
+    (404 scans) has no template; its path is replaced by a fixed marker.
+    """
+    template = route if isinstance(route, str) and route.startswith("/") else UNMATCHED_ROUTE
+    template = template[:_MAX_ATTR_CHARS]
+    if key == "http.target":
+        return template
+    value = value.split("?", 1)[0]
+    m = re.match(r"^([A-Za-z][A-Za-z0-9+.-]*://[^/]*)", value)
+    return (m.group(1) if m else "") + template
 
 
 def _scrub_event(ev):
@@ -140,9 +163,13 @@ class PrivacyScrubber(SpanProcessor):
             if attrs and any(k in attrs for k in _EXC_ATTRS + _URL_ATTRS):
                 clean = {k: v for k, v in attrs.items()
                          if k not in _EXC_ATTRS and k != "url.query"}
+                server = _is_server(span)
+                route = clean.get("http.route") if server else None
                 for key in ("http.target", "http.url", "url.full"):
                     if key in clean:
-                        clean[key] = str(clean[key]).split("?", 1)[0]
+                        clean[key] = (_templated_url(key, str(clean[key]), route)
+                                      if server else
+                                      str(clean[key]).split("?", 1)[0])
                 span._attributes = clean
             status = getattr(span, "_status", None)
             desc = getattr(status, "description", None)
@@ -279,6 +306,19 @@ def _has_parent() -> bool:
         return False
 
 
+def set_attrs_from(build, *args) -> None:
+    """Build attributes from a result and set them, only while a span is
+    recording, and never raise into the request path (the builders read
+    request/result dicts whose shape the caller does not control)."""
+    span = current_span()
+    try:
+        if span is None or not span.is_recording():
+            return
+        set_attrs(build(*args))
+    except Exception:
+        pass
+
+
 def set_attrs(attrs: dict) -> None:
     """Set attributes on the active span, dropping None / secret-ish values."""
     span = current_span()
@@ -309,18 +349,21 @@ def add_event(name: str, attrs: Optional[dict] = None) -> None:
 
 def _clean(value):
     """OTLP attributes must be scalars or homogeneous scalar sequences."""
-    if value is None or isinstance(value, (bool, int, float, str)):
+    if isinstance(value, str):
+        return value[:_MAX_ATTR_CHARS]
+    if value is None or isinstance(value, (bool, int, float)):
         return value
     if isinstance(value, dict):
         return None  # never flatten free-form dicts: they can hold text/keys
     if isinstance(value, (list, tuple, set, frozenset)):
-        items = [v for v in value if isinstance(v, (bool, int, float, str))]
+        items = [v[:_MAX_ATTR_CHARS] if isinstance(v, str) else v
+                 for v in value if isinstance(v, (bool, int, float, str))]
         if not items:
             return None
         if len(items) > 32:
             items = items[:32]
         return items
-    return str(value)[:256]
+    return str(value)[:_MAX_ATTR_CHARS]
 
 
 def _span_kind(name: Optional[str]):
@@ -383,7 +426,7 @@ def span(name: str, attrs: Optional[dict] = None, kind: Optional[str] = None,
         return
     local = dict(attrs or {})
     if kind:
-        local["memory.kind"] = kind
+        local["memory.kind"] = safe_kind(kind)
     if require_parent and not _has_parent():
         yield from _unparented(tr, name, local)
         return
@@ -472,10 +515,27 @@ class timer:
 # --- attribute vocabulary ---------------------------------------------------
 
 KINDS_ALL = ("episodic", "semantic", "procedural")
+VISIBILITIES_ALL = ("private", "team", "common")
+INVALID = "invalid"
+
+
+def safe_kind(kind) -> str:
+    """Request strings are exported only if they are a known enum value.
+    Anything else (typos, probes, pasted memory text) becomes "invalid"."""
+    return kind if isinstance(kind, str) and kind in KINDS_ALL else INVALID
+
+
+def safe_visibility(vis) -> str:
+    return vis if isinstance(vis, str) and vis in VISIBILITIES_ALL else INVALID
 
 
 def _kind_attrs(kinds: Optional[Iterable[str]]) -> dict:
-    resolved = [k for k in (kinds or KINDS_ALL)]
+    if isinstance(kinds, str):
+        kinds = [kinds]
+    try:
+        resolved = [safe_kind(k) for k in (kinds or KINDS_ALL)]
+    except TypeError:
+        resolved = [INVALID]
     out: dict = {}
     if len(resolved) == 1:
         out["memory.kind"] = resolved[0]
@@ -490,8 +550,9 @@ def recall_attrs(owner_id: str, query: str, kinds, size: int,
     by_kind: dict = {}
     by_vis: dict = {}
     for h in hits:
-        by_kind[h.get("kind", "?")] = by_kind.get(h.get("kind", "?"), 0) + 1
-        vis = h.get("visibility") or "unknown"
+        k = safe_kind(h.get("kind"))
+        by_kind[k] = by_kind.get(k, 0) + 1
+        vis = safe_visibility(h.get("visibility"))
         by_vis[vis] = by_vis.get(vis, 0) + 1
     attrs = {
         "ames.owner_hash": owner_hash(owner_id),
@@ -567,8 +628,8 @@ def retain_attrs(owner_id: str, kind: str, text: str, visibility: str,
                  out: dict) -> dict:
     attrs = {
         "ames.owner_hash": owner_hash(owner_id),
-        "memory.kind": kind,
-        "memory.visibility": visibility,
+        "memory.kind": safe_kind(kind),
+        "memory.visibility": safe_visibility(visibility),
         "memory.text_chars": len(text or ""),
     }
     if isinstance(out, dict):
@@ -583,8 +644,12 @@ def retain_attrs(owner_id: str, kind: str, text: str, visibility: str,
 
 
 def promote_attrs(owner_id: str, kind: str, to_visibility: str) -> dict:
-    return {"ames.owner_hash": owner_hash(owner_id), "memory.kind": kind,
-            "memory.visibility": to_visibility}
+    return {"ames.owner_hash": owner_hash(owner_id), "memory.kind": safe_kind(kind),
+            "memory.visibility": safe_visibility(to_visibility)}
+
+
+def retain_start_attrs(kind, visibility) -> dict:
+    return {"memory.kind": safe_kind(kind), "memory.visibility": safe_visibility(visibility)}
 
 
 def reflect_attrs(owner_id: str, question: str, out: dict) -> dict:

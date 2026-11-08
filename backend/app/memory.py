@@ -401,11 +401,10 @@ def retain(owner_id: str, kind: str, text: str, visibility: str = "private",
            person: Optional[str] = None) -> dict:
     """OTEL-wrapped retain (`memory.retain` span: kind, visibility, passage and
     dedup counts; never the memory text). Behaviour is `_retain_guarded`."""
-    with _otel.span("memory.retain", {"memory.kind": kind,
-                                      "memory.visibility": visibility}):
+    with _otel.span("memory.retain", _otel.retain_start_attrs(kind, visibility)):
         out = _retain_guarded(owner_id, kind, text, visibility, occurred_at, doc_group,
                               tags, labels, extract_facts, supersedes_decision, person=person)
-        _otel.set_attrs(_otel.retain_attrs(owner_id, kind, text, visibility, out))
+        _otel.set_attrs_from(_otel.retain_attrs, owner_id, kind, text, visibility, out)
         return out
 
 
@@ -1167,13 +1166,17 @@ def recall(owner_id: str, query: str, kinds=None, size: int = 8,
         out = _recall_inner(owner_id, query, kinds, size, min_score, as_of, per_doc,
                             rerank, filter, rerank_depth, min_similarity,
                             include_inactive_decisions)
-        attrs = _otel.recall_attrs(owner_id, query, kinds, size, out)
-        timings = out.get("timings_ms") or {}
-        for key in ("embed", "search", "rerank", "fuse", "total"):
-            if isinstance(timings.get(key), (int, float)):
-                attrs[f"memory.ms.{key}"] = timings[key]
-        _otel.set_attrs(attrs)
+        _otel.set_attrs_from(_recall_span_attrs, owner_id, query, kinds, size, out)
         return out
+
+
+def _recall_span_attrs(owner_id, query, kinds, size, out) -> dict:
+    attrs = _otel.recall_attrs(owner_id, query, kinds, size, out)
+    timings = out.get("timings_ms") or {}
+    for key in ("embed", "search", "rerank", "fuse", "total"):
+        if isinstance(timings.get(key), (int, float)):
+            attrs[f"memory.ms.{key}"] = timings[key]
+    return attrs
 
 
 def _recall_inner(owner_id: str, query: str, kinds=None, size: int = 8,
@@ -1559,7 +1562,7 @@ def reflect(owner_id: str, question: str, llm_answer_fn=None, rounds: int = 3) -
     Behaviour is `_reflect_inner`."""
     with _otel.span("memory.reflect"):
         out = _reflect_inner(owner_id, question, llm_answer_fn, rounds)
-        _otel.set_attrs(_otel.reflect_attrs(owner_id, question, out))
+        _otel.set_attrs_from(_otel.reflect_attrs, owner_id, question, out)
         return out
 
 

@@ -174,9 +174,12 @@ runs MCP -> HTTP -> memory.recall -> es.request. Recall spans carry
 
 Privacy model: spans carry kinds, visibility, counts, lengths and timings, plus
 a truncated hash of the owner. Never memory text, queries, keys or owner ids.
-Exception messages and stacktraces are never recorded (class name only), URL
-query strings are stripped from `http.target` / `http.url` / `url.full` /
-`url.query`, and no HTTP headers are captured. If header capture is ever enabled
+Request strings (`kind`, `visibility`, `kinds`) are exported only when they are
+a known enum value; anything else is exported as `invalid`, and every string
+attribute is capped at 256 characters. Exception messages and stacktraces are
+never recorded (class name only). On server spans `http.target` / `http.url` /
+`url.full` carry the route template (`/memory/pages/{scope}`), never the
+concrete path, and `url.query` is dropped. No HTTP headers are captured. If header capture is ever enabled
 through the OTEL env vars, `x-api-key`, `x-admin-token`, `authorization`,
 `cookie` and `set-cookie` are sanitized. A span processor enforces this for
 third-party instrumentation spans too.
@@ -185,6 +188,13 @@ Volume: an `es.request` with no parent span (an idle worker poll) is exported
 only when it is slow (`AMES_OTEL_ES_SLOW_MS`, default 1000) or failed. To sample
 request traces, set for example
 `OTEL_TRACES_SAMPLER=parentbased_traceidratio` and `OTEL_TRACES_SAMPLER_ARG=0.1`.
+
+While Elasticsearch is down, idle worker polls fail and each failed poll is
+still exported as an `es.request` span; this is intentional and unchanged.
+
+The `backend/mcp_server` Docker image ships without OpenTelemetry, so it emits no
+spans and sends no `traceparent`. Use `scripts/ames_mcp_server.py` from a repo
+checkout (or with `backend/` on `PYTHONPATH`) for MCP -> backend traces.
 
 ## Layout
 

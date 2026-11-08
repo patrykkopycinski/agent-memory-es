@@ -779,3 +779,181 @@ def test_inject_headers_is_noop_when_tracing_off():
         assert _otel.inject_headers({"a": "b"}) == {"a": "b"}
     finally:
         _otel._state.update(saved)
+
+
+# --- round 2: request strings and path segments never reach a span -----------------
+
+BAD_KIND = "SECRET-memory-text-as-kind-c4n4ry"
+BAD_VIS = "SECRET-visibility-c4n4ry"
+BAD_PATH = "SECRET-topic-name-c4n4ry"
+BAD_MARKERS = ("SECRET-", "c4n4ry")
+
+
+def _assert_no_canary(spans_):
+    blob = _everything(spans_)
+    for m in BAD_MARKERS:
+        assert m not in blob, m
+
+
+def test_retain_bad_kind_and_visibility_exported_as_invalid(spans, client, owner):
+    r = client.post("/memory/retain", headers=H(owner),
+                    json={"kind": BAD_KIND, "text": "ordinary note", "visibility": BAD_VIS})
+    assert r.status_code >= 400
+    dom = _by_name(spans, "memory.retain")
+    assert dom, "the failing retain must still produce its span"
+    a = _attrs(dom[0])
+    assert a["memory.kind"] == "invalid" and a["memory.visibility"] == "invalid"
+    _assert_no_canary(spans)
+
+
+def test_mcp_tools_route_bad_kind_not_exported(spans, client, owner):
+    r = client.post("/mcp/tools/retain", headers=H(owner),
+                    json={"kind": BAD_KIND, "text": "ordinary note", "visibility": BAD_VIS})
+    assert r.status_code >= 400
+    r = client.post("/mcp/tools/promote", headers=H(owner),
+                    json={"kind": BAD_KIND, "doc_id": "x", "to_visibility": BAD_VIS})
+    assert r.status_code >= 400
+    assert _by_name(spans, "memory.retain") and _by_name(spans, "memory.promote")
+    _assert_no_canary(spans)
+
+
+def test_promote_bad_kind_and_visibility_exported_as_invalid(spans, client, owner):
+    r = client.post("/memory/promote", headers=H(owner),
+                    json={"kind": BAD_KIND, "doc_id": "nope", "to_visibility": BAD_VIS})
+    assert r.status_code >= 400
+    a = _attrs(_by_name(spans, "memory.promote")[0])
+    assert a["memory.kind"] == "invalid" and a["memory.visibility"] == "invalid"
+    _assert_no_canary(spans)
+
+
+def test_recall_bad_kinds_exported_as_invalid(spans, client, owner):
+    r = client.post("/memory/recall", headers=H(owner),
+                    json={"query": "quantum muffin", "kinds": [BAD_KIND, "semantic"]})
+    assert r.status_code >= 0
+    dom = _by_name(spans, "memory.recall")
+    assert dom
+    a = _attrs(dom[0])
+    assert a["memory.kinds"] == ["invalid", "semantic"]
+    _assert_no_canary(spans)
+
+
+def test_recall_single_bad_kind_collapses_to_invalid(spans, client, owner):
+    client.post("/memory/recall", headers=H(owner),
+                json={"query": "quantum muffin", "kinds": [BAD_KIND]})
+    a = _attrs(_by_name(spans, "memory.recall")[0])
+    assert a["memory.kind"] == "invalid"
+    _assert_no_canary(spans)
+
+
+def test_recall_kinds_of_wrong_type_never_raise_into_the_request(spans, client, owner):
+    r = client.post("/memory/recall", headers=H(owner),
+                    json={"query": "quantum muffin", "kinds": [{"a": BAD_KIND}, 7]})
+    assert r.status_code < 500, r.text
+    _assert_no_canary(spans)
+
+
+def test_bad_value_negative_control(spans):
+    """The scan finds a bad kind when the allowlist is bypassed (plain attribute)."""
+    with _otel.span("planted", {"planted.kind": BAD_KIND}):
+        pass
+    assert BAD_KIND in _everything(spans)
+    with _otel.span("mapped", {"memory.kind": _otel.safe_kind(BAD_KIND)}):
+        pass
+    assert _by_name(spans, "mapped")[0].attributes["memory.kind"] == "invalid"
+
+
+def test_safe_helpers_allowlist():
+    assert _otel.safe_kind("semantic") == "semantic"
+    assert _otel.safe_kind("Semantic") == "invalid"
+    assert _otel.safe_kind(None) == "invalid"
+    assert _otel.safe_kind(["semantic"]) == "invalid"
+    assert _otel.safe_visibility("team") == "team"
+    assert _otel.safe_visibility("everyone") == "invalid"
+
+
+def test_clean_caps_string_and_list_item_length():
+    cap = _otel._MAX_ATTR_CHARS
+    assert len(_otel._clean("x" * 5000)) == cap
+    assert all(len(i) == cap for i in _otel._clean(["y" * 5000, "z" * 5000]))
+    assert _otel._clean("short") == "short"
+    assert _otel._clean([1, True, "ok"]) == [1, True, "ok"]
+
+
+def test_path_segment_canary_replaced_by_route_template(spans, client, owner):
+    client.get(f"/memory/pages/{BAD_PATH}", headers=H(owner))
+    server = [s for s in spans.get_finished_spans()
+              if (s.attributes or {}).get("http.route") == "/memory/pages/{scope}"]
+    assert server, "expected a server span with the route template"
+    a = _attrs(server[0])
+    assert a["http.route"] == "/memory/pages/{scope}"
+    for key in ("http.target", "http.url", "url.full", "url.path"):
+        if key in a:
+            assert BAD_PATH not in a[key], (key, a[key])
+    assert a.get("http.target", "/memory/pages/{scope}") == "/memory/pages/{scope}"
+    _assert_no_canary(spans)
+
+
+def test_unmatched_path_not_exported(spans, client, owner):
+    client.get(f"/no/such/route/{BAD_PATH}")
+    _assert_no_canary(spans)
+
+
+def test_path_template_negative_control(spans):
+    """A client-span URL (no scrubbing) keeps the planted segment, so the scan
+    above can fail; the scrubber's own transform is checked directly."""
+    with _otel.span("planted", {"http.target": f"/memory/pages/{BAD_PATH}"}):
+        pass
+    assert BAD_PATH in _everything(spans)
+    assert _otel._templated_url("http.target", f"/memory/pages/{BAD_PATH}?q=1",
+                                "/memory/pages/{scope}") == "/memory/pages/{scope}"
+    assert _otel._templated_url("http.url", f"http://h:8123/memory/pages/{BAD_PATH}?q=1",
+                                "/memory/pages/{scope}") == "http://h:8123/memory/pages/{scope}"
+    assert _otel._templated_url("http.target", f"/x/{BAD_PATH}", None) == "/<unmatched>"
+
+
+def test_attr_builders_cannot_raise_into_request_path(spans):
+    def boom(*a):
+        raise RuntimeError("builder failure " + BAD_KIND)
+    with _otel.span("guarded"):
+        _otel.set_attrs_from(boom, 1)        # must not raise
+    with _otel.span("guarded2"):
+        _otel.set_attrs_from(_otel.retain_attrs, "o", BAD_KIND, "t", BAD_VIS, object())
+    _assert_no_canary(spans)
+
+
+def test_attr_builders_skipped_when_telemetry_off(monkeypatch):
+    called = []
+    monkeypatch.setattr(_otel, "current_span", lambda: None)
+    _otel.set_attrs_from(lambda *a: called.append(1) or {}, 1)
+    assert called == []
+
+
+def test_worker_sigterm_untouched_when_telemetry_off(monkeypatch):
+    import signal
+    from app import worker
+    monkeypatch.setattr(worker.telemetry, "configure", lambda *a, **k: None)
+    prev = signal.getsignal(signal.SIGTERM)
+    try:
+        assert worker.setup_telemetry() is False
+        assert signal.getsignal(signal.SIGTERM) is prev
+        # positive control: with a provider the handler is installed
+        monkeypatch.setattr(worker.telemetry, "configure", lambda *a, **k: object())
+        assert worker.setup_telemetry() is True
+        assert signal.getsignal(signal.SIGTERM) is not prev
+    finally:
+        signal.signal(signal.SIGTERM, prev)
+
+
+def test_mcp_script_removes_backend_path_when_import_fails():
+    import subprocess
+    script = os.path.join(os.path.dirname(__file__), "..", "..", "scripts", "ames_mcp_server.py")
+    code = (
+        "import sys, importlib.util\n"
+        "sys.modules['app'] = None\n"       # makes `from app import telemetry` fail
+        f"spec = importlib.util.spec_from_file_location('m', {script!r})\n"
+        "m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)\n"
+        "assert m._otel is None\n"
+        "assert not any(p.rstrip('/').endswith('backend') for p in sys.path), sys.path\n"
+        "print('OK')\n")
+    r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+    assert "OK" in r.stdout, r.stdout + r.stderr

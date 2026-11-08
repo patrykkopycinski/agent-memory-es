@@ -215,13 +215,22 @@ def install_sigterm_flush() -> None:
     signal.signal(signal.SIGTERM, _on_term)
 
 
+def setup_telemetry() -> bool:
+    """configure() returns None unless AMES_OTEL_ENABLED and an OTLP endpoint are
+    set. Only then is there a span batch to flush on SIGTERM; with telemetry off,
+    SIGTERM keeps its default action."""
+    if telemetry.configure() is None:
+        return False
+    install_sigterm_flush()
+    return True
+
+
 if __name__ == "__main__":
     # docker-compose.yml / docker-compose.quickstart.yml run
     # `python -m app.worker`: without this entry the module imports, exits 0,
     # and the container crash-loops under `restart: unless-stopped`.
     import sys
-    telemetry.configure()   # no-op unless AMES_OTEL_ENABLED and an OTLP endpoint are set
-    install_sigterm_flush()
+    setup_telemetry()
     if "--backfill" in sys.argv:
         from .facts import backfill_loop
         backfill_loop()

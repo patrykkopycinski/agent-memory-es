@@ -20,12 +20,16 @@ import urllib.request
 # Tracing reuses the backend's telemetry module (same gate, exporter and privacy
 # scrubber) when it is importable, i.e. this script runs from a repo checkout or
 # the backend package is on PYTHONPATH. Otherwise the server runs untraced.
+_BACKEND_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "backend")
+sys.path.insert(0, _BACKEND_DIR)
 try:
-    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                    "..", "backend"))
     from app import telemetry as _otel
-except Exception:  # pragma: no cover - minimal install
+except Exception:  # minimal install: leave no `backend/` entry shadowing `app`
     _otel = None
+    try:
+        sys.path.remove(_BACKEND_DIR)
+    except ValueError:
+        pass
 
 MAX_RECALL_SIZE = 50   # keep equal to backend app.memory.MAX_RECALL_SIZE (a test pins it)
 
