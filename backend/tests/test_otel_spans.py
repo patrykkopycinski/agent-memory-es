@@ -401,7 +401,7 @@ def test_es_error_body_canary_never_reaches_spans_or_logs(spans, monkeypatch, ca
     import io
     import urllib.error
     import urllib.request
-    from app.store import es
+    from app.store import PREFIX, es
 
     def boom(req, timeout=None):
         raise urllib.error.HTTPError(
@@ -411,7 +411,7 @@ def test_es_error_body_canary_never_reaches_spans_or_logs(spans, monkeypatch, ca
 
     with _otel.span("memory.recall"):
         with pytest.raises(RuntimeError) as ei:
-            es("POST", "/amtest_am_semantic/_search", {"query": {"match_all": {}}})
+            es("POST", "/%sam_semantic/_search" % PREFIX, {"query": {"match_all": {}}})
     assert CANARY in str(ei.value), "the error itself must stay informative to the caller"
 
     es_spans = _by_name(spans, "es.request")
