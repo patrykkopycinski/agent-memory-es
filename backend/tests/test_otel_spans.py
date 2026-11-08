@@ -72,7 +72,12 @@ def spans(exporter):
 @pytest.fixture(scope="module")
 def owner():
     key = auth.create_key("otel-alice", person="otel-alice")
-    return key
+    yield key
+    # promoted/retained docs are visible to other suites sharing this ES: remove them
+    from app.store import es, idx
+    for kind in ("semantic", "episodic", "procedural"):
+        es("POST", f"/{idx(kind)}/_delete_by_query?refresh=true",
+           {"query": {"term": {"owner_id": "otel-alice"}}})
 
 
 @pytest.fixture(scope="module")
@@ -199,7 +204,11 @@ def test_retain_span(spans, client, owner):
     assert "ames.owner_hash" in a and len(a["ames.owner_hash"]) == 12
 
 
-def test_promote_and_reflect_spans(spans, client, owner):
+def test_promote_and_reflect_spans(spans, client, owner, monkeypatch):
+    # reflect calls the LLM gateway; stub it so the test needs no live model
+    from app import llm as _llm
+    monkeypatch.setattr(_llm, "rewrite_queries", lambda q, n=2: [q + " rewrite"])
+    monkeypatch.setattr(_llm, "chat", lambda q, sources: "stub answer")
     doc = client.post("/memory/retain", headers=H(owner),
                       json={"kind": "semantic",
                             "text": "convention: otel span names use dotted lowercase",
