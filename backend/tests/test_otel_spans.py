@@ -71,7 +71,7 @@ def spans(exporter):
 
 @pytest.fixture(scope="module")
 def owner():
-    key = auth.create_key("otel-alice")
+    key = auth.create_key("otel-alice", person="otel-alice")
     return key
 
 
@@ -225,9 +225,10 @@ def test_promote_and_reflect_spans(spans, client, owner):
     assert "memory.hits.total" in ra
 
 
-def test_admin_endpoint_is_traced(spans, client):
+def test_admin_endpoint_is_traced(spans, client, monkeypatch):
+    monkeypatch.setenv("AMES_ADMIN_TOKEN", "dev-admin")
     r = client.post("/admin/keys", headers={"X-Admin-Token": "dev-admin"},
-                    params={"owner_id": "otel-admin-probe"})
+                    params={"owner_id": "otel-admin-probe", "person": "otel-admin-probe"})
     assert r.status_code == 200, r.text
     server = _by_name(spans, "POST /admin/keys")
     assert server, "admin endpoints must be traced like the rest"
