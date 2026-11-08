@@ -9,11 +9,13 @@ httpx>=0.27
 onnxruntime==1.31.1
 tokenizers==0.23.3
 numpy==2.5.4
-# OpenTelemetry: OTLP http/protobuf export to the telemetry-stack collector.
-# app/telemetry.py degrades to a no-op when these are absent, so the backend
-# still boots in a minimal image.
-opentelemetry-api>=1.27
-opentelemetry-sdk>=1.27
-opentelemetry-exporter-otlp>=1.27
-opentelemetry-instrumentation-fastapi>=0.48b0
-opentelemetry-instrumentation-elasticsearch>=0.48b0
+# OpenTelemetry: OTLP http/protobuf trace export to an OTLP collector. Exact pins:
+# api/sdk/exporter ship in lockstep (1.x) and the instrumentation (0.xb) is built against
+# that exact SDK release. app/telemetry.py degrades to a no-op when these are absent, so the
+# backend still boots in a minimal image. Tracing stays off unless AMES_OTEL_ENABLED=1 and
+# OTEL_EXPORTER_OTLP_ENDPOINT is set. No ES-client instrumentation package: the ES calls are
+# traced by hand (store.es) because the backend talks to ES over urllib.
+opentelemetry-api==1.43.0
+opentelemetry-sdk==1.43.0
+opentelemetry-exporter-otlp-proto-http==1.43.0
+opentelemetry-instrumentation-fastapi==0.64b0

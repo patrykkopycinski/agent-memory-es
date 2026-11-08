@@ -19,8 +19,6 @@ from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
     InMemorySpanExporter,
 )
-from opentelemetry.sdk.trace import TracerProvider
-from opentelemetry.sdk.resources import Resource
 
 from fastapi.testclient import TestClient
 
@@ -39,11 +37,12 @@ SECRET_QUERY = "zebra-callsign-quantum-muffin"
 def exporter():
     """In-memory span pipeline, attached to the app for the whole module."""
     exp = InMemorySpanExporter()
-    provider = TracerProvider(resource=Resource.create({
+    # build_provider() is the production builder: scrubber first, then the
+    # exporter's processor. The tests therefore run the real privacy pipeline.
+    provider = _otel.build_provider(SimpleSpanProcessor(exp), {
         "service.name": "agent-memory-es-test",
         "deployment.environment.name": "test",
-    }))
-    provider.add_span_processor(SimpleSpanProcessor(exp))
+    })
 
     # configure(tracer_provider=...) is the documented test seam: it pins
     # app/telemetry.py to this provider and bypasses the AMES_OTEL_ENABLED gate.
@@ -234,9 +233,13 @@ def test_promote_and_reflect_spans(spans, client, owner, monkeypatch):
     assert "memory.hits.total" in ra
 
 
-def test_admin_endpoint_is_traced(spans, client, monkeypatch):
+def _admin_headers(monkeypatch):
     monkeypatch.setenv("AMES_ADMIN_TOKEN", "dev-admin")
-    r = client.post("/admin/keys", headers={"X-Admin-Token": "dev-admin"},
+    return {"X-Admin-Token": "dev-admin"}
+
+
+def test_admin_endpoint_is_traced(spans, client, monkeypatch):
+    r = client.post("/admin/keys", headers=_admin_headers(monkeypatch),
                     params={"owner_id": "otel-admin-probe", "person": "otel-admin-probe"})
     assert r.status_code == 200, r.text
     server = _by_name(spans, "POST /admin/keys")
@@ -303,21 +306,476 @@ def test_attribute_values_are_otlp_scalars(spans, client, owner):
 # --- the no-op contract -----------------------------------------------------
 
 def test_telemetry_helpers_are_safe_without_a_provider(monkeypatch):
-    """With telemetry unconfigured every helper is a silent no-op, and a failing
-    body still raises (telemetry must never swallow or invent errors)."""
+    """With telemetry unconfigured every helper is a silent no-op: no span is
+    created even when someone else installed a recording global provider, and a
+    failing body's error still propagates."""
     saved = dict(_otel._state)
     _otel.reset()
     try:
-        # The module provider is dropped, so spans (if any) fall back to the
-        # process-global tracer — the SDK keeps the first global it was given,
-        # so "no span at all" is not assertable here. What IS the contract:
-        # helpers never raise, and a failing body's error still propagates.
         with _otel.span("nope", {"a": 1}) as sp:
-            assert sp is None or sp.is_recording()
+            assert sp is None, "tracing off must yield no span at all"
+        assert _otel.current_span() is None or \
+            not _otel.current_span().get_span_context().is_valid
         _otel.set_attrs({"a": 1})
         _otel.add_event("e")
         with pytest.raises(ZeroDivisionError):
             with _otel.span("boom"):
                 raise ZeroDivisionError("body error must propagate")
+    finally:
+        _otel._state.update(saved)
+
+
+def test_recording_global_provider_does_not_revive_disabled_tracing():
+    """Negative control for the no-op test: a recording global tracer exists, and
+    our spans must still not use it while the module provider is unset."""
+    exp = InMemorySpanExporter()
+    other = _otel.build_provider(SimpleSpanProcessor(exp))
+    saved = dict(_otel._state)
+    _otel.reset()
+    try:
+        with other.get_tracer("x").start_as_current_span("outer"):
+            with _otel.span("must-not-record"):
+                pass
+        assert [s.name for s in exp.get_finished_spans()] == ["outer"]
+    finally:
+        _otel._state.update(saved)
+
+
+# --- P1-1: off by default, no implicit endpoint ------------------------------
+
+def test_default_is_off_without_endpoint(monkeypatch):
+    for var in ("OTEL_EXPORTER_OTLP_ENDPOINT", "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.delenv("AMES_OTEL_ENABLED", raising=False)
+    saved = dict(_otel._state)
+    try:
+        _otel.reset()
+        assert _otel.enabled() is False
+        assert _otel.configure() is None
+        from fastapi import FastAPI
+        assert _otel.instrument_fastapi(FastAPI()) is False
+        # enabled alone is still not enough: an endpoint has to be named
+        monkeypatch.setenv("AMES_OTEL_ENABLED", "1")
+        _otel.reset()
+        assert _otel.configure() is None
+        assert _otel.instrument_fastapi(FastAPI()) is False
+    finally:
+        _otel._state.update(saved)
+
+
+def test_endpoint_without_enable_flag_is_still_off(monkeypatch):
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://collector.invalid:4318")
+    monkeypatch.setenv("AMES_OTEL_ENABLED", "0")
+    saved = dict(_otel._state)
+    try:
+        _otel.reset()
+        assert _otel.configure() is None
+    finally:
+        _otel._state.update(saved)
+
+
+# --- P1-2: exception content never leaves the process -------------------------
+
+CANARY = "CANARY-es-body-7f3a9c"
+
+
+def _everything(spans_):
+    """Every string a span could export: attrs, event names + attrs, status."""
+    blob = []
+    for s in spans_.get_finished_spans():
+        blob.append(s.name)
+        for k, v in (s.attributes or {}).items():
+            blob.append(f"{k}={v}")
+        for ev in (s.events or []):
+            blob.append(str(ev.name))
+            for k, v in (ev.attributes or {}).items():
+                blob.append(f"{k}={v}")
+        blob.append(str(getattr(s.status, "description", "") or ""))
+    return " | ".join(blob)
+
+
+def test_es_error_body_canary_never_reaches_spans_or_logs(spans, monkeypatch, caplog):
+    """Force a real ES 400 whose body echoes a planted canary, as ES does with
+    query text. The canary must be on no span attribute, event or status, and in
+    no log record the telemetry layer could export."""
+    import io
+    import urllib.error
+    import urllib.request
+    from app.store import es
+
+    def boom(req, timeout=None):
+        raise urllib.error.HTTPError(
+            req.full_url, 400, "Bad Request", {},
+            io.BytesIO(('{"error":{"reason":"parse failure near %s"}}' % CANARY).encode()))
+    monkeypatch.setattr(urllib.request, "urlopen", boom)
+
+    with _otel.span("memory.recall"):
+        with pytest.raises(RuntimeError) as ei:
+            es("POST", "/amtest_am_semantic/_search", {"query": {"match_all": {}}})
+    assert CANARY in str(ei.value), "the error itself must stay informative to the caller"
+
+    es_spans = _by_name(spans, "es.request")
+    assert es_spans, "failed ES call must still produce a span"
+    a = _attrs(es_spans[0])
+    assert a["error.type"] == "HTTPError"
+    assert es_spans[0].status.status_code.name == "ERROR"
+    # status carries the raised class (RuntimeError wraps the HTTPError), never text
+    assert es_spans[0].status.description == "RuntimeError"
+    assert not [e for e in es_spans[0].events if e.name == "exception"], \
+        "record_exception must not be used"
+    assert CANARY not in _everything(spans)
+    assert CANARY not in caplog.text
+    import logging
+    assert not [h for h in logging.getLogger().handlers
+                if type(h).__name__ == "LoggingHandler"], \
+        "no OTLP log bridge may be attached: it would export exception text"
+
+
+def test_third_party_exception_events_are_scrubbed(spans):
+    """The ASGI middleware calls record_exception on its own spans; the
+    SpanProcessor must remove message + stacktrace from those too."""
+    tr = _otel.tracer()
+    with pytest.raises(ValueError):
+        with tr.start_as_current_span("third.party") as sp:  # record_exception default True
+            raise ValueError(CANARY)
+    s = _by_name(spans, "third.party")[0]
+    assert s.events, "precondition: the SDK did record an exception event"
+    assert CANARY not in _everything(spans)
+    for ev in s.events:
+        assert "exception.message" not in (ev.attributes or {})
+        assert "exception.stacktrace" not in (ev.attributes or {})
+    assert s.status.description in (None, "", "ValueError")
+
+
+def test_unhandled_route_error_keeps_class_only(spans, client, owner, monkeypatch):
+    from app import memory
+
+    def blow(*a, **k):
+        raise RuntimeError("ES POST /x -> 400: " + CANARY)
+    monkeypatch.setattr(memory, "recall", blow)
+    c = TestClient(app, raise_server_exceptions=False)
+    r = c.post("/memory/recall", headers=H(owner), json={"query": "q"})
+    assert r.status_code == 500
+    assert CANARY not in _everything(spans)
+
+
+# --- P1-3: no parentless es.request noise -------------------------------------
+
+def test_idle_es_call_without_parent_emits_nothing(spans):
+    from app.store import es
+    es("GET", "/_cluster/health")          # what an idle worker poll does
+    assert not _by_name(spans, "es.request")
+
+
+def test_unparented_es_call_is_emitted_when_slow(spans, monkeypatch):
+    monkeypatch.setenv("AMES_OTEL_ES_SLOW_MS", "0")
+    from app.store import es
+    es("GET", "/_cluster/health")
+    out = _by_name(spans, "es.request")
+    assert len(out) == 1
+    a = _attrs(out[0])
+    assert a["ames.unparented"] is True and a["ames.slow"] is True
+    assert a["db.system"] == "elasticsearch"
+
+
+def test_unparented_es_call_is_emitted_when_failed(spans, monkeypatch):
+    import io
+    import urllib.error
+    import urllib.request
+    from app.store import es
+
+    def boom(req, timeout=None):
+        raise urllib.error.HTTPError(req.full_url, 500, "x", {}, io.BytesIO(b"{}"))
+    monkeypatch.setattr(urllib.request, "urlopen", boom)
+    with pytest.raises(RuntimeError):
+        es("GET", "/_cluster/health")
+    out = _by_name(spans, "es.request")
+    assert len(out) == 1 and _attrs(out[0])["error.type"] == "HTTPError"
+    assert _attrs(out[0])["ames.unparented"] is True
+
+
+def test_worker_job_span_parents_its_es_calls(spans, monkeypatch):
+    """A claimed fact job opens worker.job; its es.request children join it and
+    the job carries counts + ES write latency. An empty poll emits nothing."""
+    from app import facts
+
+    # empty poll: no job claimed -> no spans at all
+    monkeypatch.setattr(facts, "claim", lambda *a, **k: None)
+    assert facts.run_once() is False
+    assert not spans.get_finished_spans()
+
+    from app.store import es
+    finished = {}
+    monkeypatch.setattr(facts, "claim", lambda *a, **k: (
+        "job-1", {"source_id": "s", "owner_id": "o", "attempts": 0,
+                  "transient_retries": 0, "state": "running"}, "tok"))
+    monkeypatch.setattr(facts, "_finish", lambda *a, **k: finished.update(k, args=a))
+
+    def fake_process(source_id, owner_id, abort=None):
+        es("GET", "/_cluster/health")      # child call joins worker.job
+        _otel.set_attrs({"worker.job.passages": 2, "worker.job.facts": 3,
+                         "worker.job.facts_written": 3, "worker.job.es_write_ms": 4.5})
+    monkeypatch.setattr(facts, "process", fake_process)
+    assert facts.run_once() is True
+    job = _by_name(spans, "worker.job")
+    assert len(job) == 1
+    a = _attrs(job[0])
+    assert a["worker.job.kind"] == "fact_extraction"
+    assert a["worker.job.outcome"] == "completed"
+    assert a["worker.job.facts"] == 3 and a["worker.job.es_write_ms"] == 4.5
+    child = _by_name(spans, "es.request")
+    assert child and child[0].parent.span_id == job[0].context.span_id
+    assert "ames.unparented" not in _attrs(child[0])
+
+
+def test_worker_job_failure_records_class_only(spans, monkeypatch):
+    from app import facts
+    monkeypatch.setattr(facts, "claim", lambda *a, **k: (
+        "job-2", {"source_id": "s", "owner_id": "o", "attempts": 0,
+                  "transient_retries": 0, "state": "running"}, "tok"))
+    monkeypatch.setattr(facts, "_finish", lambda *a, **k: None)
+    monkeypatch.setattr(facts, "process",
+                        lambda *a, **k: (_ for _ in ()).throw(ValueError(CANARY)))
+    facts.run_once()
+    a = _attrs(_by_name(spans, "worker.job")[0])
+    assert a["error.type"] == "ValueError" and a["worker.job.outcome"] == "pending"
+    assert CANARY not in _everything(spans)
+
+
+def test_backfill_span_wraps_the_run(spans, monkeypatch):
+    from app import facts
+    monkeypatch.setattr(facts, "claim_backfill",
+                        lambda: ("k", {"visibility": "private", "owner_id": "o"}, "tok"))
+    monkeypatch.setattr(facts, "_heartbeat", lambda *a, **k: None)
+
+    def fake_run(key, doc, token, **kw):
+        _otel.set_attrs({"worker.backfill.queued": 7})
+    monkeypatch.setattr(facts, "_run_backfill", fake_run)
+    assert facts.run_backfill_once() is True
+    a = _attrs(_by_name(spans, "worker.backfill")[0])
+    assert a["worker.job.kind"] == "backfill"
+    assert a["worker.backfill.queued"] == 7 and a["worker.job.outcome"] == "completed"
+    assert "o" != a.get("worker.backfill.visibility")  # visibility only, no owner
+
+    monkeypatch.setattr(facts, "_run_backfill",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError(CANARY)))
+    monkeypatch.setattr(facts, "_update_backfill", lambda *a, **k: None)
+    spans.clear()
+    facts.run_backfill_once()
+    a = _attrs(_by_name(spans, "worker.backfill")[0])
+    assert a["worker.job.outcome"] == "failed" and a["error.type"] == "RuntimeError"
+    assert CANARY not in _everything(spans)
+
+
+def test_consolidate_pass_span(spans, monkeypatch):
+    from app import worker
+    monkeypatch.setattr(worker, "known_owners", lambda: [])
+    assert worker.run_once() == {}
+    assert not spans.get_finished_spans(), "a pass over zero owners emits nothing"
+
+    monkeypatch.setattr(worker, "known_owners", lambda: ["o1", "o2"])
+    monkeypatch.setattr(worker, "_consolidate_owners", lambda owners: {
+        o: {"proposals": 1, "superseded": 2, "model_drafts": 0} for o in owners})
+    worker.run_once()
+    a = _attrs(_by_name(spans, "worker.consolidate")[0])
+    assert a["worker.owners"] == 2 and a["worker.proposals"] == 2
+    assert a["worker.superseded"] == 4
+
+
+# --- P2-1: query strings never reach URL attributes ---------------------------
+
+def test_query_string_canaries_stripped_from_url_attributes(spans, client, monkeypatch):
+    r = client.post("/admin/keys", headers=_admin_headers(monkeypatch),
+                    params={"owner_id": "CANARYOWNER-91c", "person": "CANARYPERSON-42d"})
+    assert r.status_code == 200, r.text
+    server = _by_name(spans, "POST /admin/keys")[0]
+    assert "CANARYOWNER" not in _everything(spans)
+    assert "CANARYPERSON" not in _everything(spans)
+    a = _attrs(server)
+    assert "url.query" not in a
+    for key in ("http.target", "http.url", "url.full"):
+        if key in a:
+            assert "?" not in a[key], (key, a[key])
+    assert a.get("http.target", "/admin/keys") == "/admin/keys"
+
+
+def test_no_header_capture_attributes(spans, client, owner):
+    client.post("/memory/recall", headers=H(owner), json={"query": "q"})
+    for s in spans.get_finished_spans():
+        for k in (s.attributes or {}):
+            assert not k.startswith(("http.request.header.", "http.response.header."))
+
+
+# --- P2-3: the scan itself must be able to fail ------------------------------
+
+def test_leak_scan_negative_control(spans):
+    """Plant a canary in an attribute that bypasses the scrubber's rules (a plain
+    attribute) and prove the scan finds it, so a green no-leak test means something."""
+    with _otel.span("planted", {"planted.text": "PLANTED-CANARY-d00d"}):
+        pass
+    assert "PLANTED-CANARY-d00d" in _everything(spans)
+
+
+def test_missing_otel_packages_do_not_break_the_app():
+    """Minimal image: opentelemetry not installed. app.main must import and
+    /health must answer."""
+    import subprocess
+    code = (
+        "import sys\n"
+        "for m in ('opentelemetry','opentelemetry.trace','opentelemetry.sdk',\n"
+        "          'opentelemetry.sdk.trace','opentelemetry.sdk.resources',\n"
+        "          'opentelemetry.instrumentation.fastapi'):\n"
+        "    sys.modules[m] = None\n"
+        "from fastapi.testclient import TestClient\n"
+        "from app import telemetry\n"
+        "import app.main as m\n"
+        "assert telemetry._HAVE_API is False\n"
+        "with telemetry.span('x') as sp: assert sp is None\n"
+        "r = TestClient(m.app).get('/health')\n"
+        "assert r.status_code == 200, r.text\n"
+        "print('OK')\n")
+    env = dict(os.environ, AMES_OTEL_ENABLED="1",
+               OTEL_EXPORTER_OTLP_ENDPOINT="http://collector.invalid:4318")
+    out = subprocess.run([sys.executable, "-c", code], cwd=os.path.join(
+        os.path.dirname(__file__), ".."), env=env, capture_output=True, text=True,
+        timeout=120)
+    assert out.returncode == 0 and "OK" in out.stdout, out.stderr[-2000:]
+
+
+# --- P2-4: flush on shutdown --------------------------------------------------
+
+def test_shutdown_hook_flushes_provider(monkeypatch):
+    from app import main
+    called = []
+    monkeypatch.setattr(_otel, "shutdown", lambda: called.append("shutdown"))
+    main._shutdown()
+    assert called == ["shutdown"]
+
+
+def test_worker_sigterm_handler_flushes_then_exits(monkeypatch):
+    import signal
+    from app import worker
+    called = []
+    monkeypatch.setattr(worker.telemetry, "shutdown", lambda: called.append(1))
+    prev = signal.getsignal(signal.SIGTERM)
+    try:
+        worker.install_sigterm_flush()
+        handler = signal.getsignal(signal.SIGTERM)
+        assert handler not in (signal.SIG_DFL, signal.SIG_IGN, prev)
+        with pytest.raises(SystemExit) as ei:
+            handler(signal.SIGTERM, None)
+        assert ei.value.code == 0 and called == [1]
+    finally:
+        signal.signal(signal.SIGTERM, prev)
+
+
+# --- B2: recall quality signal --------------------------------------------------
+
+def test_recall_quality_attributes_on_recall_span(spans, client, owner):
+    client.post("/memory/retain", headers=H(owner),
+                json={"kind": "semantic", "text": SECRET_MEMORY, "visibility": "private"})
+    spans.clear()
+    r = client.post("/memory/recall", headers=H(owner), json={"query": SECRET_QUERY})
+    assert r.status_code == 200 and r.json()["fused"]
+    a = _attrs(_by_name(spans, "memory.recall")[0])
+    assert a["memory.recall.quality.hit_count"] >= 1
+    assert a["memory.recall.quality.empty"] is False
+    top, lo = a["memory.recall.quality.top_score"], a["memory.recall.quality.min_score"]
+    assert top >= lo and a["memory.recall.quality.score_spread"] == pytest.approx(top - lo, abs=1e-5)
+    assert all(isinstance(v, (bool, int, float)) for k, v in a.items()
+               if k.startswith("memory.recall.quality."))
+
+
+def test_recall_quality_empty_result_flag():
+    q = _otel.recall_quality_attrs([])
+    assert q == {"memory.recall.quality.hit_count": 0, "memory.recall.quality.empty": True}
+    q = _otel.recall_quality_attrs([{"score": 0.5, "text": "T"}, {"score": 0.2}])
+    assert q["memory.recall.quality.top_score"] == 0.5
+    assert q["memory.recall.quality.score_spread"] == pytest.approx(0.3)
+    assert not any(isinstance(v, str) for v in q.values())
+
+
+# --- B2: MCP tool-call spans + trace propagation --------------------------------
+
+def _load_stdio_mcp():
+    import importlib.util
+    path = os.path.join(os.path.dirname(__file__), "..", "..", "scripts", "ames_mcp_server.py")
+    spec = importlib.util.spec_from_file_location("ames_mcp_server_otel", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_stdio_mcp_tool_call_span_and_traceparent(spans, monkeypatch):
+    mod = _load_stdio_mcp()
+    assert mod._otel is _otel or mod._otel.__name__.endswith("telemetry")
+    seen = {}
+
+    class R:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def read(self, *a): return b'{"fused":[{"score":0.9},{"score":0.4}],"abstained":false}'
+
+    import urllib.request
+
+    def fake_urlopen(req, timeout=None):
+        seen["headers"] = {k.lower(): v for k, v in req.header_items()}
+        return R()
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(mod.json, "load", lambda r: {"fused": [{"score": 0.9}, {"score": 0.4}],
+                                                     "abstained": False})
+    res = mod.dispatch("http://backend.invalid", "ame_KEY", "ames_recall",
+                       {"query": "CANARY-mcp-query"})
+    assert res["fused"]
+    sp = _by_name(spans, "mcp.tool_call")
+    assert len(sp) == 1
+    a = _attrs(sp[0])
+    assert a["mcp.tool.name"] == "ames_recall"
+    assert a["mcp.result.fused"] == 2
+    assert a["memory.recall.quality.hit_count"] == 2
+    assert a["mcp.latency_ms"] >= 0
+    # traceparent carries the MCP span's own context
+    tp = seen["headers"]["traceparent"]
+    ver, trace_id, span_id, flags = tp.split("-")
+    assert int(trace_id, 16) == sp[0].context.trace_id
+    assert int(span_id, 16) == sp[0].context.span_id
+    assert "CANARY-mcp-query" not in _everything(spans)
+    assert "ame_KEY" not in _everything(spans)
+
+
+def test_stdio_mcp_unknown_tool_name_is_not_recorded(spans):
+    mod = _load_stdio_mcp()
+    with pytest.raises(ValueError):
+        mod.dispatch("http://backend.invalid", "k", "CANARY-tool-name", {})
+    sp = _by_name(spans, "mcp.tool_call")[0]
+    assert _attrs(sp)["mcp.tool.name"] == "unknown"
+    assert sp.status.status_code.name == "ERROR"
+    assert "CANARY-tool-name" not in _everything(spans)
+
+
+def test_mcp_trace_connects_to_backend_server_span(spans, client, owner):
+    """End to end in-process: the traceparent the MCP server injects makes the
+    backend HTTP server span a child, memory.recall and es.request follow."""
+    with _otel.span("mcp.tool_call", {"mcp.tool.name": "ames_recall"}, otel_kind="server") as mcp_sp:
+        headers = _otel.inject_headers({**H(owner)})
+        assert "traceparent" in headers
+        r = client.post("/memory/recall", headers=headers, json={"query": SECRET_QUERY})
+    assert r.status_code == 200
+    mcp_span = _by_name(spans, "mcp.tool_call")[0]
+    server = _by_name(spans, "POST /memory/recall")[0]
+    dom = _by_name(spans, "memory.recall")[0]
+    es_spans = _by_name(spans, "es.request")
+    assert server.context.trace_id == mcp_span.context.trace_id
+    assert server.parent.span_id == mcp_span.context.span_id
+    assert dom.parent.span_id == server.context.span_id
+    assert es_spans and all(s.context.trace_id == mcp_span.context.trace_id for s in es_spans)
+    assert "memory.recall.quality.hit_count" in _attrs(dom)
+
+
+def test_inject_headers_is_noop_when_tracing_off():
+    saved = dict(_otel._state)
+    _otel.reset()
+    try:
+        assert _otel.inject_headers({"a": "b"}) == {"a": "b"}
     finally:
         _otel._state.update(saved)

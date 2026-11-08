@@ -159,7 +159,8 @@ def es(method: str, path: str, body: Optional[dict] = None, timeout: float = 30)
         _es_url() + path, data=data, method=method,
         headers=_es_headers(),
     )
-    with _otel.span("es.request", _otel.es_attrs(method, path, None)):
+    with _otel.span("es.request", _otel.es_attrs(method, path, None),
+                    require_parent=True):
         try:
             result = json.load(urllib.request.urlopen(req, timeout=timeout))
         except urllib.error.HTTPError as e:

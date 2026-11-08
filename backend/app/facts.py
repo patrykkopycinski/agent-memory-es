@@ -11,6 +11,7 @@ import threading
 
 from . import embeddings, llm
 from . import http_retry
+from . import telemetry as _otel
 from .store import es, idx, is_doc_miss, PREFIX, knn_num_candidates
 
 log = logging.getLogger(__name__)
@@ -369,7 +370,10 @@ def process(source_id, owner_id, abort=None):
         raise SourceGone(SKIP_MESSAGE)
     date = _date(source["occurred_at"])
     passages = _passages(source_id, source)
+    n_facts = n_written = 0
+    write_ms = 0.0
     for fact in _document_facts(passages, date):
+        n_facts += 1
         check_abort()
         fact_id = hashlib.sha256(f"{owner_id}\0{source_id}\0{fact}".encode()).hexdigest()
         # Retry after a partial failure must finish any missing history links.
@@ -398,24 +402,41 @@ def process(source_id, owner_id, abort=None):
             if source.get("tags"):
                 doc["tags"] = list(source["tags"])      # tag-based cleanup must reach derived facts
             check_abort()
+            t_write = time.perf_counter()
             try:
                 es("PUT", f"/{idx('semantic')}/_create/{fact_id}?refresh=true", doc)
+                n_written += 1
             except RuntimeError as exc:
                 if "-> 409:" not in str(exc):
                     raise
+            finally:
+                write_ms += (time.perf_counter() - t_write) * 1000.0
         for old_id in replacements:
             # Script is idempotent and guarded against racing updates to historical intervals.
             es("POST", f"/{idx('semantic')}/_update/{old_id}?refresh=true", {"script": {
                 "source": "if (ctx._source.owner_id == params.owner && ctx._source.visibility == params.scope && (ctx._source.valid_to == null || ctx._source.superseded_by == params.newid)) { ctx._source.valid_to = params.date; ctx._source.superseded_by = params.newid; }",
                 "params": {"owner": owner_id, "scope": source["visibility"], "newid": fact_id, "date": date}}})
+    _otel.set_attrs({"worker.job.passages": len(passages),
+                     "worker.job.facts": n_facts,
+                     "worker.job.facts_written": n_written,
+                     "worker.job.es_write_ms": round(write_ms, 3)})
 
 
 def run_once(owner_id=None, job_id=None, on_claim=None, on_finish=None, abort=None):
     claimed = claim(owner_id, job_id, lease_seconds=BACKFILL_LEASE_SECONDS) if on_claim else (
         claim(owner_id, job_id) if owner_id or job_id else claim())
     if claimed is None:
-        return False
+        return False       # empty poll: no span, nothing worth recording
     job_id, job, token = claimed
+    with _otel.span("worker.job", {
+            "worker.job.kind": "fact_extraction",
+            "worker.job.attempts": job.get("attempts", 0),
+            "worker.job.transient_retries": job.get("transient_retries", 0)}):
+        return _run_claimed(job_id, job, token, on_claim, on_finish, abort)
+
+
+def _run_claimed(job_id, job, token, on_claim, on_finish, abort):
+    outcome = _otel.set_attrs
     try:
         if on_claim:
             on_claim(job_id, token)
@@ -428,15 +449,20 @@ def run_once(owner_id=None, job_id=None, on_claim=None, on_finish=None, abort=No
         if abort is not None and abort.is_set():
             raise BackfillHeartbeatAbort("backfill heartbeat abort (lease renewal failed)")
     except BackfillHeartbeatAbort:
+        outcome({"worker.job.outcome": "requeued"})
         _finish(job_id, token, "pending", next_at=_iso(_now()))
     except SourceGone:
+        outcome({"worker.job.outcome": "source_gone"})
         log.info("fact extraction job %s: %s", job_id, SKIP_MESSAGE)
         _finish(job_id, token, "completed", error=SKIP_MESSAGE, finished_at=_iso(_now()))
     except Exception as exc:
+        outcome({"error.type": type(exc).__name__})
         if abort is not None and abort.is_set():
+            outcome({"worker.job.outcome": "requeued"})
             _finish(job_id, token, "pending", next_at=_iso(_now()))
             return True
         if http_retry.is_transient(exc):
+            outcome({"worker.job.outcome": "transient_retry"})
             # Transient upstream failure: requeue WITHOUT consuming an attempt.
             transient = job.get("transient_retries", 0) + 1
             if job.get("transient_retries", 0) >= http_retry.MAX_TRANSIENT_RETRIES:
@@ -455,6 +481,7 @@ def run_once(owner_id=None, job_id=None, on_claim=None, on_finish=None, abort=No
             return True
         attempts = job["attempts"] + 1
         state = "failed" if attempts >= MAX_ATTEMPTS else "pending"
+        outcome({"worker.job.outcome": state})
         log.exception("fact extraction job %s attempt %d %s", job_id, attempts, state)
         _finish(job_id, token, state, attempts=attempts, error=str(exc)[:900],
                 next_at=_iso(_now() + dt.timedelta(seconds=min(300, 2 ** attempts * 5))),
@@ -462,6 +489,7 @@ def run_once(owner_id=None, job_id=None, on_claim=None, on_finish=None, abort=No
     else:
         # Finalization failures are not extraction failures. Leave the lease for
         # reclaim rather than charging a successfully processed source an attempt.
+        outcome({"worker.job.outcome": "completed"})
         _finish(job_id, token, "completed", finished_at=_iso(_now()), error="")
     finally:
         if on_finish:
@@ -754,6 +782,7 @@ def _run_backfill(key, doc, token, abort=None, current_job=None, job_lock=None):
                 time.sleep(2)      # M4: only sleep when the last round made no progress
         after = hit["sort"]
         queued += 1
+        _otel.set_attrs({"worker.backfill.queued": queued})
         _untrack()
         _update_backfill(key, token, cursor=json.dumps(after), queued=queued)
 
@@ -771,18 +800,25 @@ def run_backfill_once():
         target=_heartbeat, args=(key, token, stop, abort, current_job, job_lock),
         daemon=True)
     heartbeat.start()
-    try:
-        _run_backfill(key, doc, token, abort=abort,
-                      current_job=current_job, job_lock=job_lock)
-    except Exception as exc:
-        log.exception("backfill %s failed", key)
+    with _otel.span("worker.backfill", {
+            "worker.job.kind": "backfill",
+            "worker.backfill.visibility": doc.get("visibility", "")}):
         try:
-            _update_backfill(key, token, state="failed", error=str(exc)[:900], finished_at=_iso(_now()))
-        except Exception:
-            log.exception("could not record backfill failure %s; lease will expire", key)
-    finally:
-        stop.set()
-        heartbeat.join(timeout=5)
+            _run_backfill(key, doc, token, abort=abort,
+                          current_job=current_job, job_lock=job_lock)
+        except Exception as exc:
+            _otel.set_attrs({"worker.job.outcome": "failed",
+                             "error.type": type(exc).__name__})
+            log.exception("backfill %s failed", key)
+            try:
+                _update_backfill(key, token, state="failed", error=str(exc)[:900], finished_at=_iso(_now()))
+            except Exception:
+                log.exception("could not record backfill failure %s; lease will expire", key)
+        else:
+            _otel.set_attrs({"worker.job.outcome": "completed"})
+        finally:
+            stop.set()
+            heartbeat.join(timeout=5)
     return True
 
 

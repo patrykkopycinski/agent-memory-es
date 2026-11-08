@@ -2,17 +2,20 @@
 
 Three things live here:
 
-* `configure()` — builds the SDK TracerProvider/MeterProvider with an OTLP
-  http/protobuf exporter and DELTA metrics temporality (the EDOT collector's
-  elasticsearch exporter drops cumulative histograms), resource attributes
-  `service.name` (OTEL_SERVICE_NAME, default `agent-memory-es`) and
-  `deployment.environment.name` (AMES_DEPLOYMENT_ENV, default `prod`).
+* `configure()` — builds the SDK TracerProvider with an OTLP http/protobuf
+  exporter, resource attributes `service.name` (OTEL_SERVICE_NAME, default
+  `agent-memory-es`) and `deployment.environment.name` (AMES_DEPLOYMENT_ENV,
+  default `prod`). Tracing is OFF unless AMES_OTEL_ENABLED is truthy AND an
+  OTLP endpoint is set (OTEL_EXPORTER_OTLP_ENDPOINT or
+  OTEL_EXPORTER_OTLP_TRACES_ENDPOINT); there is no default endpoint.
 * `span()` — the one context manager the app uses for its own spans. Never
   raises, never crashes the request when telemetry is off or broken.
 * attribute helpers (`set_attrs`, `record_recall`, `record_retain`, …) so the
   privacy rule lives in ONE place: spans carry kinds, visibility, counts,
   lengths and timings. Never memory text, never an API key, never an owner id
   in the clear (only the same truncated sha256 the recall log line uses).
+  Exception messages and stacktraces are never recorded: they carry request
+  and ES response bodies. Spans get the exception class name only.
 
 Everything degrades to a no-op when opentelemetry is not installed, so the
 package still imports in a minimal environment.
@@ -21,9 +24,12 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import time
 from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import Any, Iterable, Optional
+from urllib.parse import urlparse
 
 # --- optional imports -------------------------------------------------------
 try:  # pragma: no cover - exercised implicitly in the otel-less environment
@@ -40,7 +46,7 @@ except Exception:  # pragma: no cover
 
 try:  # pragma: no cover
     from opentelemetry.sdk.resources import Resource
-    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace import Event, SpanProcessor, TracerProvider
     from opentelemetry.sdk.trace.export import BatchSpanProcessor
 
     _HAVE_SDK = True
@@ -48,18 +54,19 @@ except Exception:  # pragma: no cover
     Resource = None  # type: ignore
     TracerProvider = None  # type: ignore
     BatchSpanProcessor = None  # type: ignore
+    Event = None  # type: ignore
+    SpanProcessor = object  # type: ignore
     _HAVE_SDK = False
 
 INSTRUMENTING_NAME = "ames.backend"
 INSTRUMENTING_VERSION = "0.1.0"
 
 DEFAULT_SERVICE_NAME = "agent-memory-es"
-DEFAULT_OTLP_ENDPOINT = os.environ.get("AMES_OTEL_ENDPOINT", "http://localhost:4318")
 
 # Module-level handles. `configure()` owns them; tests inject their own
 # provider so they never depend on the process-global provider (which the SDK
 # only lets you set once).
-_state: dict = {"tracer_provider": None, "meter_provider": None, "configured": False}
+_state: dict = {"tracer_provider": None, "configured": False}
 
 
 def _truthy(value: Optional[str], default: bool) -> bool:
@@ -69,15 +76,17 @@ def _truthy(value: Optional[str], default: bool) -> bool:
 
 
 def enabled() -> bool:
-    """AMES_OTEL_ENABLED wins; otherwise enabled unless explicitly off.
-
-    Off by default only when the operator opted out or the API is missing —
-    a backend that cannot reach the collector still exports into a void
-    (the exporter swallows and retries), which is not a reason to disable.
-    """
+    """Opt-in: AMES_OTEL_ENABLED must be truthy (default OFF) and the API present."""
     if not _HAVE_API:
         return False
-    return _truthy(os.environ.get("AMES_OTEL_ENABLED"), True)
+    return _truthy(os.environ.get("AMES_OTEL_ENABLED"), False)
+
+
+def endpoint_configured() -> bool:
+    """True when the operator named an OTLP endpoint. There is no default one:
+    a backend that was never pointed at a collector must not export anywhere."""
+    return bool(os.environ.get("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "").strip()
+                or os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT", "").strip())
 
 
 def owner_hash(owner_id: str) -> str:
@@ -85,25 +94,96 @@ def owner_hash(owner_id: str) -> str:
     return hashlib.sha256((owner_id or "").encode()).hexdigest()[:12]
 
 
-def _otlp_endpoint(suffix: str) -> str:
-    """Full endpoint for signals, honouring the standard OTEL env vars."""
-    explicit = os.environ.get(f"OTEL_EXPORTER_OTLP_{suffix.upper()}_ENDPOINT")
+def _otlp_traces_endpoint() -> Optional[str]:
+    """Full traces endpoint from the standard OTEL env vars, else None."""
+    explicit = os.environ.get("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "").strip()
     if explicit:
         return explicit
-    base = os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT") or DEFAULT_OTLP_ENDPOINT
-    return base.rstrip("/") + f"/v1/{suffix}"
+    base = os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT", "").strip()
+    return base.rstrip("/") + "/v1/traces" if base else None
+
+
+_EXC_ATTRS = ("exception.message", "exception.stacktrace")
+_URL_ATTRS = ("http.target", "http.url", "url.full", "url.query")
+_IDENT = re.compile(r"^[A-Za-z_][\w.]{0,80}$")
+
+
+def _scrub_event(ev):
+    attrs = dict(ev.attributes or {})
+    if not any(k in attrs for k in _EXC_ATTRS):
+        return ev
+    for k in _EXC_ATTRS:
+        attrs.pop(k, None)
+    return Event(ev.name, attrs, ev.timestamp)
+
+
+class PrivacyScrubber(SpanProcessor):
+    """Runs on every finished span, ours or an instrumentation's.
+
+    Also strips query strings from URL attributes (see `_route_only_hook`).
+
+    `record_exception` / `use_span` in third-party instrumentation (the ASGI
+    middleware) attach `exception.message` and `exception.stacktrace`, and put
+    `"Type: message"` in the ERROR status. Those carry ES response bodies and
+    request text, so the class name is all that survives.
+    """
+
+    def on_start(self, span, parent_context=None):
+        pass
+
+    def on_end(self, span):
+        try:
+            events = getattr(span, "_events", None)
+            if events:
+                span._events = tuple(_scrub_event(e) for e in events)
+            attrs = getattr(span, "_attributes", None)
+            if attrs and any(k in attrs for k in _EXC_ATTRS + _URL_ATTRS):
+                clean = {k: v for k, v in attrs.items()
+                         if k not in _EXC_ATTRS and k != "url.query"}
+                for key in ("http.target", "http.url", "url.full"):
+                    if key in clean:
+                        clean[key] = str(clean[key]).split("?", 1)[0]
+                span._attributes = clean
+            status = getattr(span, "_status", None)
+            desc = getattr(status, "description", None)
+            if desc and not _IDENT.match(desc):
+                head = desc.split(":", 1)[0].strip()
+                span._status = Status(status.status_code,
+                                      head if _IDENT.match(head) else None)
+        except Exception:
+            pass
+
+    def shutdown(self):
+        pass
+
+    def force_flush(self, timeout_millis: int = 30000) -> bool:
+        return True
+
+
+def build_provider(span_processor, resource_attrs: Optional[dict] = None):
+    """TracerProvider with the scrubber ahead of `span_processor`. The one place
+    providers are built, so tests exercise the same privacy pipeline as prod."""
+    provider = TracerProvider(resource=Resource.create(resource_attrs or {
+        "service.name": os.environ.get("OTEL_SERVICE_NAME", DEFAULT_SERVICE_NAME),
+        "deployment.environment.name": os.environ.get("AMES_DEPLOYMENT_ENV", "prod"),
+        "service.version": os.environ.get("AMES_VERSION", "0.2.0"),
+    }))
+    provider.add_span_processor(PrivacyScrubber())
+    provider.add_span_processor(span_processor)
+    return provider
 
 
 def configure(force: bool = False, tracer_provider=None,
               span_exporter=None) -> Optional[Any]:
     """Install the telemetry pipeline. Idempotent; returns the TracerProvider.
 
-    tracer_provider / span_exporter are test seams: pass a provider built with
-    a TestSpanProcessor and nothing touches the network.
+    Returns None (and exports nothing) unless AMES_OTEL_ENABLED is truthy and
+    an OTLP endpoint is configured. tracer_provider / span_exporter are test
+    seams: pass a provider and nothing touches the network.
     """
     if _state["configured"] and not force and tracer_provider is None:
         return _state["tracer_provider"]
-    if not enabled() and tracer_provider is None:
+    if tracer_provider is None and not (enabled() and endpoint_configured()):
         _state["configured"] = True
         return None
 
@@ -117,20 +197,12 @@ def configure(force: bool = False, tracer_provider=None,
                 OTLPSpanExporter,
             )
 
-            resource_attrs = {
-                "service.name": os.environ.get("OTEL_SERVICE_NAME", DEFAULT_SERVICE_NAME),
-                "deployment.environment.name": os.environ.get(
-                    "AMES_DEPLOYMENT_ENV", "prod"),
-                "service.version": os.environ.get("AMES_VERSION", "0.2.0"),
-            }
-            provider = TracerProvider(resource=Resource.create(resource_attrs))
             exporter = span_exporter or OTLPSpanExporter(
-                endpoint=_otlp_endpoint("traces"), timeout=10)
-            provider.add_span_processor(BatchSpanProcessor(exporter))
-            _maybe_start_metrics(provider)
+                endpoint=_otlp_traces_endpoint(), timeout=10)
+            provider = build_provider(BatchSpanProcessor(exporter))
         except Exception as exc:  # telemetry must never take the service down
             _state["configured"] = True
-            _warn(f"telemetry disabled: {type(exc).__name__}: {exc}")
+            _warn(f"telemetry disabled: {type(exc).__name__}")
             return None
 
     _state["tracer_provider"] = provider
@@ -140,46 +212,6 @@ def configure(force: bool = False, tracer_provider=None,
     except Exception:
         pass
     return provider
-
-
-def _maybe_start_metrics(provider) -> None:
-    """OTLP metrics with DELTA temporality (the collector needs per-interval)."""
-    try:
-        from opentelemetry.exporter.otlp.proto.http.metric_exporter import (
-            OTLPMetricExporter,
-        )
-        from opentelemetry.sdk import metrics as _sm
-        from opentelemetry.sdk.metrics.export import (
-            AggregationTemporality,
-            PeriodicExportingMetricReader,
-        )
-
-        # DELTA for every instrument type: the EDOT elasticsearch exporter
-        # drops cumulative-temporality histograms. Class names move between
-        # SDK versions (sync Gauge is `_Gauge` in some), so resolve defensively.
-        _delta = {}
-        for _name in ("Counter", "UpDownCounter", "Histogram", "Gauge",
-                      "ObservableCounter", "ObservableUpDownCounter",
-                      "ObservableGauge"):
-            _cls = getattr(_sm, _name, None) or getattr(_sm, "_" + _name, None)
-            if _cls is not None:
-                _delta[_cls] = AggregationTemporality.DELTA
-
-        reader = PeriodicExportingMetricReader(
-            OTLPMetricExporter(endpoint=_otlp_endpoint("metrics"),
-                               preferred_temporality=_delta),
-            export_interval_millis=int(os.environ.get("AMES_OTEL_METRIC_INTERVAL_MS", "15000")),
-        )
-        mp = _sm.MeterProvider(metric_readers=[reader], resource=provider.resource)
-        _state["meter_provider"] = mp
-        try:
-            from opentelemetry import metrics
-
-            metrics.set_meter_provider(mp)
-        except Exception:
-            pass
-    except Exception as exc:  # pragma: no cover - metrics are additive
-        _warn(f"metrics disabled: {type(exc).__name__}: {exc}")
 
 
 _warned: set = set()
@@ -194,27 +226,57 @@ def _warn(msg: str) -> None:
 
 
 def tracer():
-    """The tracer spans are created from (module provider, else global)."""
+    """The tracer spans are created from. None when tracing is off: our own
+    spans never fall back to a process-global provider someone else installed."""
     if not _HAVE_API:
         return None
     provider = _state.get("tracer_provider")
-    if provider is not None:
-        return provider.get_tracer(INSTRUMENTING_NAME, INSTRUMENTING_VERSION)
-    return trace.get_tracer(INSTRUMENTING_NAME, INSTRUMENTING_VERSION)
+    if provider is None:
+        return None
+    return provider.get_tracer(INSTRUMENTING_NAME, INSTRUMENTING_VERSION)
+
+
+class _Pending:
+    """Stand-in span for an unparented leaf (an idle poll's `es.request`).
+
+    Collects attributes while the call runs; `span()` turns it into a real span
+    only if the call was slow or failed, so healthy idle polling emits nothing.
+    """
+
+    def __init__(self):
+        self.attributes: dict = {}
+
+    def is_recording(self) -> bool:
+        return True
+
+    def set_attribute(self, key, value) -> None:
+        self.attributes[key] = value
+
+    def add_event(self, *args, **kwargs) -> None:
+        pass
+
+
+_pending_var: ContextVar = ContextVar("ames_otel_pending", default=None)
 
 
 def current_span():
     if not _HAVE_API:
         return None
+    pending = _pending_var.get()
+    if pending is not None:
+        return pending
     try:
         span = trace.get_current_span()
     except Exception:
         return None
-    if span is None or not span.is_recording():
-        provider = _state.get("tracer_provider")
-        if provider is not None and hasattr(provider, "get_current_span"):
-            span = provider.get_current_span()
     return span
+
+
+def _has_parent() -> bool:
+    try:
+        return trace.get_current_span().get_span_context().is_valid
+    except Exception:
+        return False
 
 
 def set_attrs(attrs: dict) -> None:
@@ -261,44 +323,125 @@ def _clean(value):
     return str(value)[:256]
 
 
+def _span_kind(name: Optional[str]):
+    if not _HAVE_API or not name:
+        return trace.SpanKind.INTERNAL if _HAVE_API else None
+    return getattr(trace.SpanKind, name.upper(), trace.SpanKind.INTERNAL)
+
+
+def inject_headers(headers: dict) -> dict:
+    """Add W3C `traceparent` (and `tracestate`) for the active span to an
+    outgoing request's headers. No-op when tracing is off or nothing is active."""
+    if not _HAVE_API or _state.get("tracer_provider") is None:
+        return headers
+    try:
+        from opentelemetry.propagate import inject
+
+        inject(headers)
+    except Exception:
+        pass
+    return headers
+
+
+def _slow_ms() -> float:
+    try:
+        return float(os.environ.get("AMES_OTEL_ES_SLOW_MS", "1000"))
+    except ValueError:
+        return 1000.0
+
+
+def _mark_error(sp, exc: BaseException) -> None:
+    """Class name only: messages and stacktraces carry request/ES bodies."""
+    name = type(exc).__name__
+    try:
+        if sp is not None and sp.is_recording():
+            if "error.type" not in (getattr(sp, "attributes", None) or {}):
+                sp.set_attribute("error.type", name)
+            if Status is not None:
+                sp.set_status(Status(StatusCode.ERROR, name))
+    except Exception:
+        pass
+
+
 @contextmanager
-def span(name: str, attrs: Optional[dict] = None, kind: Optional[str] = None):
+def span(name: str, attrs: Optional[dict] = None, kind: Optional[str] = None,
+         require_parent: bool = False, otel_kind: Optional[str] = None):
     """Record a span; yields the live span (or None when telemetry is off).
 
-    Never swallows the body's exception — it records it on the span and
-    re-raises, so error handling stays in the routes.
+    Never swallows the body's exception: it records the class name on the span
+    and re-raises, so error handling stays in the routes.
+
+    otel_kind: "server" / "client" / "producer" / "consumer" (default internal).
+
+    require_parent: with no active parent span the call is only recorded when
+    it is slow (AMES_OTEL_ES_SLOW_MS) or fails, so idle background polling
+    does not mint a trace per poll.
     """
     tr = tracer()
     if tr is None:
         yield None
         return
+    local = dict(attrs or {})
+    if kind:
+        local["memory.kind"] = kind
+    if require_parent and not _has_parent():
+        yield from _unparented(tr, name, local)
+        return
     try:
-        cm = tr.start_as_current_span(name)
+        cm = tr.start_as_current_span(name, record_exception=False,
+                                      set_status_on_exception=False,
+                                      kind=_span_kind(otel_kind))
     except Exception:
         yield None
         return
     with cm as sp:
         try:
-            local = dict(attrs or {})
-            if kind:
-                local["memory.kind"] = kind
             set_attrs(local)
         except Exception:
             pass
         try:
             yield sp
         except Exception as exc:
-            try:
-                if sp is not None and sp.is_recording():
-                    sp.record_exception(exc)
-                    sp.set_status(Status(StatusCode.ERROR, type(exc).__name__))
-            except Exception:
-                pass
+            _mark_error(sp, exc)
             raise
         else:
             try:
                 if sp is not None and sp.is_recording():
                     sp.set_status(Status(StatusCode.OK))
+            except Exception:
+                pass
+
+
+def _unparented(tr, name: str, attrs: dict):
+    pending = _Pending()
+    pending.attributes.update({k: v for k, v in attrs.items()
+                               if _clean(v) is not None})
+    token = _pending_var.set(pending)
+    t0_wall = time.time_ns()
+    t0 = time.perf_counter()
+    failed: Optional[BaseException] = None
+    try:
+        yield pending
+    except Exception as exc:
+        failed = exc
+        raise
+    finally:
+        _pending_var.reset(token)
+        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+        if failed is not None or elapsed_ms >= _slow_ms():
+            try:
+                sp = tr.start_span(name, start_time=t0_wall)
+                for k, v in pending.attributes.items():
+                    c = _clean(v)
+                    if c is not None:
+                        sp.set_attribute(k, c)
+                sp.set_attribute("ames.unparented", True)
+                if failed is not None:
+                    _mark_error(sp, failed)
+                else:
+                    sp.set_attribute("ames.slow", True)
+                    sp.set_status(Status(StatusCode.OK))
+                sp.end(end_time=t0_wall + int(elapsed_ms * 1e6))
             except Exception:
                 pass
 
@@ -361,6 +504,7 @@ def recall_attrs(owner_id: str, query: str, kinds, size: int,
         "memory.visibility.distinct": sorted(by_vis),
     }
     attrs.update(_kind_attrs(kinds))
+    attrs.update(recall_quality_attrs(hits))
     for kind, count in by_kind.items():
         attrs[f"memory.hits.kind.{kind}"] = count
     for vis, count in by_vis.items():
@@ -370,6 +514,53 @@ def recall_attrs(owner_id: str, query: str, kinds, size: int,
         attrs["memory.rerank.requested"] = bool(rerank.get("requested"))
         attrs["memory.rerank.applied"] = bool(rerank.get("applied"))
     return attrs
+
+
+def recall_quality_attrs(hits) -> dict:
+    """`memory.recall.quality.*`: numbers and one flag, never text.
+
+    top_score / min_score / spread come from each hit's fused `score`; an empty
+    result reports 0 hits and empty=True with no score attributes.
+    """
+    scores = [float(h["score"]) for h in hits
+              if isinstance(h, dict) and isinstance(h.get("score"), (int, float))
+              and not isinstance(h.get("score"), bool)]
+    out: dict = {"memory.recall.quality.hit_count": len(hits),
+                 "memory.recall.quality.empty": len(hits) == 0}
+    if scores:
+        out["memory.recall.quality.top_score"] = round(max(scores), 6)
+        out["memory.recall.quality.min_score"] = round(min(scores), 6)
+        out["memory.recall.quality.score_spread"] = round(max(scores) - min(scores), 6)
+    return out
+
+
+def mcp_result_attrs(res) -> dict:
+    """Counts for an MCP tool result: how many hits/proposals came back, never text."""
+    if not isinstance(res, dict):
+        return {}
+    out: dict = {}
+    for key in ("fused", "results", "evidence", "proposals", "sources"):
+        val = res.get(key)
+        if isinstance(val, list):
+            out[f"mcp.result.{key}"] = len(val)
+    if "abstained" in res:
+        out["mcp.result.abstained"] = bool(res.get("abstained"))
+    hits = res.get("fused") or res.get("results")
+    if isinstance(hits, list):
+        out.update(recall_quality_attrs([h for h in hits if isinstance(h, dict)]))
+    return out
+
+
+def configure_for_cli(default_service: str) -> Optional[Any]:
+    """Bootstrap for the stdio MCP servers: same gate and exporter as the backend
+    (`configure()`), a different default service name, flushed at process exit."""
+    os.environ.setdefault("OTEL_SERVICE_NAME", default_service)
+    provider = configure()
+    if provider is not None:
+        import atexit
+
+        atexit.register(shutdown)
+    return provider
 
 
 def retain_attrs(owner_id: str, kind: str, text: str, visibility: str,
@@ -425,7 +616,7 @@ def es_attrs(method: str, path: str, response: Optional[dict]) -> dict:
         "db.operation": method,
         "es.index": index,
         "es.index_pattern": _index_pattern(index),
-        "server.address": os.environ.get("AMES_ES_HOST", ""),
+        "server.address": _es_host(),
     }
     if isinstance(response, dict):
         took = response.get("took")
@@ -448,6 +639,13 @@ def es_attrs(method: str, path: str, response: Optional[dict]) -> dict:
     return {k: v for k, v in attrs.items() if _clean(v) is not None}
 
 
+def _es_host() -> str:
+    try:
+        return urlparse(os.environ.get("AMES_ES_URL", "")).hostname or ""
+    except Exception:
+        return ""
+
+
 def _index_pattern(index: str) -> str:
     """Normalise a concrete index name to the pattern it belongs to.
 
@@ -467,6 +665,34 @@ def _index_pattern(index: str) -> str:
     return "_".join(parts[:2]) + "_*" if len(parts) > 1 else name
 
 
+# Header names the ASGI instrumentation must never record. Header capture is
+# off (empty list), so this is defence in depth should someone enable it.
+SANITIZE_HEADER_FIELDS = ["x-api-key", "x-admin-token", "authorization",
+                          "cookie", "set-cookie"]
+
+
+def _route_only_hook(span, scope) -> None:
+    """server_request_hook: URL attributes carry the path, never the query.
+
+    Query strings hold owner_id / person (/admin/keys) and other identifiers.
+    The middleware re-sets `http.target` after this hook runs, so
+    `PrivacyScrubber.on_end` strips once more at span end.
+    """
+    try:
+        if not span.is_recording():
+            return
+        path = scope.get("path") or ""
+        attrs = span.attributes or {}
+        for key in ("http.target", "http.url", "url.full"):
+            if key in attrs:
+                span.set_attribute(key, path if key == "http.target"
+                                   else str(attrs[key]).split("?", 1)[0])
+        if "url.query" in attrs:
+            span.set_attribute("url.query", "")
+    except Exception:
+        pass
+
+
 def instrument_fastapi(app, tracer_provider=None, force: bool = False) -> bool:
     """Attach FastAPI server spans (and W3C trace-context propagation).
 
@@ -476,7 +702,7 @@ def instrument_fastapi(app, tracer_provider=None, force: bool = False) -> bool:
     through the global. Explicit provider also bypasses the AMES_OTEL_ENABLED
     gate — a test that hands us a provider has opted in.
     """
-    if tracer_provider is None and not enabled():
+    if tracer_provider is None and not (enabled() and endpoint_configured()):
         return False
     try:
         from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
@@ -489,7 +715,15 @@ def instrument_fastapi(app, tracer_provider=None, force: bool = False) -> bool:
             except Exception:
                 pass
             app._ames_otel_instrumented = False
-        kwargs = {"excluded_urls": "health,metrics"}
+        kwargs = {
+            "excluded_urls": "health,metrics",
+            "server_request_hook": _route_only_hook,
+            # No request/response header is recorded; the sanitize list is the
+            # backstop if an operator turns capture on via OTEL env vars.
+            "http_capture_headers_server_request": [],
+            "http_capture_headers_server_response": [],
+            "http_capture_headers_sanitize_fields": SANITIZE_HEADER_FIELDS,
+        }
         provider = tracer_provider or _state.get("tracer_provider")
         if provider is not None:
             kwargs["tracer_provider"] = provider
@@ -511,7 +745,7 @@ def instrument_fastapi(app, tracer_provider=None, force: bool = False) -> bool:
 
 def shutdown() -> None:
     """Flush exporters (used at app shutdown and by the tests)."""
-    for key in ("tracer_provider", "meter_provider"):
+    for key in ("tracer_provider",):
         provider = _state.get(key)
         try:
             if provider is not None:
@@ -521,7 +755,7 @@ def shutdown() -> None:
 
 
 def force_flush() -> None:
-    for key in ("tracer_provider", "meter_provider"):
+    for key in ("tracer_provider",):
         provider = _state.get(key)
         try:
             if provider is not None:
@@ -532,5 +766,4 @@ def force_flush() -> None:
 
 def reset() -> None:
     """Test helper: forget the configured provider."""
-    _state.update({"tracer_provider": None, "meter_provider": None,
-                   "configured": False})
+    _state.update({"tracer_provider": None, "configured": False})

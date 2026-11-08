@@ -5,6 +5,7 @@ import os
 import time
 
 from . import auth, embeddings, governance, memory, mental_models as mm
+from . import telemetry
 from .store import KINDS, es, idx
 
 log = logging.getLogger(__name__)
@@ -97,9 +98,25 @@ def _candidate_clusters(owner: str, min_facts: int = 3) -> list:
 def run_once() -> dict:
     """Propose then apply: dry_run pass for visibility, apply pass for supersessions
     (keep_both stays untouched — surfaced only). Mental-model drafts proposed per
-    owner; promotion is manual (upsert_model via the owner's key)."""
+    owner; promotion is manual (upsert_model via the owner's key).
+
+    One `worker.consolidate` span per pass that has owners to process; a pass
+    over zero owners emits nothing."""
+    owners = known_owners()
+    if not owners:
+        return {}
+    with telemetry.span("worker.consolidate", {"worker.owners": len(owners)}):
+        stats = _consolidate_owners(owners)
+        telemetry.set_attrs({
+            "worker.proposals": sum(v["proposals"] for v in stats.values()),
+            "worker.superseded": sum(v["superseded"] for v in stats.values()),
+            "worker.model_drafts": sum(v["model_drafts"] for v in stats.values())})
+        return stats
+
+
+def _consolidate_owners(owners) -> dict:
     stats = {}
-    for owner in known_owners():
+    for owner in owners:
         plan = memory.consolidate(owner, dry_run=True)
         applied = memory.consolidate(owner, dry_run=False)
         if _drafts_enabled():
@@ -183,13 +200,28 @@ def run_forever(interval_s: int = 0):
         time.sleep(interval_s)
 
 
+def install_sigterm_flush() -> None:
+    """`docker stop` sends SIGTERM; flush the span batch before exiting so the
+    last job's spans are not lost. Exit code 0 keeps the restart policy quiet."""
+    import signal
+    import sys
+
+    def _on_term(signum, frame):  # noqa: ARG001
+        try:
+            telemetry.shutdown()
+        finally:
+            sys.exit(0)
+
+    signal.signal(signal.SIGTERM, _on_term)
+
+
 if __name__ == "__main__":
     # docker-compose.yml / docker-compose.quickstart.yml run
     # `python -m app.worker`: without this entry the module imports, exits 0,
     # and the container crash-loops under `restart: unless-stopped`.
     import sys
-    from . import telemetry
-    telemetry.configure()   # no-op when AMES_OTEL_ENABLED=0 or opentelemetry is absent
+    telemetry.configure()   # no-op unless AMES_OTEL_ENABLED and an OTLP endpoint are set
+    install_sigterm_flush()
     if "--backfill" in sys.argv:
         from .facts import backfill_loop
         backfill_loop()

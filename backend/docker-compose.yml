@@ -1,4 +1,7 @@
 version: "3.8"
+# Tracing is off unless AMES_OTEL_ENABLED=1 AND OTEL_EXPORTER_OTLP_ENDPOINT is set (see README,
+# "Telemetry"). To sample traces add OTEL_TRACES_SAMPLER=parentbased_traceidratio and
+# OTEL_TRACES_SAMPLER_ARG=0.1 to the service environment.
 services:
   ames-backend:
     build: .

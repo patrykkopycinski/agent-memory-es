@@ -158,6 +158,34 @@ curl -s -X POST localhost:8123/memory/recall -H "X-API-Key: $KEY" \
 
 Hermes users: install the [standalone plugin](https://github.com/patrykkopycinski/hermes-plugin-agent-memory-es) — it turns the API into `agent_memory_recall` / `agent_memory_retain` / `agent_memory_reflect` agent tools.
 
+## Telemetry (OpenTelemetry traces)
+
+Tracing is **off by default**. It turns on only when both `AMES_OTEL_ENABLED=1`
+and an OTLP endpoint (`OTEL_EXPORTER_OTLP_ENDPOINT` or
+`OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`) are set; there is no implicit
+`localhost:4318`. Point it at any OTLP/HTTP collector.
+
+Spans: FastAPI server spans, `memory.recall|retain|promote|reflect`,
+`es.request`, `worker.job` / `worker.backfill` / `worker.consolidate` (opened
+only once a job is claimed or a pass has owners), and `mcp.tool_call` from the
+MCP servers, which also send a W3C `traceparent` to the backend so one trace
+runs MCP -> HTTP -> memory.recall -> es.request. Recall spans carry
+`memory.recall.quality.{hit_count,empty,top_score,min_score,score_spread}`.
+
+Privacy model: spans carry kinds, visibility, counts, lengths and timings, plus
+a truncated hash of the owner. Never memory text, queries, keys or owner ids.
+Exception messages and stacktraces are never recorded (class name only), URL
+query strings are stripped from `http.target` / `http.url` / `url.full` /
+`url.query`, and no HTTP headers are captured. If header capture is ever enabled
+through the OTEL env vars, `x-api-key`, `x-admin-token`, `authorization`,
+`cookie` and `set-cookie` are sanitized. A span processor enforces this for
+third-party instrumentation spans too.
+
+Volume: an `es.request` with no parent span (an idle worker poll) is exported
+only when it is slow (`AMES_OTEL_ES_SLOW_MS`, default 1000) or failed. To sample
+request traces, set for example
+`OTEL_TRACES_SAMPLER=parentbased_traceidratio` and `OTEL_TRACES_SAMPLER_ARG=0.1`.
+
 ## Layout
 
 ```

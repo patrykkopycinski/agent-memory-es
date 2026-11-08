@@ -35,6 +35,11 @@ if os.environ.get("AMES_RECALL_LOG", "1") != "0":
     _rl.setLevel(logging.INFO)
 
 
+@app.on_event("shutdown")
+def _shutdown():
+    _otel.shutdown()    # flush the span batch on SIGTERM (uvicorn runs shutdown hooks)
+
+
 @app.on_event("startup")
 def _startup():
     ensure_indices()
