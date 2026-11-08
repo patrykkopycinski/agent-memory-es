@@ -957,3 +957,174 @@ def test_mcp_script_removes_backend_path_when_import_fails():
         "print('OK')\n")
     r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
     assert "OK" in r.stdout, r.stdout + r.stderr
+
+
+# --- url.path / new-semconv URL attributes ---------------------------------
+
+_SEMCONV_PROBE = r'''
+import json, sys
+sys.path.insert(0, sys.argv[1])
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+from app import telemetry as t
+
+exp = InMemorySpanExporter()
+prov = t.build_provider(SimpleSpanProcessor(exp))
+app = FastAPI()
+
+@app.get("/memory/pages/{scope}")
+def page(scope: str):
+    return {"ok": 1}
+
+sub = FastAPI()
+
+@sub.get("/inner/{x}")
+def inner(x: str):
+    return {"ok": 1}
+
+app.mount("/sub", sub)
+t.instrument_fastapi(app, tracer_provider=prov, force=True)
+client = TestClient(app)
+out = {}
+for path in ("/memory/pages/SECRETPATH1?q=SECRETQ", "/nope/SECRETPATH2", "/sub/inner/SECRETPATH3"):
+    exp.clear()
+    client.get(path)
+    spans = exp.get_finished_spans()
+    out[path] = [{"name": s.name, "kind": s.kind.name, "attrs": {k: str(v) for k, v in s.attributes.items()}}
+                 for s in spans]
+print("JSON:" + json.dumps(out))
+'''
+
+_BACKEND_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+
+# Keys each semconv mode must emit on the server span (asserted PRESENT).
+_SEMCONV_KEYS = {
+    "": ("http.target", "http.url"),
+    "http": ("url.path",),
+    "http/dup": ("http.target", "http.url", "url.path"),
+}
+_TEMPLATES = {
+    "/memory/pages/SECRETPATH1?q=SECRETQ": "/memory/pages/{scope}",
+    "/nope/SECRETPATH2": "/<unmatched>",
+    "/sub/inner/SECRETPATH3": "/sub",
+}
+
+
+def _run_semconv_probe(mode):
+    import json
+    import subprocess
+    env = dict(os.environ, AMES_ES_URL="http://localhost:1")
+    env.pop("OTEL_SEMCONV_STABILITY_OPT_IN", None)
+    if mode:
+        env["OTEL_SEMCONV_STABILITY_OPT_IN"] = mode
+    r = subprocess.run([sys.executable, "-c", _SEMCONV_PROBE, _BACKEND_DIR],
+                       capture_output=True, text=True, env=env, timeout=120)
+    line = [ln for ln in r.stdout.splitlines() if ln.startswith("JSON:")]
+    assert line, r.stdout + r.stderr
+    return json.loads(line[0][5:])
+
+
+@pytest.mark.parametrize("mode", ["", "http", "http/dup"])
+def test_url_path_canary_under_every_semconv_mode(mode):
+    # The instrumentation reads OTEL_SEMCONV_STABILITY_OPT_IN when it initialises,
+    # so each mode needs a fresh interpreter.
+    out = _run_semconv_probe(mode)
+    for path, template in _TEMPLATES.items():
+        spans = out[path]
+        assert spans, path
+        assert "SECRET" not in repr(spans), (mode, path, spans)
+        server = [s for s in spans if s["kind"] == "SERVER"]
+        assert len(server) == 1, (mode, path, spans)
+        a = server[0]["attrs"]
+        for key in _SEMCONV_KEYS[mode]:
+            assert key in a, (mode, path, key, a)
+            if key in ("http.target", "url.path"):
+                assert a[key] == template, (mode, path, key, a[key])
+            else:
+                assert a[key].endswith(template) and "?" not in a[key], (mode, path, key, a[key])
+        assert "url.query" not in a and "http.query" not in a
+
+
+def test_url_path_negative_control_scan_detects_raw_value():
+    # Negative control: the scan in the test above must fail when a raw path is
+    # present, so a clean result is evidence and not an empty scan.
+    class _Span:
+        def __init__(self, kind):
+            self.kind = kind
+            self._attributes = {"url.path": "/memory/pages/SECRETPATH1",
+                                "url.full": "http://h/memory/pages/SECRETPATH1?q=SECRETQ",
+                                "url.query": "q=SECRETQ"}
+            self._events = ()
+            self._status = None
+
+    class _Kind:
+        def __init__(self, name):
+            self.name = name
+
+    client_span = _Span(_Kind("CLIENT"))
+    _otel.PrivacyScrubber().on_end(client_span)
+    # non-server spans lose the query but keep the (non-template) path text,
+    # which is why only SERVER spans may carry URL attributes at all
+    assert "SECRETQ" not in repr(client_span._attributes)
+    assert "SECRETPATH1" in repr(client_span._attributes)
+
+    server_span = _Span(_Kind("SERVER"))
+    server_span._attributes["http.route"] = "/memory/pages/{scope}"
+    _otel.PrivacyScrubber().on_end(server_span)
+    assert server_span._attributes["url.path"] == "/memory/pages/{scope}"
+    assert server_span._attributes["url.full"] == "http://h/memory/pages/{scope}"
+    assert "SECRET" not in repr(server_span._attributes)
+
+
+def test_templated_url_covers_new_semconv_keys():
+    tpl = "/memory/pages/{scope}"
+    assert _otel._templated_url("url.path", f"/memory/pages/{BAD_PATH}", tpl) == tpl
+    assert _otel._templated_url("url.full", f"https://h:8123/memory/pages/{BAD_PATH}?q=1",
+                                tpl) == "https://h:8123" + tpl
+    assert _otel._templated_url("url.path", f"/x/{BAD_PATH}", None) == "/<unmatched>"
+    assert _otel._templated_url("url.full", f"http://h/x/{BAD_PATH}", None) == "http://h/<unmatched>"
+
+
+def test_route_only_hook_placeholders_for_both_semconv_generations():
+    class _Rec:
+        def __init__(self):
+            self.attrs = {"http.target": f"/a/{BAD_PATH}", "url.path": f"/a/{BAD_PATH}",
+                          "http.url": f"http://h/a/{BAD_PATH}?q=1",
+                          "url.full": f"http://h/a/{BAD_PATH}?q=1", "url.query": "q=1"}
+            self.attributes = self.attrs
+
+        def is_recording(self):
+            return True
+
+        def set_attribute(self, k, v):
+            self.attrs[k] = v
+
+    s = _Rec()
+    _otel._route_only_hook(s, {"path": f"/a/{BAD_PATH}"})
+    assert s.attrs["http.target"] == "/<unmatched>"
+    assert s.attrs["url.path"] == "/<unmatched>"
+    assert s.attrs["http.url"] == "http://h/<unmatched>"
+    assert s.attrs["url.full"] == "http://h/<unmatched>"
+    assert s.attrs["url.query"] == ""
+    assert not any(m in repr(s.attrs) for m in BAD_MARKERS)
+
+
+# --- set_attrs_from reports builder bugs without leaking text ---------------
+
+def test_failing_attr_builder_warns_class_name_only_once(spans, caplog):
+    import logging
+
+    def boom(*a):
+        raise RuntimeError("builder failure " + BAD_KIND)
+
+    _otel._warned.clear()
+    with caplog.at_level(logging.WARNING, logger="ames.telemetry"):
+        with _otel.span("guarded"):
+            _otel.set_attrs_from(boom, 1)
+            _otel.set_attrs_from(boom, 2)
+    msgs = [r.getMessage() for r in caplog.records if r.name == "ames.telemetry"]
+    assert msgs == ["attr builder boom failed: RuntimeError"], msgs
+    assert not any(m in caplog.text for m in BAD_MARKERS)
+    _assert_no_canary(spans)

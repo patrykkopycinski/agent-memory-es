@@ -178,8 +178,10 @@ Request strings (`kind`, `visibility`, `kinds`) are exported only when they are
 a known enum value; anything else is exported as `invalid`, and every string
 attribute is capped at 256 characters. Exception messages and stacktraces are
 never recorded (class name only). On server spans `http.target` / `http.url` /
-`url.full` carry the route template (`/memory/pages/{scope}`), never the
-concrete path, and `url.query` is dropped. No HTTP headers are captured. If header capture is ever enabled
+`url.path` / `url.full` carry the route template (`/memory/pages/{scope}`),
+never the concrete path, and `url.query` is dropped. This holds for the default
+and for `OTEL_SEMCONV_STABILITY_OPT_IN=http` / `http/dup`. An attribute-builder
+failure logs one warning with the exception class name only. No HTTP headers are captured. If header capture is ever enabled
 through the OTEL env vars, `x-api-key`, `x-admin-token`, `authorization`,
 `cookie` and `set-cookie` are sanitized. A span processor enforces this for
 third-party instrumentation spans too.

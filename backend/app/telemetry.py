@@ -104,7 +104,12 @@ def _otlp_traces_endpoint() -> Optional[str]:
 
 
 _EXC_ATTRS = ("exception.message", "exception.stacktrace")
-_URL_ATTRS = ("http.target", "http.url", "url.full", "url.query")
+# Old semconv: http.target / http.url. New (OTEL_SEMCONV_STABILITY_OPT_IN=http):
+# url.path / url.full / url.query. `http/dup` emits both. All of them carry
+# caller-chosen text (path segments, query strings).
+_URL_ATTRS = ("http.target", "http.url", "url.full", "url.path", "url.query")
+_URL_PATH_KEYS = ("http.target", "url.path")        # value is a bare path
+_URL_FULL_KEYS = ("http.url", "url.full")           # value is scheme://host/path
 _IDENT = re.compile(r"^[A-Za-z_][\w.]{0,80}$")
 UNMATCHED_ROUTE = "/<unmatched>"
 _MAX_ATTR_CHARS = 256
@@ -124,7 +129,7 @@ def _templated_url(key: str, value: str, route) -> str:
     """
     template = route if isinstance(route, str) and route.startswith("/") else UNMATCHED_ROUTE
     template = template[:_MAX_ATTR_CHARS]
-    if key == "http.target":
+    if key in _URL_PATH_KEYS:
         return template
     value = value.split("?", 1)[0]
     m = re.match(r"^([A-Za-z][A-Za-z0-9+.-]*://[^/]*)", value)
@@ -143,7 +148,9 @@ def _scrub_event(ev):
 class PrivacyScrubber(SpanProcessor):
     """Runs on every finished span, ours or an instrumentation's.
 
-    Also strips query strings from URL attributes (see `_route_only_hook`).
+    Also rewrites URL attributes of both semconv generations (`http.target`,
+    `http.url`, `url.path`, `url.full`) to the route template and drops
+    `url.query` (see `_route_only_hook`).
 
     `record_exception` / `use_span` in third-party instrumentation (the ASGI
     middleware) attach `exception.message` and `exception.stacktrace`, and put
@@ -165,7 +172,7 @@ class PrivacyScrubber(SpanProcessor):
                          if k not in _EXC_ATTRS and k != "url.query"}
                 server = _is_server(span)
                 route = clean.get("http.route") if server else None
-                for key in ("http.target", "http.url", "url.full"):
+                for key in _URL_PATH_KEYS + _URL_FULL_KEYS:
                     if key in clean:
                         clean[key] = (_templated_url(key, str(clean[key]), route)
                                       if server else
@@ -315,8 +322,11 @@ def set_attrs_from(build, *args) -> None:
         if span is None or not span.is_recording():
             return
         set_attrs(build(*args))
-    except Exception:
-        pass
+    except Exception as exc:
+        # Class name only: the builders read request and result dicts, so an
+        # exception message can carry request text. Deduplicated by `_warn`.
+        _warn(f"attr builder {getattr(build, '__name__', '?')} failed: "
+              f"{type(exc).__name__}")
 
 
 def set_attrs(attrs: dict) -> None:
@@ -737,21 +747,24 @@ SANITIZE_HEADER_FIELDS = ["x-api-key", "x-admin-token", "authorization",
 
 
 def _route_only_hook(span, scope) -> None:
-    """server_request_hook: URL attributes carry the path, never the query.
+    """server_request_hook: fail-closed placeholder for every URL attribute.
 
-    Query strings hold owner_id / person (/admin/keys) and other identifiers.
-    The middleware re-sets `http.target` after this hook runs, so
-    `PrivacyScrubber.on_end` strips once more at span end.
+    The route template is not known yet when this runs, and the middleware
+    re-sets some of these attributes after it. `PrivacyScrubber.on_end` writes
+    the final value (route template, or `/<unmatched>`); until then a span that
+    is somehow inspected early holds the placeholder, never the concrete path
+    or query string. Covers both semconv generations.
     """
     try:
         if not span.is_recording():
             return
-        path = scope.get("path") or ""
         attrs = span.attributes or {}
-        for key in ("http.target", "http.url", "url.full"):
+        for key in _URL_PATH_KEYS:
             if key in attrs:
-                span.set_attribute(key, path if key == "http.target"
-                                   else str(attrs[key]).split("?", 1)[0])
+                span.set_attribute(key, UNMATCHED_ROUTE)
+        for key in _URL_FULL_KEYS:
+            if key in attrs:
+                span.set_attribute(key, _templated_url(key, str(attrs[key]), None))
         if "url.query" in attrs:
             span.set_attribute("url.query", "")
     except Exception:
@@ -804,7 +817,7 @@ def instrument_fastapi(app, tracer_provider=None, force: bool = False) -> bool:
             app.middleware_stack = None
         return True
     except Exception as exc:  # pragma: no cover - optional dependency
-        _warn(f"fastapi instrumentation disabled: {type(exc).__name__}: {exc}")
+        _warn(f"fastapi instrumentation disabled: {type(exc).__name__}")
         return False
 
 
