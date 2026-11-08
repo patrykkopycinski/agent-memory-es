@@ -6,6 +6,9 @@ services:
     restart: unless-stopped
     environment:
       AMES_ES_URL: http://host.docker.internal:9268  # explicit: no app-level default anymore
+      OTEL_SERVICE_NAME: ames-backend
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
+      AMES_OTEL_ENABLED: ${AMES_OTEL_ENABLED:-0}
       AMES_EMBED_BACKEND: local
       AMES_ADMIN_TOKEN: ${AMES_ADMIN_TOKEN:?set in .env}
       AMES_API_KEYS_FILE: /data/ames_keys.json
@@ -24,6 +27,9 @@ services:
     restart: unless-stopped
     environment:
       AMES_ES_URL: http://host.docker.internal:9268  # explicit: no app-level default anymore
+      OTEL_SERVICE_NAME: ames-worker
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
+      AMES_OTEL_ENABLED: ${AMES_OTEL_ENABLED:-0}
       AMES_EMBED_BACKEND: local
       AMES_API_KEYS_FILE: /data/ames_keys.json
       AMES_CONSOLIDATE_INTERVAL: "600"
@@ -36,6 +42,9 @@ services:
     restart: unless-stopped
     environment:
       AMES_ES_URL: http://host.docker.internal:9268
+      OTEL_SERVICE_NAME: ames-fact-worker
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
+      AMES_OTEL_ENABLED: ${AMES_OTEL_ENABLED:-0}
       AMES_EMBED_BACKEND: local   # off-license; parity with ES _inference verified (cos>=0.99996)
       AMES_API_KEYS_FILE: /data/ames_keys.json
       AMES_LLM_BASE: http://host.docker.internal:20128/v1
@@ -52,6 +61,9 @@ services:
     restart: unless-stopped
     environment:
       AMES_ES_URL: http://host.docker.internal:9268
+      OTEL_SERVICE_NAME: ames-backfill-worker
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
+      AMES_OTEL_ENABLED: ${AMES_OTEL_ENABLED:-0}
       AMES_EMBED_BACKEND: local   # off-license; parity with ES _inference verified (cos>=0.99996)
       AMES_API_KEYS_FILE: /data/ames_keys.json
       AMES_LLM_BASE: http://host.docker.internal:20128/v1

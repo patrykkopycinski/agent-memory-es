@@ -54,7 +54,7 @@ INSTRUMENTING_NAME = "ames.backend"
 INSTRUMENTING_VERSION = "0.1.0"
 
 DEFAULT_SERVICE_NAME = "agent-memory-es"
-DEFAULT_OTLP_ENDPOINT = os.environ.get("AMES_OTEL_ENDPOINT", "http://127.0.0.1:24318")
+DEFAULT_OTLP_ENDPOINT = os.environ.get("AMES_OTEL_ENDPOINT", "http://localhost:4318")
 
 # Module-level handles. `configure()` owns them; tests inject their own
 # provider so they never depend on the process-global provider (which the SDK
