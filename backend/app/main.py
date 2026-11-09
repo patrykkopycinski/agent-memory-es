@@ -35,8 +35,35 @@ if os.environ.get("AMES_RECALL_LOG", "1") != "0":
     _rl.setLevel(logging.INFO)
 
 
+_DEFAULT_LOADER_WAIT_S = 10.0   # well under a typical container stop grace period (10 s on docker, 30 s on k8s)
+_warmup_thread: Optional[threading.Thread] = None
+
+
+def _loader_wait_s() -> float:
+    raw = os.environ.get("AMES_SHUTDOWN_LOADER_WAIT_S", "")
+    try:
+        return max(0.0, float(raw)) if raw.strip() else _DEFAULT_LOADER_WAIT_S
+    except ValueError:
+        return _DEFAULT_LOADER_WAIT_S
+
+
+def _wait_for_model_load() -> None:
+    """Bounded wait for the warm-up and probe-load threads. Tearing the interpreter down while one
+    is inside the native ONNX load can abort the process (SIGABRT) before spans are flushed."""
+    deadline = time.monotonic() + _loader_wait_s()
+    for thread in (_warmup_thread, embeddings._loader):
+        if thread is None or not thread.is_alive():
+            continue
+        thread.join(max(0.0, deadline - time.monotonic()))
+        if thread.is_alive():
+            logging.getLogger("ames.shutdown").warning(
+                "%s still loading the embedding model after %.1f s; shutting down anyway",
+                thread.name, _loader_wait_s())
+
+
 @app.on_event("shutdown")
 def _shutdown():
+    _wait_for_model_load()
     _otel.shutdown()    # flush the span batch on SIGTERM (uvicorn runs shutdown hooks)
 
 
@@ -62,8 +89,11 @@ def _warm_embedder() -> None:
 
 
 def _warm_embedder_in_background() -> None:
+    global _warmup_thread
     try:
-        threading.Thread(target=_warm_embedder, daemon=True, name="embed-warmup").start()
+        thread = threading.Thread(target=_warm_embedder, daemon=True, name="embed-warmup")
+        thread.start()
+        _warmup_thread = thread
     except Exception:
         logging.getLogger("ames.startup").warning("could not start embedder warm-up", exc_info=True)
 
