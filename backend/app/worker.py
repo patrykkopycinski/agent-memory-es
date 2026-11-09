@@ -163,6 +163,18 @@ def reembed_sweep(batch: int = 0) -> dict:
     result = {"found": len(found), "embedded": 0, "conflicts": 0, "gone": 0}
     if not found:
         return result
+    with telemetry.span("worker.reembed", {"worker.reembed.found": len(found)}):
+        try:
+            _embed_found(found, result)
+        finally:
+            telemetry.set_attrs({"worker.reembed.embedded": result["embedded"],
+                                 "worker.reembed.conflicts": result["conflicts"],
+                                 "worker.reembed.gone": result["gone"]})
+    log.info("reembed sweep: %s", result)
+    return result
+
+
+def _embed_found(found, result) -> None:
     vectors = embeddings.embed([h["_source"]["text"] for _, _, h in found])
     for (_, kind, h), vec in zip(found, vectors):
         try:
@@ -178,8 +190,25 @@ def reembed_sweep(batch: int = 0) -> dict:
                 result["gone"] += 1      # not store.is_doc_miss: this 404 body has no found:false
             else:
                 raise
-    log.info("reembed sweep: %s", result)
-    return result
+
+
+_GOVERNANCE_COUNTS = ("expired", "completed_overrides", "released_claims", "override_conflicts")
+
+
+def governance_pass() -> dict:
+    """`governance.expire_stale_proposals()` as one `worker.governance_expiry` span, recorded only
+    when the pass did something (or failed). Whether there is work is only known once the pass
+    has searched, so the span is recorded afterwards with the pass's real start time."""
+    started = time.time_ns()
+    try:
+        out = governance.expire_stale_proposals()
+    except Exception as exc:
+        telemetry.record_pass("worker.governance_expiry", started, {}, failed=exc)
+        raise
+    if any(out.get(k) for k in _GOVERNANCE_COUNTS):
+        telemetry.record_pass("worker.governance_expiry", started,
+                              {f"worker.governance.{k}": out.get(k, 0) for k in _GOVERNANCE_COUNTS})
+    return out
 
 
 def run_forever(interval_s: int = 0):
@@ -194,7 +223,7 @@ def run_forever(interval_s: int = 0):
         except Exception as e:  # noqa: BLE001 — a failed sweep must not stop consolidation
             print(time.strftime("%H:%M:%S"), "reembed error:", e, flush=True)
         try:
-            print(time.strftime("%H:%M:%S"), "governance", governance.expire_stale_proposals(), flush=True)
+            print(time.strftime("%H:%M:%S"), "governance", governance_pass(), flush=True)
         except Exception as e:  # noqa: BLE001 — a failed pass must not stop the loop
             print(time.strftime("%H:%M:%S"), "governance error:", e, flush=True)
         time.sleep(interval_s)

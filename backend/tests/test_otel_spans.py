@@ -582,6 +582,53 @@ def test_consolidate_pass_span(spans, monkeypatch):
     assert a["worker.superseded"] == 4
 
 
+def test_reembed_pass_span(spans, monkeypatch):
+    from app import embeddings, worker
+    monkeypatch.setattr(embeddings, "probe", lambda: None)
+    monkeypatch.setattr(embeddings, "embed", lambda texts: [[1.0] for _ in texts])
+    hit = {"_id": "d1", "_seq_no": 3, "_primary_term": 1,
+           "_source": {"text": SECRET_MEMORY, "occurred_at": "2026-11-05T03:37:00Z"}}
+
+    def fake_es(method, path, body=None, timeout=30):
+        if path.endswith("/_search"):
+            return {"hits": {"hits": [hit] if "am_semantic" in path else []}}
+        return {"result": "updated"}
+    monkeypatch.setattr(worker, "es", fake_es)
+    assert worker.reembed_sweep()["embedded"] == 1
+    a = _attrs(_by_name(spans, "worker.reembed")[0])
+    assert a["worker.reembed.found"] == 1 and a["worker.reembed.embedded"] == 1
+    assert SECRET_QUERY not in _everything(spans)
+
+    spans.clear()
+    monkeypatch.setattr(worker, "es", lambda *a, **k: {"hits": {"hits": []}})
+    assert worker.reembed_sweep()["found"] == 0
+    assert not spans.get_finished_spans(), "a sweep with nothing to embed emits nothing"
+
+
+def test_governance_expiry_span(spans, monkeypatch):
+    from app import governance, worker
+    monkeypatch.setattr(governance, "expire_stale_proposals", lambda: {
+        "expired": 3, "completed_overrides": 0, "released_claims": 1, "override_conflicts": 0})
+    worker.governance_pass()
+    a = _attrs(_by_name(spans, "worker.governance_expiry")[0])
+    assert a["worker.governance.expired"] == 3 and a["worker.governance.released_claims"] == 1
+
+    spans.clear()
+    monkeypatch.setattr(governance, "expire_stale_proposals", lambda: {
+        "expired": 0, "completed_overrides": 0, "released_claims": 0, "override_conflicts": 0})
+    worker.governance_pass()
+    assert not spans.get_finished_spans(), "a pass that did nothing emits nothing"
+
+    def boom():
+        raise RuntimeError(SECRET_MEMORY)
+    monkeypatch.setattr(governance, "expire_stale_proposals", boom)
+    with pytest.raises(RuntimeError):
+        worker.governance_pass()
+    s = _by_name(spans, "worker.governance_expiry")[0]
+    assert _attrs(s)["error.type"] == "RuntimeError"
+    assert SECRET_QUERY not in _everything(spans)
+
+
 # --- P2-1: query strings never reach URL attributes ---------------------------
 
 def test_query_string_canaries_stripped_from_url_attributes(spans, client, monkeypatch):

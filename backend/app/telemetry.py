@@ -465,6 +465,29 @@ def span(name: str, attrs: Optional[dict] = None, kind: Optional[str] = None,
                 pass
 
 
+def record_pass(name: str, start_ns: int, attrs: dict,
+                failed: Optional[BaseException] = None) -> None:
+    """Record a finished span after the fact, for a background pass whose "is
+    there any work" answer only exists once it ran. Starts at `start_ns`, ends now.
+    Never raises."""
+    tr = tracer()
+    if tr is None:
+        return
+    try:
+        sp = tr.start_span(name, start_time=start_ns)
+        for k, v in attrs.items():
+            c = _clean(v)
+            if c is not None:
+                sp.set_attribute(k, c)
+        if failed is not None:
+            _mark_error(sp, failed)
+        else:
+            sp.set_status(Status(StatusCode.OK))
+        sp.end()
+    except Exception:
+        pass
+
+
 def _unparented(tr, name: str, attrs: dict):
     pending = _Pending()
     pending.attributes.update({k: v for k, v in attrs.items()
@@ -695,8 +718,6 @@ def es_attrs(method: str, path: str, response: Optional[dict]) -> dict:
     """ES client span attributes: index pattern + outcome counts (never bodies)."""
     seg = [s for s in (path or "").split("?")[0].split("/") if s]
     index = seg[0] if seg else ""
-    operation = seg[1] if len(seg) > 1 and seg[1].startswith("_") else (
-        seg[-1] if seg else "")
     attrs = {
         "db.system": "elasticsearch",
         "db.operation": method,
