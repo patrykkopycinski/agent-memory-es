@@ -62,6 +62,12 @@ Background loop (default every 600 s, `AMES_CONSOLIDATE_INTERVAL`): for every kn
 
 `ames-backend` (uvicorn :8123) + `ames-worker` + a Elasticsearch instance; `AMES_ADMIN_TOKEN` required. Env knobs: `AMES_ES_URL`, `AMES_EMBED_BACKEND`, `AMES_LLM_BASE` (OpenAI-compatible endpoint for reflect).
 
+### LLM provider and key store (stateless / Cloud Run deploys)
+
+- `AMES_LLM_PROVIDER=openai` (default) calls the OpenAI-compatible gateway at `AMES_LLM_BASE`. `es_inference` calls `POST /_inference/chat_completion/<AMES_LLM_INFERENCE_ID>/_stream` on `AMES_ES_URL` with the same `ApiKey` authorization the Elasticsearch client already uses, assembles the SSE stream, and sends no `model` unless `AMES_LLM_MODEL` is set. JSON extraction (`chat_json`) relies on the prompt there: no `response_format` is sent. Transport failures and cut streams retry like the openai path; 4xx does not.
+- `AMES_KEY_STORE=file` (default) keeps keys in `AMES_API_KEYS_FILE`. `es` keeps them in `<prefix>am_keys` (doc id = sha256 of the token, source `owner_id`/`role`/`person`/`created_at`; the plaintext token is never stored), so no key volume is needed. Lookups cache hits for `AMES_KEY_CACHE_TTL_S` (default 30; a revoked key can stay valid that long) and never cache misses; an unreachable store answers 503, not 401. `/health/ready` reports `key_store_ok`. The worker logs `zero owners: key store unreachable or empty` when it finds no owners while memory indices hold documents.
+- Move an existing file store with `python -m app.keystore_migrate --from-file <path>` (idempotent, prints counts only).
+
 ### Embedding backends and the license
 
 - `es` calls `_inference/text_embedding`, which **needs an Elasticsearch license** that includes inference: when a trial expires it returns 403 and writes land without vectors. `omniroute` calls an external OpenAI-compatible gateway (different dimensions, so it needs its own index).

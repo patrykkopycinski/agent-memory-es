@@ -2,9 +2,10 @@
 evidence. Cites only retrieved ids. Abstains (atlas finding) when evidence is thin."""
 import json
 import os
+import urllib.parse
 import urllib.request
 
-from . import http_retry
+from . import http_retry, store
 
 BASE = os.environ.get("AMES_LLM_BASE", "http://localhost:20128/v1")
 MODEL = os.environ.get("AMES_LLM_MODEL", "auto/best-chat")
@@ -40,21 +41,77 @@ SYSTEM = (
 )
 
 
-def chat(question: str, evidence: list) -> str:
-    body = json.dumps({
-        "model": MODEL,
-        **_sampling(0),
-        "messages": [
-            {"role": "system", "content": SYSTEM},
-            {"role": "user", "content": "QUESTION: " + question + "\n\nEVIDENCE:\n" +
-             "\n".join(f"[{e['id']}] {e['text']}" for e in evidence)},
-        ],
-    }).encode()
-    req = urllib.request.Request(BASE + "/chat/completions", data=body, method="POST",
+def _provider() -> str:
+    """AMES_LLM_PROVIDER=openai (default: OpenAI-compatible gateway at AMES_LLM_BASE) or
+    es_inference (the Elasticsearch _inference chat_completion API on AMES_ES_URL with the same
+    auth as store.es, endpoint id from AMES_LLM_INFERENCE_ID)."""
+    provider = os.environ.get("AMES_LLM_PROVIDER", "openai").strip().lower() or "openai"
+    if provider not in ("openai", "es_inference"):
+        raise ValueError(f"AMES_LLM_PROVIDER must be 'openai' or 'es_inference', got {provider!r}")
+    return provider
+
+
+def _parse_sse(response) -> tuple:
+    """Assemble (content, finish_reason) from a chat_completion SSE stream. Accepts the bare chunk
+    (`choices[].delta.content`) and the `{"chat_completion": {...}}` wrapper; skips `event:` lines.
+    A stream that ends without `[DONE]` was cut off: ConnectionResetError, which http_retry retries."""
+    parts, finish, done = [], None, False
+    for raw in response:
+        line = raw.decode("utf-8", "replace").strip()
+        if not line.startswith("data:"):
+            continue
+        data = line[5:].strip()
+        if data == "[DONE]":
+            done = True
+            break
+        chunk = json.loads(data)
+        if "error" in chunk:
+            raise ValueError("inference stream returned an error event")   # body may echo the prompt
+        for choice in chunk.get("chat_completion", chunk).get("choices") or []:
+            parts.append((choice.get("delta") or {}).get("content") or "")
+            finish = choice.get("finish_reason") or finish
+    if not done:
+        raise ConnectionResetError("inference stream ended before [DONE]")
+    return "".join(parts), finish
+
+
+def _complete(messages: list, sampling: dict, json_mode: bool, timeout: float) -> tuple:
+    """One chat completion on the configured provider -> (content, finish_reason).
+    json_mode asks for a JSON object: on openai via response_format (+ the optional
+    disable-thinking template kwarg); on es_inference by prompt alone, since the _inference API
+    rejects unknown request fields."""
+    if _provider() == "es_inference":
+        inference_id = os.environ.get("AMES_LLM_INFERENCE_ID", "").strip()
+        if not inference_id:
+            raise RuntimeError("AMES_LLM_INFERENCE_ID is required when AMES_LLM_PROVIDER=es_inference")
+        body = {"messages": messages, **sampling}
+        model = os.environ.get("AMES_LLM_MODEL")
+        if model:
+            body["model"] = model
+        url = (store._es_url() + "/_inference/chat_completion/"
+               + urllib.parse.quote(inference_id, safe="") + "/_stream")
+        req = urllib.request.Request(url, data=json.dumps(body).encode(), method="POST",
+                                     headers={**store._es_headers(), "Accept": "text/event-stream"})
+        return http_retry.request_with(req, _parse_sse, timeout=timeout)
+    body = {"model": MODEL, **sampling, "messages": messages}
+    if json_mode:
+        body.update(_template_kwargs())
+        body["response_format"] = {"type": "json_object"}
+    req = urllib.request.Request(BASE + "/chat/completions", data=json.dumps(body).encode(),
+                                 method="POST",
                                  headers={"Content-Type": "application/json",
                                           "Authorization": f"Bearer {KEY}"})
-    out = http_retry.request_json(req, timeout=120)
-    return out["choices"][0]["message"]["content"]
+    choice = http_retry.request_json(req, timeout=timeout)["choices"][0]
+    return choice["message"].get("content") or "", choice.get("finish_reason")
+
+
+def chat(question: str, evidence: list) -> str:
+    content, _ = _complete([
+        {"role": "system", "content": SYSTEM},
+        {"role": "user", "content": "QUESTION: " + question + "\n\nEVIDENCE:\n" +
+         "\n".join(f"[{e['id']}] {e['text']}" for e in evidence)},
+    ], _sampling(0), False, 120)
+    return content
 
 
 REWRITE_SYSTEM = (
@@ -66,43 +123,27 @@ REWRITE_SYSTEM = (
 
 def rewrite_queries(question: str, n: int = 2) -> list:
     """Generate alternative recall queries for reflect's multi-round loop."""
-    body = json.dumps({
-        "model": MODEL, **_sampling(0.3),
-        "messages": [
-            {"role": "system", "content": REWRITE_SYSTEM},
-            {"role": "user", "content": question},
-        ],
-    }).encode()
-    req = urllib.request.Request(BASE + "/chat/completions", data=body, method="POST",
-                                 headers={"Content-Type": "application/json",
-                                          "Authorization": f"Bearer {KEY}"})
-    out = http_retry.request_json(req, timeout=60)
+    content, _ = _complete([
+        {"role": "system", "content": REWRITE_SYSTEM},
+        {"role": "user", "content": question},
+    ], _sampling(0.3), False, 60)
     lines = [l.strip().lstrip("0123456789.-) ") for l in
-             out["choices"][0]["message"]["content"].splitlines() if l.strip()]
+             content.splitlines() if l.strip()]
     return lines[:n]
 
 
 def chat_json(system: str, user: str, timeout: int = 120) -> dict:
     """One temperature-0 chat completion that must return a JSON object (label extraction).
     Raises on transport errors, empty content or a non-object body: the caller decides policy."""
-    body = json.dumps({
-        "model": MODEL, **_sampling(0), **_template_kwargs(),
-        "response_format": {"type": "json_object"},
-        "messages": [{"role": "system", "content": system},
-                     {"role": "user", "content": "Return a json object.\n\n" + user}],
-    }).encode()
-    req = urllib.request.Request(BASE + "/chat/completions", data=body, method="POST",
-                                 headers={"Content-Type": "application/json",
-                                          "Authorization": f"Bearer {KEY}"})
-    out = http_retry.request_json(req, timeout=timeout)
-    choice = out["choices"][0]
-    raw = choice["message"].get("content") or ""
+    raw, reason = _complete([
+        {"role": "system", "content": system},
+        {"role": "user", "content": "Return a json object.\n\n" + user}],
+        _sampling(0), True, timeout)
     content = raw.strip()
     if content.startswith("```"):                      # tolerate a fenced reply
         content = content.strip("`")
         if content[:4].lower() == "json":
             content = content[4:]
-    reason = choice.get("finish_reason")
     reason = reason if reason in ("stop", "length", "content_filter", "tool_calls") else "other"
     try:
         obj = json.loads(content)
