@@ -633,6 +633,13 @@ def test_missing_otel_packages_do_not_break_the_app():
         "with telemetry.span('x') as sp: assert sp is None\n"
         "r = TestClient(m.app).get('/health')\n"
         "assert r.status_code == 200, r.text\n"
+        # /health starts a daemon thread that loads the local model; exiting while it is inside
+        # native code aborts the interpreter at shutdown, after the assertions already passed
+        "from app import embeddings\n"
+        "loader = embeddings._loader\n"
+        "if loader is not None:\n"
+        "    loader.join(timeout=90)\n"
+        "    assert not loader.is_alive(), 'model loader still running'\n"
         "print('OK')\n")
     env = dict(os.environ, AMES_OTEL_ENABLED="1",
                OTEL_EXPORTER_OTLP_ENDPOINT="http://collector.invalid:4318")
