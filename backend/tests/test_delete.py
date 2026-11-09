@@ -11,8 +11,8 @@ from app.main import app  # noqa: E402
 from app import auth  # noqa: E402
 
 client = TestClient(app)
-ALICE = auth.create_key("alice")
-BOB = auth.create_key("bob")
+ALICE = auth.create_key("alice", person="alice")
+BOB = auth.create_key("bob", person="bob")
 H = lambda k: {"X-API-Key": k}  # noqa: E731
 
 from app.store import es, PREFIX, idx  # noqa: E402

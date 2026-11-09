@@ -144,7 +144,7 @@ def test_per_doc_one_is_honoured_end_to_end_through_the_http_api():
     from app.main import app
     from app import auth
     _seed()
-    key = auth.create_key(OWNER)
+    key = auth.create_key(OWNER, person=OWNER)
     client = TestClient(app)
     r = client.post("/memory/recall", headers={"X-API-Key": key},
                     json={"query": Q, "kinds": ["episodic"], "size": 8,

@@ -16,6 +16,7 @@ from . import embeddings
 from . import secrets_guard
 from . import tagfilter as _tf
 from . import tombstone
+from . import governance
 
 _recall_log = logging.getLogger("ames.recall")
 
@@ -361,11 +362,14 @@ def _nearest_dup(owner_id: str, kind: str, visibility: str, vec):
     near-duplicate write (supersedes/superseded_by), never to drop it."""
     if vec is None:
         return None
+    flt = _scope_filter(owner_id, kind, visibility)["bool"]["filter"]
+    if kind == "semantic" and visibility == "team":
+        # governed decisions are never linked as near-duplicates (either side of the pair)
+        flt = {"bool": {"filter": flt, "must_not": governance.exclusion_clauses()}}
     r = es("POST", f"/{idx(kind)}/_search", {
         "size": 1,
         "knn": {"field": "embedding", "query_vector": vec, "k": 1,
-                "num_candidates": knn_num_candidates(1),
-                "filter": _scope_filter(owner_id, kind, visibility)["bool"]["filter"]},
+                "num_candidates": knn_num_candidates(1), "filter": flt},
     })
     hits = r["hits"]["hits"]
     if not hits:
@@ -392,12 +396,13 @@ def _reject_secret(text, tags) -> None:
 def retain(owner_id: str, kind: str, text: str, visibility: str = "private",
            occurred_at: Optional[str] = None, doc_group: Optional[str] = None,
            tags: Optional[list] = None, labels: Optional[list] = None,
-           extract_facts: bool = True) -> dict:
+           extract_facts: bool = True, supersedes_decision: Optional[str] = None,
+           person: Optional[str] = None) -> dict:
     """Write a memory, refusing text that looks like a credential (ValueError -> HTTP 422) and
     flagging over-long text with a `too_long` hint on the result (the write still happens)."""
     _reject_secret(text, tags)
     out = _retain(owner_id, kind, text, visibility, occurred_at, doc_group, tags, labels,
-                  extract_facts)
+                  extract_facts, supersedes_decision, person=person)
     if isinstance(text, str) and len(text) > RETAIN_SOFT_MAX_CHARS:
         out["too_long"] = True
         out["too_long_hint"] = (f"text is {len(text)} chars (> {RETAIN_SOFT_MAX_CHARS}); "
@@ -408,7 +413,9 @@ def retain(owner_id: str, kind: str, text: str, visibility: str = "private",
 def _retain(owner_id: str, kind: str, text: str, visibility: str = "private",
             occurred_at: Optional[str] = None, doc_group: Optional[str] = None,
             tags: Optional[list] = None, labels: Optional[list] = None,
-            extract_facts: bool = True) -> dict:
+            extract_facts: bool = True, supersedes_decision: Optional[str] = None,
+            _proposal: Optional[dict] = None, person: Optional[str] = None,
+            _group: Optional[str] = None) -> dict:
     """Write a memory. Long text is split into verbatim passages (cause 2) that share
     a `doc_group` (the caller's stable id for the source document, e.g. a session id);
     recall returns each passage with its group + occurred_at, so callers can treat a
@@ -438,6 +445,10 @@ def _retain(owner_id: str, kind: str, text: str, visibility: str = "private",
         out = {"_id": dup_id, "doc_group": existing.get("doc_group") or dup_id,
                "deduped": True, "dedup_reason": "exact_text_hash",
                **existing, "deduped_against_owner": existing.get("owner_id")}
+        if governance.is_governed(existing):
+            # identical text of a decision already in the pipeline: never a second proposal
+            out["decision_status"] = existing.get("decision_status")
+            out["approvals_needed"] = governance.approvals_needed(existing)
         if kind == "episodic" and extract_facts:
             from . import facts
             out["fact_jobs"] = []
@@ -458,13 +469,35 @@ def _retain(owner_id: str, kind: str, text: str, visibility: str = "private",
         if len(write_tags) > _tf.MAX_TAGS_PER_WRITE:
             write_tags = write_tags[:_tf.MAX_TAGS_PER_WRITE]
             extraction["capped"] = True
+    governed = governance.is_governed_write(kind, visibility, write_tags)
+    if supersedes_decision is not None and not governed:
+        raise ValueError("supersedes_decision applies only to a team semantic memory tagged "
+                         f"{governance.DECISION_TAG}")
+    override_of = None
+    if governed and _proposal is None:
+        governance.require_person(person)
+        # fail closed BEFORE any write: a bad override target must leave nothing behind
+        override_of = (governance.validate_override_target(supersedes_decision)
+                       if supersedes_decision is not None else None)
     passages = chunk_text(text)
-    group = doc_group or ("dg_%s" % uuid.uuid4().hex)
+    # A governed write never takes the caller's doc_group: a group is only a label, and status
+    # fields are mirrored per group, so a caller-chosen name could pull unrelated docs in.
+    # `_group` is the edit path re-using the proposal's own server-generated group.
+    group = (_group or "dg_%s" % uuid.uuid4().hex) if governed else (
+        doc_group or ("dg_%s" % uuid.uuid4().hex))
+    author = person or owner_id
     occurred = occurred_at or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     # Embeddings stay optional (BM25-only degrade) but the degrade is reported, never silent.
     vecs, embed_error = embeddings.embed_safe([passages[0]])
     vec = vecs[0] if vecs else None
-    near = _nearest_dup(owner_id, kind, visibility, vec)
+    near = None if governed else _nearest_dup(owner_id, kind, visibility, vec)
+    gov_fields = None
+    if governed:
+        if _proposal is None:
+            gov_fields = governance.proposal_fields(author, owner_id, override_of)
+            governance.audit_propose(author, group, h, override_of)   # BEFORE the first write
+        else:
+            gov_fields = dict(_proposal)
     ids = []
     unembedded = 1 if vec is None else 0   # passages written without a vector
     for i, passage in enumerate(passages):
@@ -485,6 +518,8 @@ def _retain(owner_id: str, kind: str, text: str, visibility: str = "private",
             doc["fact_requested"] = True
         if write_tags:
             doc[_tf.TAG_FIELD] = list(write_tags)
+        if gov_fields:
+            doc.update(gov_fields)
         if vec is not None:
             # Each passage gets its OWN embedding (that is the point of chunking);
             # reuse the already-computed head vector for passage 0.
@@ -511,6 +546,8 @@ def _retain(owner_id: str, kind: str, text: str, visibility: str = "private",
         out["embed_error"] = embed_error
     if write_tags:
         out["tags"] = list(write_tags)
+    if gov_fields:
+        out.update(governance.propose_result(gov_fields))
     if extraction is not None:
         out["extraction"] = extraction
     if near and near[1] >= DEDUP_SIM_THRESHOLD:
@@ -632,13 +669,32 @@ def _group_hits(owner_id: str, kind: str, doc_id: str) -> list:
     return hits or [(doc_id, s.get("text", ""))]
 
 
+def _assert_group_mutable(owner_id: str, kind: str, s: dict) -> None:
+    """update / delete / promote act on the whole group, so they must clear every member, not
+    only the addressed doc: a decision in force (or closed) cannot be changed through a sibling,
+    and an open proposal cannot be reached through a doc that is not itself governed."""
+    group = s.get("doc_group")
+    if not group:
+        return
+    r = es("POST", f"/{idx(kind)}/_search", {
+        "size": MAX_PASSAGES, "_source": ["decision_status"],
+        "query": {"bool": {"filter": _owned_group_query(owner_id, group)["bool"]["filter"] + [
+            {"exists": {"field": "decision_status"}}]}}})
+    for h in r["hits"]["hits"]:
+        if not governance.is_governed(s):
+            raise governance.GovernedError()
+        governance.check_mutable(h["_source"])
+
+
 def _group_docs(owner_id: str, kind: str, doc_id: str) -> list:
     return [i for i, _ in _group_hits(owner_id, kind, doc_id)]
 
 
-def _log_mutation(intent: str, owner_id: str, kind: str, doc_id: str, detail: dict) -> None:
+def _log_mutation(intent: str, owner_id: str, kind: str, doc_id: str, detail: dict,
+                  strict: bool = False) -> Optional[str]:
     """Best-effort intent log (who/what/when) written BEFORE the mutation runs.
-    A logging failure never blocks the mutation."""
+    A logging failure never blocks the mutation, except with strict=True (decision governance:
+    a transition that cannot be audited must not happen)."""
     from .store import PREFIX
     doc = {"intent": intent, "owner_id": owner_id, "kind": kind, "doc_id": doc_id,
            "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "detail": detail}
@@ -664,13 +720,15 @@ def _log_mutation(intent: str, owner_id: str, kind: str, doc_id: str, detail: di
     except RuntimeError:
         pass
     try:
-        es("POST", f"/{PREFIX}am_mutations/_doc?refresh=true", doc)
+        return es("POST", f"/{PREFIX}am_mutations/_doc?refresh=true", doc).get("_id")
     except RuntimeError:
-        pass
+        if strict:
+            raise
+    return None
 
 
 def update(owner_id: str, kind: str, doc_id: str, text=None, tags=None,
-           visibility=None, occurred_at=None) -> dict:
+           visibility=None, occurred_at=None, person: Optional[str] = None) -> dict:
     """Fix a memory in place: replace text (re-chunked, re-embedded) and/or
     tags/visibility/occurred_at across the whole doc_group. The group id is
     stable. Owner-scoped (same check as promote). The new text goes through
@@ -684,15 +742,47 @@ def update(owner_id: str, kind: str, doc_id: str, text=None, tags=None,
         raise PermissionError("only the creator can modify their memory")
     if _is_superseded(s):
         raise SupersededError(doc_id, _live_successor(kind, s))
+    governance.check_mutable(s)         # active / closed decisions: 409, the creator included
+    _assert_group_mutable(owner_id, kind, s)
+    if governance.is_governed(s) and not governance.is_author(s, person, owner_id):
+        raise PermissionError("only the creator can modify their memory")
     if visibility is not None and visibility not in VISIBILITIES:
         raise ValueError(f"visibility must be one of {VISIBILITIES}")
     _check_text_size(text)
     _reject_secret(text, tags)  # before _log_mutation and the delete: a 422 must change nothing
+    proposal = None
+    if governance.is_governed(s):
+        # an open proposal edited by its author: stays a proposal, approvals reset below
+        if (visibility not in (None, "team") or
+                (tags is not None and governance.DECISION_TAG not in _tf.norm_tags(tags))):
+            raise ValueError("a proposed decision stays a team decision; delete it to withdraw")
+        proposal = {k: s[k] for k in ("decision_status", "proposed_by", "proposed_by_persons",
+                                          "proposal_for") if k in s}
+        proposal["approvals"] = []
+        if s.get("proposal_expires_at"):
+            proposal["proposal_expires_at"] = s["proposal_expires_at"]   # an edit never extends the TTL
+        if s.get("objections"):
+            proposal["objections"] = s["objections"]
+    elif kind == "semantic" and (visibility == "team" or (
+            tags is not None and s["visibility"] == "team")):
+        # no side door around the proposal flow: update cannot make an existing doc a decision
+        will_have = _tf.norm_tags(tags) if tags is not None else (s.get(_tf.TAG_FIELD) or [])
+        if governance.DECISION_TAG in will_have and (
+                s["visibility"] != "team" or governance.DECISION_TAG not in (s.get(_tf.TAG_FIELD) or [])):
+            raise ValueError("a decision cannot be created through update; retain it as a team "
+                             "memory tagged " + governance.DECISION_TAG + " to propose it")
     group = s.get("doc_group")
     occurred = s.get("occurred_at")
     old_tags = s.get(_tf.TAG_FIELD)
     old_text = s["text"] if text is not None else None
     hits = _group_hits(owner_id, kind, doc_id)
+    if proposal is not None:
+        # only the passages of THIS decision: a stray doc sharing the group name is not part of it
+        mine = es("POST", f"/{idx(kind)}/_search", {
+            "size": MAX_PASSAGES, "_source": False,
+            "query": {"bool": {"filter": governance._scope(s)}}})
+        mine_ids = {h["_id"] for h in mine["hits"]["hits"]}
+        hits = [(i, t) for i, t in hits if i in mine_ids] or hits
     old_ids = [i for i, _ in hits] if text is not None else []
     new_tags = _tf.norm_tags(tags) if tags is not None else None
     target_vis = visibility or s["visibility"]
@@ -709,15 +799,24 @@ def update(owner_id: str, kind: str, doc_id: str, text=None, tags=None,
                 "note": "no-op: identical normalized text, tags and visibility"}
     _log_mutation("update", owner_id, kind, doc_id,
                   {"old_text": old_text, "new_text": text, "old_ids": old_ids,
-                   "old_tags": old_tags, "tags": tags, "visibility": visibility})
+                   "old_tags": old_tags, "tags": tags, "visibility": visibility},
+                  strict=proposal is not None)
     if text is not None:
-        if len(old_ids) == 1:
+        if proposal is not None:
+            # write the new passages first, delete the old ones only once the new text is
+            # stored: a collision or a failure partway must leave the original proposal intact
+            _reject_secret(text, new_tags)
+            r = _rewrite_proposal(owner_id, kind, s, text, target_vis, occurred,
+                                  new_tags if new_tags is not None else old_tags,
+                                  proposal, group, old_ids)
+        elif len(old_ids) == 1:
             es("DELETE", f"/{idx(kind)}/_doc/{_q(old_ids[0])}?refresh=true")
         else:
             es("POST", f"/{idx(kind)}/_delete_by_query?refresh=true",
                {"query": _owned_group_query(owner_id, group)})
-        r = retain(owner_id, kind, text, target_vis,
-                   occurred_at=occurred, doc_group=group, tags=new_tags)
+        if proposal is None:
+            r = retain(owner_id, kind, text, target_vis,
+                       occurred_at=occurred, doc_group=group, tags=new_tags)
         out = {"_id": r["_id"], "doc_group": r.get("doc_group", group),
                "passages": r.get("passages"), "updated": True}
         if "embedded" in r:
@@ -739,7 +838,36 @@ def update(owner_id: str, kind: str, doc_id: str, text=None, tags=None,
             "passages": len(old_ids), "updated": bool(patch)}
 
 
-def delete(owner_id: str, kind: str, doc_id: str, retract: bool = False) -> dict:
+def _rewrite_proposal(owner_id, kind, s, text, visibility, occurred, tags, proposal, group,
+                      old_ids) -> dict:
+    """Replace the text of an open proposal without ever losing it: the new passages are written
+    first (same server-generated group, new text hash), the old ones deleted only afterwards.
+    A collision with another doc raises before anything is written; a failure partway removes the
+    partial new passages and leaves the original untouched."""
+    new_hash = text_hash(text)
+    if new_hash == s.get("text_hash"):
+        # same text, new tags: nothing to rewrite, the approvals stay bound to this text
+        for i in old_ids:
+            es("POST", f"/{idx(kind)}/_update/{_q(i)}?refresh=true",
+               {"doc": {_tf.TAG_FIELD: list(tags or [])}})
+        return {"_id": old_ids[0], "doc_group": group, "passages": len(old_ids)}
+    try:
+        r = _retain(owner_id, kind, text, visibility, occurred_at=occurred, tags=tags,
+                    _proposal=proposal, _group=group)
+    except Exception:
+        es("POST", f"/{idx(kind)}/_delete_by_query?refresh=true&conflicts=proceed",
+           {"query": {"bool": {"filter": governance._scope(
+               {"doc_group": group, "owner_id": owner_id, "text_hash": new_hash})}}})
+        raise
+    if r.get("deduped"):
+        raise ValueError("an identical memory already exists; the proposal was left unchanged")
+    for old in old_ids:
+        es("DELETE", f"/{idx(kind)}/_doc/{_q(old)}?refresh=true")
+    return r
+
+
+def delete(owner_id: str, kind: str, doc_id: str, retract: bool = False,
+           person: Optional[str] = None) -> dict:
     """Delete a memory (the whole doc_group) by id. Owner-scoped: another owner's
     doc is a PermissionError (HTTP 403), matching promote. Intent (who/when/what)
     is logged to am_mutations BEFORE the delete runs. A plain delete only removes
@@ -756,6 +884,11 @@ def delete(owner_id: str, kind: str, doc_id: str, retract: bool = False) -> dict
         raise PermissionError("only the creator can delete their memory")
     if _is_superseded(s):
         raise SupersededError(doc_id, _live_successor(kind, s))
+    _assert_group_mutable(owner_id, kind, s)
+    if governance.is_governed(s):
+        if s.get("decision_status") == governance.PROPOSED:
+            return governance.withdraw(person or owner_id, doc_id, owner_id)   # author's delete = withdrawn
+        governance.check_mutable(s)
     group = s.get("doc_group")
     _log_mutation("delete", owner_id, kind, doc_id,
                   {"text": s["text"], "doc_group": group,
@@ -1009,7 +1142,8 @@ def recall(owner_id: str, query: str, kinds=None, size: int = 8,
            rerank: Optional[bool] = None,
            filter: Optional[dict] = None,
            rerank_depth: Optional[int] = None,
-           min_similarity: Optional[float] = None) -> dict:
+           min_similarity: Optional[float] = None,
+           include_inactive_decisions: bool = False) -> dict:
     """Hybrid recall: BM25 + kNN fused per-kind, visibility isolation, RRF across kinds.
 
     Returns a single flat `results` list (RRF + recency fused, score-ordered) with
@@ -1031,7 +1165,13 @@ def recall(owner_id: str, query: str, kinds=None, size: int = 8,
     candidate set INSIDE Elasticsearch (BM25 filter + kNN pre-filter + temporal arm). A filter
     that matches nothing returns `results: []` with `abstained: true` and never an unfiltered
     top-k. With no filter this function is unchanged.
+
+    Decision governance: active decisions are returned as before, open proposals carry
+    `decision_status: proposed`, and rejected / expired / superseded decisions are hidden unless
+    `include_inactive_decisions` is true (they are stored `active: false`).
     """
+    if not isinstance(include_inactive_decisions, bool):
+        raise ValueError("include_inactive_decisions must be a boolean")
     t_start = time.perf_counter()
     if kinds:
         bad = [k for k in kinds if k not in KINDS]
@@ -1090,7 +1230,12 @@ def recall(owner_id: str, query: str, kinds=None, size: int = 8,
                           {"range": {"valid_from": {"lte": instant}}}], "minimum_should_match": 1}},
                         {"bool": {"should": [{"bool": {"must_not": {"exists": {"field": "valid_to"}}}},
                           {"range": {"valid_to": {"gt": instant}}}], "minimum_should_match": 1}}]
-        base_filter = [{"term": {"active": True}}, _visibility_filter(owner_id)] + flt_extra + validity
+        active_clause = {"term": {"active": True}}
+        if include_inactive_decisions and kind == "semantic":
+            active_clause = {"bool": {"should": [
+                {"term": {"active": True}},
+                {"terms": {"decision_status": list(governance.TERMINAL)}}], "minimum_should_match": 1}}
+        base_filter = [active_clause, _visibility_filter(owner_id)] + flt_extra + validity
         lexical_query = {"bool": {"must": must, "filter": base_filter,
                                   **({"must_not": flt_not} if flt_not else {})}}
         if qvec is not None:
@@ -1153,7 +1298,9 @@ def recall(owner_id: str, query: str, kinds=None, size: int = 8,
         from . import graph as _graph
         for rank, h in enumerate([] if parsed is not None else
                                  _graph.graph_expand(owner_id, query, size,
-                                                     _visibility_filter(owner_id))):
+                                                     _visibility_filter(owner_id),
+                                                     **({"include_inactive_decisions": True}
+                                                        if include_inactive_decisions else {}))):
             fused.setdefault(h["id"], {**h, "rrf": 0.0, "arm": "graph"})
             fused[h["id"]]["rrf"] += GRAPH_RRF_WEIGHT / (RANK_CONSTANT + rank + 1)
             fused[h["id"]]["graph_hit"] = True
@@ -1263,7 +1410,8 @@ def recall(owner_id: str, query: str, kinds=None, size: int = 8,
     return out
 
 
-def promote(owner_id: str, kind: str, doc_id: str, to_visibility: str) -> dict:
+def promote(owner_id: str, kind: str, doc_id: str, to_visibility: str,
+            person: Optional[str] = None) -> dict:
     """Copy-on-promote: private -> team/common creates a promoted copy; original stays private."""
     if to_visibility not in ("team", "common"):
         raise ValueError("promotion target must be team or common")
@@ -1272,6 +1420,8 @@ def promote(owner_id: str, kind: str, doc_id: str, to_visibility: str) -> dict:
     s = _get_source(kind, doc_id)       # LookupError -> 404 at the edge, not a bare ES 404 -> 500
     if s["owner_id"] != owner_id:
         raise PermissionError("only the creator can promote their memory")
+    governance.check_mutable(s)
+    _assert_group_mutable(owner_id, kind, s)
     if s["visibility"] != "private":
         raise ValueError("only private memories can be promoted")
     allowed, reason = guard_promotion(s["text"], to_visibility)
@@ -1280,8 +1430,20 @@ def promote(owner_id: str, kind: str, doc_id: str, to_visibility: str) -> dict:
     copy = {k: v for k, v in s.items() if k not in ("superseded_by", "supersedes")}
     copy["visibility"] = to_visibility
     copy["promoted_from"] = doc_id
+    governed = governance.is_governed_write(kind, to_visibility, copy.get(_tf.TAG_FIELD))
+    if governed:
+        # promoting a private decision to the team bank is a proposal, never an active decision
+        governance.require_person(person)
+        author = person
+        copy["doc_group"] = "dg_%s" % uuid.uuid4().hex     # the proposal gets its own group
+        copy["passage_index"] = 0
+        copy.update(governance.proposal_fields(author, owner_id))
+        governance.audit_propose(author, copy["doc_group"], copy.get("text_hash"), None)
     r = es("POST", f"/{idx(kind)}/_doc?refresh=true", copy)
-    return {"promoted_id": r["_id"], "visibility": to_visibility}
+    out = {"promoted_id": r["_id"], "visibility": to_visibility}
+    if governed:
+        out.update(governance.propose_result(copy))
+    return out
 
 
 def _supersede(owner_id: str, old_id: str, new_id: str, kind: str = "semantic") -> None:
@@ -1291,6 +1453,8 @@ def _supersede(owner_id: str, old_id: str, new_id: str, kind: str = "semantic") 
     new = es("GET", f"/{idx(kind)}/_doc/{new_id}")["_source"]
     if old["owner_id"] != owner_id or new["owner_id"] != owner_id:
         raise PermissionError("supersede requires both memories to belong to the caller")
+    if governance.is_governed(old) or governance.is_governed(new):
+        raise governance.GovernedError()
     es("POST", f"/{idx(kind)}/_update/{old_id}?refresh=true",
        {"doc": {"active": False, "superseded_by": new_id}})
 
@@ -1306,7 +1470,7 @@ def consolidate(owner_id: str, kind: str = "semantic", similarity_threshold: flo
         "size": 200,
         "query": {"bool": {"filter": [
             {"term": {"active": True}}, {"term": {"owner_id": owner_id}},
-        ]}},
+        ], "must_not": governance.exclusion_clauses()}},
         "sort": [{"occurred_at": {"order": "asc"}}],
     }
     r = es("POST", f"/{idx(kind)}/_search", body)

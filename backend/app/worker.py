@@ -4,7 +4,7 @@ import logging
 import os
 import time
 
-from . import auth, embeddings, memory, mental_models as mm
+from . import auth, embeddings, governance, memory, mental_models as mm
 from .store import KINDS, es, idx
 
 log = logging.getLogger(__name__)
@@ -176,6 +176,10 @@ def run_forever(interval_s: int = 0):
             print(time.strftime("%H:%M:%S"), "reembed", reembed_sweep(), flush=True)
         except Exception as e:  # noqa: BLE001 — a failed sweep must not stop consolidation
             print(time.strftime("%H:%M:%S"), "reembed error:", e, flush=True)
+        try:
+            print(time.strftime("%H:%M:%S"), "governance", governance.expire_stale_proposals(), flush=True)
+        except Exception as e:  # noqa: BLE001 — a failed pass must not stop the loop
+            print(time.strftime("%H:%M:%S"), "governance error:", e, flush=True)
         time.sleep(interval_s)
 
 

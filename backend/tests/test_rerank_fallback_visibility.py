@@ -155,7 +155,7 @@ def test_http_request_depth_reaches_the_reranker_and_response_has_rerank_block(m
         seen["n"] = len(h)
         return {"hits": h[:top_n], "reranked": False, "fallback_reason": "timeout", "ms": 7}
     monkeypatch.setattr(reranker, "rerank", spy)
-    c = TestClient(app); key = auth.create_key(OWNER)
+    c = TestClient(app); key = auth.create_key(OWNER, person=OWNER)
     r = c.post("/memory/recall", headers={"X-API-Key": key},
                json={"query": Q, "kinds": ["episodic"], "size": 3, "as_of": "2023-05-30",
                      "rerank": True, "rerank_depth": 3})

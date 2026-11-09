@@ -24,8 +24,8 @@ client = TestClient(app)
 # Dedicated owners + module-level cleanup: a second run of this suite would
 # otherwise dedup onto the previous run's docs (different doc_group), breaking
 # the group-stability assertions.
-ALICE = auth.create_key("mutationalice")
-BOB = auth.create_key("mutationbob")
+ALICE = auth.create_key("mutationalice", person="mutationalice")
+BOB = auth.create_key("mutationbob", person="mutationbob")
 OWNER = "mutationalice"
 H = lambda k: {"X-API-Key": k}  # noqa: E731
 
