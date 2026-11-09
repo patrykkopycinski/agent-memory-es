@@ -14,6 +14,19 @@ from typing import Optional
 _lock = threading.Lock()
 
 
+class KeyStoreUnavailable(RuntimeError):
+    """The Elasticsearch key store cannot be read or written. Lookups fail closed on it."""
+
+
+def es_mode() -> bool:
+    """AMES_KEY_STORE=es keeps keys in Elasticsearch (stateless deploys: Cloud Run); the default
+    `file` is the key volume. Read per call so tests can scope it."""
+    mode = os.environ.get("AMES_KEY_STORE", "file").strip().lower()
+    if mode not in ("file", "es"):
+        raise ValueError(f"AMES_KEY_STORE must be 'file' or 'es', got {mode!r}")
+    return mode == "es"
+
+
 def _keys_file() -> str:
     # resolved per call so tests (and multi-tenant deploys) can scope key stores
     return os.environ.get("AMES_API_KEYS_FILE",
@@ -54,6 +67,9 @@ def _read() -> dict:
 def load_readonly() -> dict:
     """Keys with legacy entries normalized in memory only. For processes that share the
     key volume read-only (the consolidation worker): never writes, never takes the lock."""
+    if es_mode():
+        from . import keystore_es
+        return keystore_es.list_all()
     keys = _read()
     _normalize_legacy(keys)
     return keys
@@ -166,6 +182,11 @@ def clean_person(person: Optional[str]) -> str:
     return person.strip().lower()
 
 
+def _mint() -> tuple:
+    token = "ame_" + secrets.token_hex(32)
+    return token, hashlib.sha256(token.encode()).hexdigest()
+
+
 def create_key(owner_id: str, role: str = "member", person: Optional[str] = None) -> str:
     """Mint an API key for owner_id. Returns the plaintext key once. `person` is REQUIRED: it names
     the human behind the key, and governance counts people, not keys (a key with no person would
@@ -175,9 +196,11 @@ def create_key(owner_id: str, role: str = "member", person: Optional[str] = None
     if role not in ROLES:
         raise ValueError(f"role must be one of {ROLES}")
     person = clean_person(person)
-    token = "ame_" + secrets.token_hex(32)
-    digest = hashlib.sha256(token.encode()).hexdigest()
     entry = {"owner_id": owner_id, "role": role, "person": person}
+    if es_mode():
+        from . import keystore_es
+        return keystore_es.create(entry, _mint)
+    token, digest = _mint()
     with _guard():
         keys = _load()
         keys[digest] = entry
@@ -189,6 +212,9 @@ def set_person(owner_id: str, person: str) -> int:
     """Admin: name the person behind every key of `owner_id` that has none (legacy keys). Keys that
     already name a person are left alone. Returns how many keys were updated."""
     person = clean_person(person)
+    if es_mode():
+        from . import keystore_es
+        return keystore_es.set_person(owner_id, person)
     with _guard():
         keys = _load()
         n = 0
@@ -203,6 +229,9 @@ def set_person(owner_id: str, person: str) -> int:
 
 def persons_of(owner_id: Optional[str]) -> set:
     """Every person named on a key of `owner_id` (read-only, like the worker's key view)."""
+    if es_mode():
+        from . import keystore_es
+        return keystore_es.persons_of(owner_id)
     return {e["person"].lower() for e in load_readonly().values()
             if isinstance(e, dict) and e.get("owner_id") == owner_id
             and isinstance(e.get("person"), str) and e["person"]}
@@ -232,6 +261,9 @@ def owner_of(token: str) -> Optional[dict]:
     if not token:
         return None
     digest = hashlib.sha256(token.encode()).hexdigest()
+    if es_mode():
+        from . import keystore_es
+        return keystore_es.get(digest)
     # lock-free: _save is an atomic os.replace, so a reader sees a whole old or new file
     keys = _read()
     if _normalize_legacy(keys) and _migration_due(_keys_file()):
@@ -249,6 +281,9 @@ def owner_of(token: str) -> Optional[dict]:
 
 def delete_key(token: str) -> bool:
     digest = hashlib.sha256(token.encode()).hexdigest()
+    if es_mode():
+        from . import keystore_es
+        return keystore_es.delete(digest)
     with _guard():
         keys = _load()
         if digest in keys:

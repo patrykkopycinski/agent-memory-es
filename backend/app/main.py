@@ -73,6 +73,9 @@ def _startup():
     facts.ensure_queue()
     pages_mod.ensure_pages_index()
     mm_mod.ensure_models_index()
+    if auth.es_mode():
+        from . import keystore_es
+        keystore_es.ensure_index()
     _warm_embedder_in_background()
 
 
@@ -96,6 +99,13 @@ def _warm_embedder_in_background() -> None:
         _warmup_thread = thread
     except Exception:
         logging.getLogger("ames.startup").warning("could not start embedder warm-up", exc_info=True)
+
+
+@app.exception_handler(auth.KeyStoreUnavailable)
+def _key_store_unavailable(_request, exc):
+    # lookups fail closed; the cause stays in the server log
+    logging.getLogger("ames.auth").error("%s", exc)
+    return JSONResponse({"detail": "key store unavailable"}, status_code=503)
 
 
 def _identify(x_api_key: Optional[str]) -> dict:
@@ -215,7 +225,7 @@ def mint_key(owner_id: str, role: str = "member", person: Optional[str] = None,
         return {"api_key": auth.create_key(owner_id, role, person), "owner_id": owner_id}
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from None
-    except auth.KeyStoreNotWritable as exc:
+    except (auth.KeyStoreNotWritable, auth.KeyStoreUnavailable) as exc:
         # path/errno stay server-side; the client only learns the store is unavailable
         logging.getLogger("ames.auth").error("%s", exc)
         raise HTTPException(503, "key store not writable") from None
@@ -252,7 +262,7 @@ def set_key_person(owner_id: str, person: str, _admin: str = Header(None, alias=
         return {"owner_id": owner_id, "person": person, "updated": updated}
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from None
-    except auth.KeyStoreNotWritable as exc:
+    except (auth.KeyStoreNotWritable, auth.KeyStoreUnavailable) as exc:
         logging.getLogger("ames.auth").error("%s", exc)
         raise HTTPException(503, "key store not writable") from None
 
@@ -692,6 +702,11 @@ def _compute_health() -> dict:
             "embed_failures": dict(embeddings.FAILURES)}
     if embed_error:
         body["embed_error"] = embed_error
+    if auth.es_mode():
+        from . import keystore_es
+        body["key_store"] = "es"
+        body["key_store_ok"] = keystore_es.health()
+        body["ok"] = body["ok"] and body["key_store_ok"]
     return body
 
 
@@ -757,4 +772,5 @@ def health_ready():
     """Readiness: same body as /health, HTTP 503 while degraded (embed probe failing). The
     2026-10-31 license expiry silently wrote vector-less docs for five days behind a green health."""
     body = _health_cached()
-    return JSONResponse(body, status_code=503 if body["degraded"] else 200)
+    not_ready = body["degraded"] or body.get("key_store_ok") is False
+    return JSONResponse(body, status_code=503 if not_ready else 200)
