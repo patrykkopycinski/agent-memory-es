@@ -172,6 +172,11 @@ MCP servers, which also send a W3C `traceparent` to the backend so one trace
 runs MCP -> HTTP -> memory.recall -> es.request. Recall spans carry
 `memory.recall.quality.{hit_count,empty,top_score,min_score,score_spread}`.
 
+On shutdown the server waits up to `AMES_SHUTDOWN_LOADER_WAIT_S` seconds (default 10)
+for an in-flight local embedding model load, then flushes spans; interpreter teardown
+mid-load can abort the process and lose the last batch. A load that outlasts the wait
+is logged as a warning and shutdown proceeds.
+
 Privacy model: spans carry kinds, visibility, counts, lengths and timings, plus
 a truncated, unsalted hash of the owner (`ames.owner_hash`). That hash is a
 pseudonym, not anonymisation: a dictionary attack over guessable owner ids can
