@@ -4,6 +4,7 @@ import logging
 import os
 import re
 import urllib.error
+import urllib.parse
 import urllib.request
 from typing import Any, Optional
 
@@ -99,23 +100,42 @@ _ALLOWED_CLUSTER_APIS = (
 )
 
 
+_SAFE_NAME = re.compile(r"[A-Za-z0-9_.\-]+")
+
+
+def _decode_fully(text: str) -> str:
+    """Percent-decode until stable: ES decodes path segments, so the guard must judge the
+    names ES will act on, not their encoded spelling. Only used for checking; the request
+    is sent unchanged."""
+    for _ in range(8):
+        decoded = urllib.parse.unquote(text)
+        if decoded == text:
+            return text
+        text = decoded
+    return text
+
+
 def _guard_path(path: str, method: str) -> None:
     """Under tests (AMES_TEST_GUARD=1, set by tests/conftest.py and
     tests/_safety.py): refuse any request that could touch non-test data.
     Every comma-separated index name is checked; wildcards and _all are
     refused; cluster-level APIs pass only if allowlisted AND read-only."""
-    p = path.split("?", 1)[0].lstrip("/")
-    if p == "":
+    raw = path.split("?", 1)[0].lstrip("/")
+    if raw == "":
         return
-    if p.startswith("_index_template/"):
-        name = p.split("/", 1)[1]
-        if not name or "/" in name or "*" in name or not name.startswith(PREFIX):
+    # Judge the names ES will act on: decode each path segment on its own (an encoded '/' or ','
+    # inside a name must not split or hide it), and only look at the segments the checks need.
+    first_raw, _, rest = raw.partition("/")
+    first = _decode_fully(first_raw)
+    if first == "_index_template":
+        name = _decode_fully(rest)
+        if not _SAFE_NAME.fullmatch(name) or not name.startswith(PREFIX):
             raise RuntimeError(
                 f"ES test guard: refusing {method} {path} — index template "
-                f"{name!r} does not start with required test prefix {PREFIX!r}.")
+                f"{name!r} is not a single plain name starting with required "
+                f"test prefix {PREFIX!r}.")
         return
-    if p.startswith("_"):
-        first = p.split("/", 1)[0]
+    if first.startswith("_"):
         if method not in ("GET", "HEAD"):
             raise RuntimeError(
                 f"ES test guard: refusing {method} {path} — cluster-level "
@@ -125,11 +145,11 @@ def _guard_path(path: str, method: str) -> None:
                 f"ES test guard: refusing {method} {path} — cluster API "
                 f"{first!r} is not in the test allowlist {_ALLOWED_CLUSTER_APIS}")
         return
-    for index in p.split("/", 1)[0].split(","):
-        if index == "_all" or "*" in index:
+    for index in first.split(","):
+        if index == "_all" or "*" in index or not _SAFE_NAME.fullmatch(index):
             raise RuntimeError(
-                f"ES test guard: refusing {method} {path} — wildcard or "
-                f"_all index {index!r} not allowed under the test guard")
+                f"ES test guard: refusing {method} {path} — wildcard, _all or "
+                f"non-plain index {index!r} not allowed under the test guard")
         if not index.startswith(PREFIX):
             raise RuntimeError(
                 f"ES test guard: refusing {method} {path} — index {index!r} "
