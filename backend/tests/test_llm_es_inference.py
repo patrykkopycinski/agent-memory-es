@@ -160,11 +160,61 @@ def test_rewrite_queries_via_es_inference(es_inference):
 
 def test_missing_inference_id_and_bad_provider(es_inference, monkeypatch):
     es_inference([], AMES_LLM_INFERENCE_ID=" ")
-    with pytest.raises(RuntimeError, match="AMES_LLM_INFERENCE_ID"):
+    with pytest.raises(RuntimeError, match="misconfigured") as missing:
         llm.chat("q", [])
+    assert "AMES_LLM" not in str(missing.value)
+    monkeypatch.setenv("AMES_LLM_PROVIDER", "bedrock")
+    with pytest.raises(ValueError, match="misconfigured") as bad:
+        llm.chat("q", [])
+    assert "bedrock" not in str(bad.value)
+
+
+def test_validate_config_fails_fast_without_echoing_values(monkeypatch):
+    monkeypatch.delenv("AMES_LLM_PROVIDER", raising=False)
+    llm.validate_config()
+    monkeypatch.setenv("AMES_LLM_PROVIDER", "bedrock")
+    with pytest.raises(ValueError, match="AMES_LLM_PROVIDER") as bad:
+        llm.validate_config()
+    assert "bedrock" not in str(bad.value)
+    monkeypatch.setenv("AMES_LLM_PROVIDER", "es_inference")
+    monkeypatch.setenv("AMES_LLM_INFERENCE_ID", " ")
+    with pytest.raises(ValueError, match="AMES_LLM_INFERENCE_ID"):
+        llm.validate_config()
+    monkeypatch.setenv("AMES_LLM_INFERENCE_ID", ".some-endpoint")
+    llm.validate_config()
+
+
+def test_app_startup_refuses_a_bad_llm_provider(monkeypatch, caplog):
+    from app import main
     monkeypatch.setenv("AMES_LLM_PROVIDER", "bedrock")
     with pytest.raises(ValueError):
-        llm.chat("q", [])
+        main._startup()
+    assert "invalid configuration" in caplog.text
+
+
+def test_openai_null_content_returns_empty_string(monkeypatch):
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            self.rfile.read(int(self.headers.get("Content-Length") or 0))
+            data = json.dumps({"choices": [{"finish_reason": "length", "message": {"content": None}}]}).encode()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def log_message(self, *_a):
+            pass
+
+    server = HTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    monkeypatch.delenv("AMES_LLM_PROVIDER", raising=False)
+    monkeypatch.setattr(llm, "BASE", f"http://127.0.0.1:{server.server_port}/v1")
+    monkeypatch.setattr(llm, "KEY", "k")
+    try:
+        assert llm.chat("q", []) == ""
+    finally:
+        server.shutdown()
+        server.server_close()
 
 
 def test_openai_path_is_unchanged(monkeypatch):

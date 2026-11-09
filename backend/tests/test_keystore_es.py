@@ -19,6 +19,7 @@ from app.store import es  # noqa: E402
 def es_keys(monkeypatch):
     monkeypatch.setenv("AMES_KEY_STORE", "es")
     keystore_es._cache.clear()
+    keystore_es.ensure_index()
     yield
     keystore_es._cache.clear()
 
@@ -116,6 +117,7 @@ def test_known_owners_via_es(es_keys):
 
 
 def test_migration_is_idempotent_and_prints_counts_only(es_keys, tmp_path, capsys):
+    _clear_sentinel()
     plain = "ame_" + "c" * 64
     kept, kept_digest = auth._mint()
     path = tmp_path / "keys.json"
@@ -126,7 +128,7 @@ def test_migration_is_idempotent_and_prints_counts_only(es_keys, tmp_path, capsy
     assert keystore_migrate.main(["--from-file", str(path)]) == 0
     first = json.loads(capsys.readouterr().out)
     assert first == {"created": 2, "existing": 0, "skipped": 1}
-    assert keystore_migrate.main(["--from-file", str(path)]) == 0
+    assert keystore_migrate.main(["--from-file", str(path), "--force"]) == 0
     second = json.loads(capsys.readouterr().out)
     assert second == {"created": 0, "existing": 2, "skipped": 1}
     assert path.read_text() == before            # source file untouched
@@ -137,7 +139,168 @@ def test_migration_is_idempotent_and_prints_counts_only(es_keys, tmp_path, capsy
     assert plain not in stored
 
 
+def _clear_sentinel():
+    try:
+        es("DELETE", f"/{keystore_es.INDEX}/_doc/{keystore_es.SENTINEL_ID}?refresh=true")
+    except RuntimeError:
+        pass
+
+
+def test_migration_second_run_is_refused_without_force(es_keys, tmp_path, capsys):
+    _clear_sentinel()
+    _t, digest = auth._mint()
+    path = tmp_path / "keys.json"
+    path.write_text(json.dumps({digest: {"owner_id": "ks-rerun", "role": "member"}}))
+    assert keystore_migrate.main(["--from-file", str(path)]) == 0
+    capsys.readouterr()
+    es("DELETE", f"/{keystore_es.INDEX}/_doc/{digest}?refresh=true")     # revoked after migration
+    assert keystore_migrate.main(["--from-file", str(path)]) == 1
+    assert "refused" in capsys.readouterr().err
+    with pytest.raises(RuntimeError):
+        es("GET", f"/{keystore_es.INDEX}/_doc/{digest}")                 # not resurrected
+    assert keystore_migrate.main(["--from-file", str(path), "--force"]) == 0
+    _clear_sentinel()
+
+
+def test_sentinel_is_invisible_to_key_listings(es_keys):
+    auth.create_key("ks-sent", person="sentp")
+    keystore_es.mark_migrated()
+    assert keystore_es.migration_done() is True
+    assert keystore_es.SENTINEL_ID not in keystore_es.list_all()
+    assert all(v.get("owner_id") for v in keystore_es.list_all().values())
+    assert "ks-sent" in worker.known_owners()
+    assert auth.persons_of("ks-sent") == {"sentp"}
+    assert auth.persons_of(None) == set()
+    _clear_sentinel()
+
+
+def test_migration_skips_invalid_digest_and_role(es_keys, tmp_path, capsys):
+    _clear_sentinel()
+    _t, good = auth._mint()
+    path = tmp_path / "keys.json"
+    path.write_text(json.dumps({
+        good: {"owner_id": "ks-valid", "role": "member"},
+        "migration-sentinel": {"owner_id": "ks-evil", "role": "owner"},
+        "A" * 64: {"owner_id": "ks-upper", "role": "member"},
+        "b" * 63: {"owner_id": "ks-short", "role": "member"},
+        "c" * 64: {"owner_id": "ks-badrole", "role": "root"}}))
+    assert keystore_migrate.main(["--from-file", str(path)]) == 0
+    assert json.loads(capsys.readouterr().out) == {"created": 1, "existing": 0, "skipped": 4}
+    assert "ks-evil" not in worker.known_owners()
+    _clear_sentinel()
+
+
+def test_write_paths_validate_id_and_role(es_keys):
+    with pytest.raises(ValueError):
+        keystore_es.put_digest("not-a-digest", {"owner_id": "ks-v", "role": "member"})
+    with pytest.raises(ValueError):
+        keystore_es.put_digest("d" * 64, {"owner_id": "ks-v", "role": "root"})
+    with pytest.raises(ValueError):
+        keystore_es._create_doc("../x", {"owner_id": "ks-v", "role": "member"})
+
+
+def test_missing_index_fails_closed_not_unknown(es_keys):
+    es("DELETE", f"/{keystore_es.INDEX}")
+    keystore_es._cache.clear()
+    try:
+        with pytest.raises(auth.KeyStoreUnavailable):    # index_not_found is a fault, not "unknown key"
+            auth.owner_of("ame_" + "e" * 64)
+    finally:
+        keystore_es._index_ready = False
+        keystore_es.ensure_index()
+
+
+def test_wrong_mapping_is_refused(es_keys):
+    es("DELETE", f"/{keystore_es.INDEX}")
+    es("PUT", f"/{keystore_es.INDEX}", {"mappings": {"properties": {"owner_id": {"type": "text"}}}})
+    keystore_es._index_ready = False
+    try:
+        with pytest.raises(auth.KeyStoreUnavailable):
+            keystore_es.ensure_index()
+        with pytest.raises(auth.KeyStoreUnavailable):
+            auth.owner_of("ame_" + "f" * 64)
+    finally:
+        es("DELETE", f"/{keystore_es.INDEX}")
+        keystore_es._index_ready = False
+        keystore_es.ensure_index()
+
+
+def test_recreated_index_gets_strict_mapping_from_template(es_keys):
+    es("DELETE", f"/{keystore_es.INDEX}")
+    keystore_es._index_ready = False
+    token = auth.create_key("ks-recreate", person="rc")      # ES auto-creates the index on write
+    props = es("GET", f"/{keystore_es.INDEX}")[keystore_es.INDEX]["mappings"]["properties"]
+    assert props["owner_id"]["type"] == "keyword"
+    assert auth.persons_of("ks-recreate") == {"rc"} and auth.owner_of(token)
+
+
+def test_ttl_is_capped_and_bad_values_rejected(monkeypatch):
+    monkeypatch.setenv("AMES_KEY_CACHE_TTL_S", "100000")
+    assert keystore_es._ttl() == keystore_es.MAX_TTL_S
+    for bad in ("nan", "inf", "-1", "abc"):
+        monkeypatch.setenv("AMES_KEY_CACHE_TTL_S", bad)
+        assert keystore_es._ttl() == keystore_es.DEFAULT_TTL_S
+        with pytest.raises(ValueError):
+            keystore_es.validate_config()
+    monkeypatch.setenv("AMES_KEY_CACHE_TTL_S", "0")
+    keystore_es.validate_config()
+    assert keystore_es._ttl() == 0
+
+
+def test_startup_refuses_invalid_key_store_config(monkeypatch, caplog):
+    from app import main
+    monkeypatch.setenv("AMES_KEY_STORE", "redis")
+    with pytest.raises(ValueError):
+        main._startup()
+    monkeypatch.setenv("AMES_KEY_STORE", "es")
+    monkeypatch.setenv("AMES_KEY_CACHE_TTL_S", "nan")
+    with pytest.raises(ValueError):
+        main._startup()
+    assert "invalid configuration" in caplog.text
+
+
+def test_list_all_logs_error_when_truncated(monkeypatch, caplog):
+    seen = {}
+
+    def fake(method, path, body=None, timeout=30):
+        seen["body"] = body
+        return {"hits": {"total": {"value": 5, "relation": "eq"}, "hits": []}}
+    monkeypatch.setattr(keystore_es, "es", fake)
+    monkeypatch.setattr(keystore_es, "MAX_KEYS", 2)
+    with caplog.at_level(logging.ERROR, logger=keystore_es.log.name):
+        assert keystore_es.list_all() == {}
+    assert seen["body"]["track_total_hits"] is True
+    assert "only 2 are read" in caplog.text
+
+
+def test_health_uses_the_short_timeout(monkeypatch):
+    seen = {}
+
+    def fake(method, path, body=None, timeout=30):
+        seen["timeout"] = timeout
+        return {"count": 0}
+    monkeypatch.setattr(keystore_es, "es", fake)
+    assert keystore_es.health() is True and seen["timeout"] == 5
+    assert keystore_es.health(2.5) is True and seen["timeout"] == 2.5
+    from app import main
+    assert main.HEALTH_ES_TIMEOUT_S == 5
+
+
+def test_zero_owner_probe_only_runs_when_no_owners(monkeypatch):
+    called = []
+    monkeypatch.setattr(worker, "_warn_if_zero_owners_with_data", lambda: called.append(1))
+    monkeypatch.setattr(worker, "_consolidate_owners", lambda owners: {})
+    monkeypatch.setattr(worker, "known_owners", lambda: [])
+    worker.run_once()
+    assert called == [1]
+    called.clear()
+    monkeypatch.setattr(worker, "known_owners", lambda: ["someone"])
+    worker.run_once()
+    assert called == []
+
+
 def test_migration_missing_file_reports_failure(es_keys, tmp_path, capsys):
+    _clear_sentinel()
     assert keystore_migrate.main(["--from-file", str(tmp_path / "nope.json")]) == 1
     assert "ame_" not in capsys.readouterr().err
 

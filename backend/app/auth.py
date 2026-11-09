@@ -23,8 +23,15 @@ def es_mode() -> bool:
     `file` is the key volume. Read per call so tests can scope it."""
     mode = os.environ.get("AMES_KEY_STORE", "file").strip().lower()
     if mode not in ("file", "es"):
-        raise ValueError(f"AMES_KEY_STORE must be 'file' or 'es', got {mode!r}")
+        raise ValueError("AMES_KEY_STORE must be 'file' or 'es'")
     return mode == "es"
+
+
+def validate_config() -> None:
+    """Startup check: key store mode and, for es mode, the key cache TTL."""
+    if es_mode():
+        from . import keystore_es
+        keystore_es.validate_config()
 
 
 def _keys_file() -> str:

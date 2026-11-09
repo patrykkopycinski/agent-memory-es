@@ -11,7 +11,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, StrictBool
 
-from . import auth, embeddings, governance, memory, pages as pages_mod, mental_models as mm_mod, reranker, tagfilter, facts
+from . import auth, embeddings, governance, llm, memory, pages as pages_mod, mental_models as mm_mod, reranker, tagfilter, facts
 from . import telemetry as _otel
 from .store import KINDS, ensure_indices, is_doc_miss
 
@@ -69,6 +69,12 @@ def _shutdown():
 
 @app.on_event("startup")
 def _startup():
+    try:
+        auth.validate_config()
+        llm.validate_config()
+    except ValueError as exc:
+        logging.getLogger("ames.startup").error("invalid configuration: %s", exc)
+        raise
     ensure_indices()
     facts.ensure_queue()
     pages_mod.ensure_pages_index()
@@ -705,7 +711,7 @@ def _compute_health() -> dict:
     if auth.es_mode():
         from . import keystore_es
         body["key_store"] = "es"
-        body["key_store_ok"] = keystore_es.health()
+        body["key_store_ok"] = keystore_es.health(HEALTH_ES_TIMEOUT_S)
         body["ok"] = body["ok"] and body["key_store_ok"]
     return body
 

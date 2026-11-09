@@ -3,15 +3,28 @@
     python -m app.keystore_migrate --from-file /data/ames_keys.json
 
 Legacy plaintext name-keyed entries are normalized to digests first; only digests are written.
-Idempotent: digests already present are left alone. Prints counts only, never tokens."""
+Digests already present are left alone, and entries with a malformed digest or unknown role are
+skipped. A successful run writes a sentinel in the key store and a second run is refused unless
+--force: a rerun would resurrect keys revoked in Elasticsearch since. Retire the file after
+migration. Prints counts only, never tokens."""
 import argparse
 import json
+import re
 import sys
 
 from . import auth, keystore_es
 
 
-def migrate(path: str) -> dict:
+class AlreadyMigrated(RuntimeError):
+    pass
+
+
+_DIGEST_RE = re.compile(r"[0-9a-f]{64}")
+
+
+def migrate(path: str, force: bool = False) -> dict:
+    if not force and keystore_es.migration_done():
+        raise AlreadyMigrated("already migrated; retire the file or pass --force")
     with open(path) as f:
         keys = json.load(f)
     auth._normalize_legacy(keys)
@@ -20,19 +33,28 @@ def migrate(path: str) -> dict:
         if not isinstance(entry, dict) or not entry.get("owner_id"):
             skipped += 1    # name-keyed plaintext copies: their digest entry was just added
             continue
+        if not _DIGEST_RE.fullmatch(str(digest)) or entry.get("role") not in auth.ROLES:
+            skipped += 1
+            continue
         if keystore_es.put_digest(digest, entry):
             created += 1
         else:
             existing += 1
+    keystore_es.mark_migrated()
     return {"created": created, "existing": existing, "skipped": skipped}
 
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--from-file", required=True, help="path to the file-mode key store")
+    parser.add_argument("--force", action="store_true",
+                        help="run again after a completed migration (resurrects keys revoked since)")
     args = parser.parse_args(argv)
     try:
-        counts = migrate(args.from_file)
+        counts = migrate(args.from_file, args.force)
+    except AlreadyMigrated as exc:
+        print(f"migration refused: {exc}", file=sys.stderr)
+        return 1
     except (OSError, ValueError, auth.KeyStoreUnavailable) as exc:
         print(f"migration failed: {type(exc).__name__}", file=sys.stderr)
         return 1

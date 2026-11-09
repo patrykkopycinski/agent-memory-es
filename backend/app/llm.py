@@ -47,8 +47,17 @@ def _provider() -> str:
     auth as store.es, endpoint id from AMES_LLM_INFERENCE_ID)."""
     provider = os.environ.get("AMES_LLM_PROVIDER", "openai").strip().lower() or "openai"
     if provider not in ("openai", "es_inference"):
-        raise ValueError(f"AMES_LLM_PROVIDER must be 'openai' or 'es_inference', got {provider!r}")
+        raise ValueError("llm provider misconfigured")    # per-call: no env values to clients
     return provider
+
+
+def validate_config() -> None:
+    """Fail fast at startup (app and worker) with a log-only explanation; values are not echoed."""
+    provider = os.environ.get("AMES_LLM_PROVIDER", "openai").strip().lower() or "openai"
+    if provider not in ("openai", "es_inference"):
+        raise ValueError("AMES_LLM_PROVIDER must be 'openai' or 'es_inference'")
+    if provider == "es_inference" and not os.environ.get("AMES_LLM_INFERENCE_ID", "").strip():
+        raise ValueError("AMES_LLM_INFERENCE_ID is required when AMES_LLM_PROVIDER=es_inference")
 
 
 def _parse_sse(response) -> tuple:
@@ -83,7 +92,7 @@ def _complete(messages: list, sampling: dict, json_mode: bool, timeout: float) -
     if _provider() == "es_inference":
         inference_id = os.environ.get("AMES_LLM_INFERENCE_ID", "").strip()
         if not inference_id:
-            raise RuntimeError("AMES_LLM_INFERENCE_ID is required when AMES_LLM_PROVIDER=es_inference")
+            raise RuntimeError("llm provider misconfigured")
         body = {"messages": messages, **sampling}
         model = os.environ.get("AMES_LLM_MODEL")
         if model:

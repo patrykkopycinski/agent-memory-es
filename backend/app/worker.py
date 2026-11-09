@@ -4,7 +4,7 @@ import logging
 import os
 import time
 
-from . import auth, embeddings, governance, memory, mental_models as mm
+from . import auth, embeddings, governance, llm, memory, mental_models as mm
 from . import telemetry
 from .store import KINDS, es, idx
 
@@ -275,6 +275,12 @@ if __name__ == "__main__":
     # `python -m app.worker`: without this entry the module imports, exits 0,
     # and the container crash-loops under `restart: unless-stopped`.
     import sys
+    try:
+        auth.validate_config()
+        llm.validate_config()
+    except ValueError as exc:
+        logging.getLogger("ames.worker").error("invalid configuration: %s", exc)
+        sys.exit(2)
     setup_telemetry()
     if "--backfill" in sys.argv:
         from .facts import backfill_loop
