@@ -78,7 +78,7 @@ def test_http_recall_returns_confidence_descending(seeded, monkeypatch):
     from app import auth
     from app.main import app
     _inverted(monkeypatch)
-    r = TestClient(app).post("/memory/recall", headers={"X-API-Key": auth.create_key(OWNER)},
+    r = TestClient(app).post("/memory/recall", headers={"X-API-Key": auth.create_key(OWNER, person=OWNER)},
                              json={"query": QUERY, "kinds": ["semantic"], "size": 5, "rerank": False})
     assert r.status_code == 200, r.text
     confs = [h["confidence"] for h in r.json()["results"]]
