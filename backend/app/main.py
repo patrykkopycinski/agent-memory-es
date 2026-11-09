@@ -12,9 +12,16 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, StrictBool
 
 from . import auth, embeddings, governance, memory, pages as pages_mod, mental_models as mm_mod, reranker, tagfilter, facts
+from . import telemetry as _otel
 from .store import KINDS, ensure_indices, is_doc_miss
 
 app = FastAPI(title="agent-memory-es", version="0.2.0")
+
+# OTel is wired at import time so uvicorn and TestClient(app) behave the same.
+# Both calls are no-ops when AMES_OTEL_ENABLED=0 or opentelemetry is not
+# installed, and neither can raise: telemetry must never take the API down.
+_otel.configure()
+_otel.instrument_fastapi(app)
 
 # uvicorn only configures its own loggers, so without this the per-recall `ames.recall` line is
 # dropped at the root WARNING level. Attached here (not in memory.py) so library/test use of
@@ -26,6 +33,11 @@ if os.environ.get("AMES_RECALL_LOG", "1") != "0":
         _h.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
         _rl.addHandler(_h)
     _rl.setLevel(logging.INFO)
+
+
+@app.on_event("shutdown")
+def _shutdown():
+    _otel.shutdown()    # flush the span batch on SIGTERM (uvicorn runs shutdown hooks)
 
 
 @app.on_event("startup")

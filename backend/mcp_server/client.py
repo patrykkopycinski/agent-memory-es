@@ -5,6 +5,11 @@ from typing import Any, Optional
 
 import httpx
 
+try:  # shared exporter bootstrap + privacy scrubber from the backend package
+    from app import telemetry as _otel
+except Exception:  # pragma: no cover - mcp image ships without the backend app
+    _otel = None
+
 
 class AmesError(Exception):
     """Error safe to show to the MCP client (never contains the API key)."""
@@ -23,7 +28,8 @@ class AmesClient:
 
     def _request(self, method: str, path: str, body: Optional[dict] = None) -> Any:
         try:
-            r = self._http.request(method, path, json=body)
+            headers = _otel.inject_headers({}) if _otel is not None else {}
+            r = self._http.request(method, path, json=body, headers=headers)
         except httpx.TimeoutException:
             raise AmesError("AMES backend timed out") from None
         except httpx.HTTPError as e:

@@ -5,6 +5,7 @@ import os
 import time
 
 from . import auth, embeddings, governance, memory, mental_models as mm
+from . import telemetry
 from .store import KINDS, es, idx
 
 log = logging.getLogger(__name__)
@@ -97,9 +98,25 @@ def _candidate_clusters(owner: str, min_facts: int = 3) -> list:
 def run_once() -> dict:
     """Propose then apply: dry_run pass for visibility, apply pass for supersessions
     (keep_both stays untouched — surfaced only). Mental-model drafts proposed per
-    owner; promotion is manual (upsert_model via the owner's key)."""
+    owner; promotion is manual (upsert_model via the owner's key).
+
+    One `worker.consolidate` span per pass that has owners to process; a pass
+    over zero owners emits nothing."""
+    owners = known_owners()
+    if not owners:
+        return {}
+    with telemetry.span("worker.consolidate", {"worker.owners": len(owners)}):
+        stats = _consolidate_owners(owners)
+        telemetry.set_attrs({
+            "worker.proposals": sum(v["proposals"] for v in stats.values()),
+            "worker.superseded": sum(v["superseded"] for v in stats.values()),
+            "worker.model_drafts": sum(v["model_drafts"] for v in stats.values())})
+        return stats
+
+
+def _consolidate_owners(owners) -> dict:
     stats = {}
-    for owner in known_owners():
+    for owner in owners:
         plan = memory.consolidate(owner, dry_run=True)
         applied = memory.consolidate(owner, dry_run=False)
         if _drafts_enabled():
@@ -146,6 +163,18 @@ def reembed_sweep(batch: int = 0) -> dict:
     result = {"found": len(found), "embedded": 0, "conflicts": 0, "gone": 0}
     if not found:
         return result
+    with telemetry.span("worker.reembed", {"worker.reembed.found": len(found)}):
+        try:
+            _embed_found(found, result)
+        finally:
+            telemetry.set_attrs({"worker.reembed.embedded": result["embedded"],
+                                 "worker.reembed.conflicts": result["conflicts"],
+                                 "worker.reembed.gone": result["gone"]})
+    log.info("reembed sweep: %s", result)
+    return result
+
+
+def _embed_found(found, result) -> None:
     vectors = embeddings.embed([h["_source"]["text"] for _, _, h in found])
     for (_, kind, h), vec in zip(found, vectors):
         try:
@@ -161,8 +190,25 @@ def reembed_sweep(batch: int = 0) -> dict:
                 result["gone"] += 1      # not store.is_doc_miss: this 404 body has no found:false
             else:
                 raise
-    log.info("reembed sweep: %s", result)
-    return result
+
+
+_GOVERNANCE_COUNTS = ("expired", "completed_overrides", "released_claims", "override_conflicts")
+
+
+def governance_pass() -> dict:
+    """`governance.expire_stale_proposals()` as one `worker.governance_expiry` span, recorded only
+    when the pass did something (or failed). Whether there is work is only known once the pass
+    has searched, so the span is recorded afterwards with the pass's real start time."""
+    started = time.time_ns()
+    try:
+        out = governance.expire_stale_proposals()
+    except Exception as exc:
+        telemetry.record_pass("worker.governance_expiry", started, {}, failed=exc)
+        raise
+    if any(out.get(k) for k in _GOVERNANCE_COUNTS):
+        telemetry.record_pass("worker.governance_expiry", started,
+                              {f"worker.governance.{k}": out.get(k, 0) for k in _GOVERNANCE_COUNTS})
+    return out
 
 
 def run_forever(interval_s: int = 0):
@@ -177,10 +223,35 @@ def run_forever(interval_s: int = 0):
         except Exception as e:  # noqa: BLE001 — a failed sweep must not stop consolidation
             print(time.strftime("%H:%M:%S"), "reembed error:", e, flush=True)
         try:
-            print(time.strftime("%H:%M:%S"), "governance", governance.expire_stale_proposals(), flush=True)
+            print(time.strftime("%H:%M:%S"), "governance", governance_pass(), flush=True)
         except Exception as e:  # noqa: BLE001 — a failed pass must not stop the loop
             print(time.strftime("%H:%M:%S"), "governance error:", e, flush=True)
         time.sleep(interval_s)
+
+
+def install_sigterm_flush() -> None:
+    """`docker stop` sends SIGTERM; flush the span batch before exiting so the
+    last job's spans are not lost. Exit code 0 keeps the restart policy quiet."""
+    import signal
+    import sys
+
+    def _on_term(signum, frame):  # noqa: ARG001
+        try:
+            telemetry.shutdown()
+        finally:
+            sys.exit(0)
+
+    signal.signal(signal.SIGTERM, _on_term)
+
+
+def setup_telemetry() -> bool:
+    """configure() returns None unless AMES_OTEL_ENABLED and an OTLP endpoint are
+    set. Only then is there a span batch to flush on SIGTERM; with telemetry off,
+    SIGTERM keeps its default action."""
+    if telemetry.configure() is None:
+        return False
+    install_sigterm_flush()
+    return True
 
 
 if __name__ == "__main__":
@@ -188,6 +259,7 @@ if __name__ == "__main__":
     # `python -m app.worker`: without this entry the module imports, exits 0,
     # and the container crash-loops under `restart: unless-stopped`.
     import sys
+    setup_telemetry()
     if "--backfill" in sys.argv:
         from .facts import backfill_loop
         backfill_loop()

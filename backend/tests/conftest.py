@@ -26,6 +26,13 @@ def refuse_prod_es(es_url: str, prefix: str) -> None:
 refuse_prod_es(os.environ.get("AMES_ES_URL", "http://localhost:9268"),
                os.environ.get("AMES_INDEX_PREFIX", ""))
 
+
+# OTel: app.main wires telemetry at import time. The suite must not open OTLP
+# connections or hand spans to a batch exporter it cannot inspect, so the
+# pipeline stays off globally; tests/test_otel_spans.py injects its own
+# TracerProvider + in-memory exporter (explicit provider bypasses this gate).
+os.environ.setdefault("AMES_OTEL_ENABLED", "0")
+
 # Single session-wide key store: modules must not fight over AMES_API_KEYS_FILE
 # (pytest imports all test modules before running any test).
 os.environ["AMES_API_KEYS_FILE"] = "/tmp/ames_session_keys.json"

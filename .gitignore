@@ -8,3 +8,6 @@ backend/data/
 __pycache__/
 .env
 nohup.out
+*.bak*
+.env.*
+!.env.example

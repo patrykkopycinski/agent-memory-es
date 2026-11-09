@@ -4,8 +4,11 @@ import logging
 import os
 import re
 import urllib.error
+import urllib.parse
 import urllib.request
 from typing import Any, Optional
+
+from . import telemetry as _otel
 
 _NO_ES_URL_MSG = (
     "AMES_ES_URL is not set. Refusing to guess an Elasticsearch target "
@@ -97,16 +100,42 @@ _ALLOWED_CLUSTER_APIS = (
 )
 
 
+_SAFE_NAME = re.compile(r"[A-Za-z0-9_.\-]+")
+
+
+def _decode_fully(text: str) -> str:
+    """Percent-decode until stable: ES decodes path segments, so the guard must judge the
+    names ES will act on, not their encoded spelling. Only used for checking; the request
+    is sent unchanged."""
+    for _ in range(8):
+        decoded = urllib.parse.unquote(text)
+        if decoded == text:
+            return text
+        text = decoded
+    return text
+
+
 def _guard_path(path: str, method: str) -> None:
     """Under tests (AMES_TEST_GUARD=1, set by tests/conftest.py and
     tests/_safety.py): refuse any request that could touch non-test data.
     Every comma-separated index name is checked; wildcards and _all are
     refused; cluster-level APIs pass only if allowlisted AND read-only."""
-    p = path.split("?", 1)[0].lstrip("/")
-    if p == "":
+    raw = path.split("?", 1)[0].lstrip("/")
+    if raw == "":
         return
-    if p.startswith("_"):
-        first = p.split("/", 1)[0]
+    # Judge the names ES will act on: decode each path segment on its own (an encoded '/' or ','
+    # inside a name must not split or hide it), and only look at the segments the checks need.
+    first_raw, _, rest = raw.partition("/")
+    first = _decode_fully(first_raw)
+    if first == "_index_template":
+        name = _decode_fully(rest)
+        if not _SAFE_NAME.fullmatch(name) or not name.startswith(PREFIX):
+            raise RuntimeError(
+                f"ES test guard: refusing {method} {path} — index template "
+                f"{name!r} is not a single plain name starting with required "
+                f"test prefix {PREFIX!r}.")
+        return
+    if first.startswith("_"):
         if method not in ("GET", "HEAD"):
             raise RuntimeError(
                 f"ES test guard: refusing {method} {path} — cluster-level "
@@ -116,11 +145,11 @@ def _guard_path(path: str, method: str) -> None:
                 f"ES test guard: refusing {method} {path} — cluster API "
                 f"{first!r} is not in the test allowlist {_ALLOWED_CLUSTER_APIS}")
         return
-    for index in p.split("/", 1)[0].split(","):
-        if index == "_all" or "*" in index:
+    for index in first.split(","):
+        if index == "_all" or "*" in index or not _SAFE_NAME.fullmatch(index):
             raise RuntimeError(
-                f"ES test guard: refusing {method} {path} — wildcard or "
-                f"_all index {index!r} not allowed under the test guard")
+                f"ES test guard: refusing {method} {path} — wildcard, _all or "
+                f"non-plain index {index!r} not allowed under the test guard")
         if not index.startswith(PREFIX):
             raise RuntimeError(
                 f"ES test guard: refusing {method} {path} — index {index!r} "
@@ -157,11 +186,17 @@ def es(method: str, path: str, body: Optional[dict] = None, timeout: float = 30)
         _es_url() + path, data=data, method=method,
         headers=_es_headers(),
     )
-    try:
-        return json.load(urllib.request.urlopen(req, timeout=timeout))
-    except urllib.error.HTTPError as e:
-        detail = e.read().decode()[:400]
-        raise RuntimeError(f"ES {method} {path} -> {e.code}: {detail}") from e
+    with _otel.span("es.request", lambda: _otel.es_attrs(method, path, None),
+                    require_parent=True):
+        try:
+            result = json.load(urllib.request.urlopen(req, timeout=timeout))
+        except urllib.error.HTTPError as e:
+            detail = e.read().decode()[:400]
+            _otel.set_attrs({"es.status_code": e.code,
+                             "error.type": type(e).__name__})
+            raise RuntimeError(f"ES {method} {path} -> {e.code}: {detail}") from e
+        _otel.set_attrs_from(_otel.es_attrs, method, path, result)
+        return result
 
 
 _indices_ready = False

@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import re
+import threading
 import time
 import urllib.parse
 import uuid
@@ -15,6 +16,7 @@ from .store import KINDS, es, idx, is_doc_miss, ensure_indices, ensure_indices_o
 from . import embeddings
 from . import secrets_guard
 from . import tagfilter as _tf
+from . import telemetry as _otel
 from . import tombstone
 from . import governance
 
@@ -413,6 +415,21 @@ def retain(owner_id: str, kind: str, text: str, visibility: str = "private",
            tags: Optional[list] = None, labels: Optional[list] = None,
            extract_facts: bool = True, supersedes_decision: Optional[str] = None,
            person: Optional[str] = None) -> dict:
+    """OTEL-wrapped retain (`memory.retain` span: kind, visibility, passage and
+    dedup counts; never the memory text). Behaviour is `_retain_guarded`."""
+    with _otel.span("memory.retain",
+                    lambda: _otel.retain_start_attrs(kind, visibility)):
+        out = _retain_guarded(owner_id, kind, text, visibility, occurred_at, doc_group,
+                              tags, labels, extract_facts, supersedes_decision, person=person)
+        _otel.set_attrs_from(_otel.retain_attrs, owner_id, kind, text, visibility, out)
+        return out
+
+
+def _retain_guarded(owner_id: str, kind: str, text: str, visibility: str = "private",
+                    occurred_at: Optional[str] = None, doc_group: Optional[str] = None,
+                    tags: Optional[list] = None, labels: Optional[list] = None,
+                    extract_facts: bool = True, supersedes_decision: Optional[str] = None,
+                    person: Optional[str] = None) -> dict:
     """Write a memory, refusing text that looks like a credential (ValueError -> HTTP 422) and
     flagging over-long text with a `too_long` hint on the result (the write still happens)."""
     _reject_secret(text, tags)
@@ -705,6 +722,71 @@ def _group_docs(owner_id: str, kind: str, doc_id: str) -> list:
     return [i for i, _ in _group_hits(owner_id, kind, doc_id)]
 
 
+_MUTATION_PROPERTIES = {
+    "intent": {"type": "keyword"}, "owner_id": {"type": "keyword"},
+    "kind": {"type": "keyword"}, "doc_id": {"type": "keyword"},
+    "at": {"type": "date"},
+}
+_MUTATION_SETTINGS = {"number_of_shards": 1, "number_of_replicas": 0}
+_mutations_lock = threading.Lock()
+_mutations_ready: Optional[str] = None   # name of the am_mutations index ensured by this process
+_mutations_log = logging.getLogger("ames.mutations")
+
+
+def _ensure_mutations_index() -> None:
+    """Create am_mutations (or add missing fields to a pre-existing one) once per process.
+    Indices created before doc_id was pinned as keyword would otherwise text-map it.
+    A transient failure leaves the flag unset so the next call retries; a mapping conflict
+    on an existing index cannot be fixed by retrying, so it is logged once and the flag set."""
+    global _mutations_ready
+    from .store import PREFIX, _fields_mapped
+    index = f"{PREFIX}am_mutations"
+    if _mutations_ready == index:
+        return
+    with _mutations_lock:
+        if _mutations_ready == index:
+            return
+        # Elasticsearch auto-creates a missing index on write with dynamic mapping (doc_id would
+        # become text); the template pins the mapping for an index recreated after this check.
+        try:
+            es("PUT", f"/_index_template/{index}", {
+                "index_patterns": [index],
+                "template": {"settings": _MUTATION_SETTINGS,
+                             "mappings": {"properties": _MUTATION_PROPERTIES}},
+            })
+        except RuntimeError:
+            _mutations_log.warning("am_mutations index template not installed; "
+                                   "an index recreated by a write gets dynamic mapping",
+                                   exc_info=True)
+        # ignore_unavailable turns "missing" into an empty 200: no 404 for the tracer to record
+        got = es("GET", f"/{index}?ignore_unavailable=true")
+        if not got:
+            try:
+                es("PUT", f"/{index}", {
+                    "settings": _MUTATION_SETTINGS,
+                    "mappings": {"properties": _MUTATION_PROPERTIES},
+                })
+            except RuntimeError as exc:
+                if "resource_already_exists" not in str(exc):  # lost a creation race
+                    raise
+        elif not all(_fields_mapped(_MUTATION_PROPERTIES, v.get("mappings", {}).get("properties", {}))
+                     for v in got.values()):
+            try:
+                es("PUT", f"/{index}/_mapping", {"properties": _MUTATION_PROPERTIES})
+            except RuntimeError as exc:
+                if "-> 400:" not in str(exc):
+                    raise
+                _mutations_log.warning(
+                    "am_mutations has a field mapping that cannot be changed in place; "
+                    "term queries on it may not match until the index is reindexed")
+        _mutations_ready = index
+
+
+def _forget_mutations_index() -> None:
+    global _mutations_ready
+    _mutations_ready = None
+
+
 def _log_mutation(intent: str, owner_id: str, kind: str, doc_id: str, detail: dict,
                   strict: bool = False) -> Optional[str]:
     """Best-effort intent log (who/what/when) written BEFORE the mutation runs.
@@ -713,32 +795,21 @@ def _log_mutation(intent: str, owner_id: str, kind: str, doc_id: str, detail: di
     from .store import PREFIX
     doc = {"intent": intent, "owner_id": owner_id, "kind": kind, "doc_id": doc_id,
            "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "detail": detail}
-    try:
-        es("PUT", f"/{PREFIX}am_mutations", {
-            "settings": {"number_of_shards": 1, "number_of_replicas": 0},
-            "mappings": {"properties": {
-                "intent": {"type": "keyword"}, "owner_id": {"type": "keyword"},
-                "kind": {"type": "keyword"}, "doc_id": {"type": "keyword"},
-                "at": {"type": "date"},
-            }},
-        })
-    except RuntimeError:
-        pass  # already exists
-    # Additive mapping migration (same pattern as store.ensure_indices): indices
-    # created before doc_id was pinned as keyword would otherwise text-map it.
-    try:
-        es("PUT", f"/{PREFIX}am_mutations/_mapping", {"properties": {
-            "intent": {"type": "keyword"}, "owner_id": {"type": "keyword"},
-            "kind": {"type": "keyword"}, "doc_id": {"type": "keyword"},
-            "at": {"type": "date"},
-        }})
-    except RuntimeError:
-        pass
-    try:
-        return es("POST", f"/{PREFIX}am_mutations/_doc?refresh=true", doc).get("_id")
-    except RuntimeError:
-        if strict:
-            raise
+    for attempt in (1, 2):
+        try:
+            _ensure_mutations_index()
+        except RuntimeError:
+            pass  # the write below still proceeds, as it did when the setup calls were swallowed
+        try:
+            return es("POST", f"/{PREFIX}am_mutations/_doc?refresh=true", doc).get("_id")
+        except RuntimeError as exc:
+            # index removed after it was ensured: re-ensure, then retry once
+            if attempt == 1 and "index_not_found" in str(exc):
+                _forget_mutations_index()
+                continue
+            if strict:
+                raise
+            return None
     return None
 
 
@@ -1159,6 +1230,35 @@ def recall(owner_id: str, query: str, kinds=None, size: int = 8,
            rerank_depth: Optional[int] = None,
            min_similarity: Optional[float] = None,
            include_inactive_decisions: bool = False) -> dict:
+    """OTEL-wrapped recall: one `memory.recall` span carrying kinds, visibility
+    mix, hit counts and timings (never the query text). Behaviour is
+    `_recall_inner`, unchanged."""
+    with _otel.span("memory.recall", lambda: _otel._kind_attrs(kinds)):
+        out = _recall_inner(owner_id, query, kinds, size, min_score, as_of, per_doc,
+                            rerank, filter, rerank_depth, min_similarity,
+                            include_inactive_decisions)
+        _otel.set_attrs_from(_recall_span_attrs, owner_id, query, kinds, size, out)
+        return out
+
+
+def _recall_span_attrs(owner_id, query, kinds, size, out) -> dict:
+    attrs = _otel.recall_attrs(owner_id, query, kinds, size, out)
+    timings = out.get("timings_ms") or {}
+    for key in ("embed", "search", "rerank", "fuse", "total"):
+        if isinstance(timings.get(key), (int, float)):
+            attrs[f"memory.ms.{key}"] = timings[key]
+    return attrs
+
+
+def _recall_inner(owner_id: str, query: str, kinds=None, size: int = 8,
+           min_score: Optional[float] = None,
+           as_of: Optional[str] = None,
+           per_doc: Optional[int] = None,
+           rerank: Optional[bool] = None,
+           filter: Optional[dict] = None,
+           rerank_depth: Optional[int] = None,
+           min_similarity: Optional[float] = None,
+           include_inactive_decisions: bool = False) -> dict:
     """Hybrid recall: BM25 + kNN fused per-kind, visibility isolation, RRF across kinds.
 
     Returns a single flat `results` list (RRF + recency fused, score-ordered) with
@@ -1226,7 +1326,9 @@ def recall(owner_id: str, query: str, kinds=None, size: int = 8,
     kinds = kinds or list(KINDS)
     sim_floor = KNN_MIN_SIMILARITY if min_similarity is None else _parse_similarity(min_similarity)
     t_embed = time.perf_counter()
-    qvecs, embed_error = embeddings.embed_safe([query])
+    with _otel.span("memory.embed"):
+        qvecs, embed_error = embeddings.embed_safe([query])
+        _otel.set_attrs_from(_otel.embed_attrs, embeddings.backend_name(), 1, bool(embed_error))
     qvec = qvecs[0] if qvecs else None
     timings["embed"] = _ms(t_embed)
     results = {}
@@ -1436,6 +1538,15 @@ def recall(owner_id: str, query: str, kinds=None, size: int = 8,
 
 def promote(owner_id: str, kind: str, doc_id: str, to_visibility: str,
             person: Optional[str] = None) -> dict:
+    """OTEL-wrapped promote (`memory.promote` span: kind + target visibility; the
+    guarded text is never an attribute). Behaviour is `_promote_inner`."""
+    with _otel.span("memory.promote",
+                    lambda: _otel.promote_attrs(owner_id, kind, to_visibility)):
+        return _promote_inner(owner_id, kind, doc_id, to_visibility, person)
+
+
+def _promote_inner(owner_id: str, kind: str, doc_id: str, to_visibility: str,
+            person: Optional[str] = None) -> dict:
     """Copy-on-promote: private -> team/common creates a promoted copy; original stays private."""
     if to_visibility not in ("team", "common"):
         raise ValueError("promotion target must be team or common")
@@ -1529,6 +1640,16 @@ def consolidate(owner_id: str, kind: str = "semantic", similarity_threshold: flo
 
 
 def reflect(owner_id: str, question: str, llm_answer_fn=None, rounds: int = 3) -> dict:
+    """OTEL-wrapped reflect (`memory.reflect` span: query length, rounds run,
+    evidence/source counts, abstain flag; never the question or the answer).
+    Behaviour is `_reflect_inner`."""
+    with _otel.span("memory.reflect"):
+        out = _reflect_inner(owner_id, question, llm_answer_fn, rounds)
+        _otel.set_attrs_from(_otel.reflect_attrs, owner_id, question, out)
+        return out
+
+
+def _reflect_inner(owner_id: str, question: str, llm_answer_fn=None, rounds: int = 3) -> dict:
     """Answer from memory via a bounded agentic loop: recall (with mental-model
     priority tier), optionally rewrite the query and recall again when evidence is
     thin, synthesize if an LLM fn is provided. Cites only retrieved ids.

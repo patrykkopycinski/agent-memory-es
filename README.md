@@ -158,6 +158,48 @@ curl -s -X POST localhost:8123/memory/recall -H "X-API-Key: $KEY" \
 
 Hermes users: install the [standalone plugin](https://github.com/patrykkopycinski/hermes-plugin-agent-memory-es) — it turns the API into `agent_memory_recall` / `agent_memory_retain` / `agent_memory_reflect` agent tools.
 
+## Telemetry (OpenTelemetry traces)
+
+Tracing is **off by default**. It turns on only when both `AMES_OTEL_ENABLED=1`
+and an OTLP endpoint (`OTEL_EXPORTER_OTLP_ENDPOINT` or
+`OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`) are set; there is no implicit
+`localhost:4318`. Point it at any OTLP/HTTP collector.
+
+Spans: FastAPI server spans, `memory.recall|retain|promote|reflect`,
+`es.request`, `worker.job` / `worker.backfill` / `worker.consolidate` (opened
+only once a job is claimed or a pass has owners), and `mcp.tool_call` from the
+MCP servers, which also send a W3C `traceparent` to the backend so one trace
+runs MCP -> HTTP -> memory.recall -> es.request. Recall spans carry
+`memory.recall.quality.{hit_count,empty,top_score,min_score,score_spread}`.
+
+Privacy model: spans carry kinds, visibility, counts, lengths and timings, plus
+a truncated, unsalted hash of the owner (`ames.owner_hash`). That hash is a
+pseudonym, not anonymisation: a dictionary attack over guessable owner ids can
+reverse it. Never memory text, queries, keys or raw owner ids.
+Request strings (`kind`, `visibility`, `kinds`) are exported only when they are
+a known enum value; anything else is exported as `invalid`, and every string
+attribute is capped at 256 characters. Exception messages and stacktraces are
+never recorded (class name only). On server spans `http.target` / `http.url` /
+`url.path` / `url.full` carry the route template (`/memory/pages/{scope}`),
+never the concrete path, and `url.query` is dropped. This holds for the default
+and for `OTEL_SEMCONV_STABILITY_OPT_IN=http` / `http/dup`. An attribute-builder
+failure logs one warning with the exception class name only. No HTTP headers are captured. If header capture is ever enabled
+through the OTEL env vars, `x-api-key`, `x-admin-token`, `authorization`,
+`cookie` and `set-cookie` are sanitized. A span processor enforces this for
+third-party instrumentation spans too.
+
+Volume: an `es.request` with no parent span (an idle worker poll) is exported
+only when it is slow (`AMES_OTEL_ES_SLOW_MS`, default 1000) or failed. To sample
+request traces, set for example
+`OTEL_TRACES_SAMPLER=parentbased_traceidratio` and `OTEL_TRACES_SAMPLER_ARG=0.1`.
+
+While Elasticsearch is down, idle worker polls fail and each failed poll is
+still exported as an `es.request` span; this is intentional and unchanged.
+
+The `backend/mcp_server` Docker image ships without OpenTelemetry, so it emits no
+spans and sends no `traceparent`. Use `scripts/ames_mcp_server.py` from a repo
+checkout (or with `backend/` on `PYTHONPATH`) for MCP -> backend traces.
+
 ## Layout
 
 ```
