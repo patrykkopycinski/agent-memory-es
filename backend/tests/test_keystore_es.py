@@ -217,8 +217,8 @@ def test_wrong_mapping_is_refused(es_keys):
     try:
         with pytest.raises(auth.KeyStoreUnavailable):
             keystore_es.ensure_index()
-        with pytest.raises(auth.KeyStoreUnavailable):
-            auth.owner_of("ame_" + "f" * 64)
+        with pytest.raises(auth.KeyStoreUnavailable):     # writes refuse too
+            auth.create_key("ks-badmap", person="bm")
     finally:
         es("DELETE", f"/{keystore_es.INDEX}")
         keystore_es._index_ready = False
