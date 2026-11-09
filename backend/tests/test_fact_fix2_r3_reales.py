@@ -2,6 +2,7 @@
 import datetime as dt
 import threading
 import time
+import types
 import uuid
 
 import pytest
@@ -175,15 +176,53 @@ def test_T5_expired_race_does_not_revive_foreign_token(monkeypatch, setup):
     assert doc(QUEUE, "job")["state"] == "completed"
 
 
+class _LogicalClock:
+    """Frozen replacement for facts._now(); time moves only when advance() is called."""
+
+    def __init__(self, start):
+        self._now, self._lock = start, threading.Lock()
+
+    def now(self):
+        with self._lock:
+            return self._now
+
+    def advance(self, seconds):
+        with self._lock:
+            self._now += dt.timedelta(seconds=seconds)
+
+
+class _SteppedEvent(threading.Event):
+    """Event whose timed wait consumes logical time instead of sleeping.
+
+    The heartbeat only ever waits on its stop event, so every heartbeat/retry
+    interval elapses on the logical clock and the renew schedule is exact."""
+    clock = None
+
+    def wait(self, timeout=None):
+        if timeout is not None and not self.is_set():
+            self.clock.advance(timeout)
+        return self.is_set()
+
+
 def test_T6_abort_before_scope_expiry(monkeypatch, setup):
     seed()
+    clock = _LogicalClock(facts._now())
+    _SteppedEvent.clock = clock
+    # facts only uses Event (heartbeat stop/abort), Thread and Lock from threading.
+    monkeypatch.setattr(facts, "threading", types.SimpleNamespace(
+        Event=_SteppedEvent, Thread=threading.Thread, Lock=threading.Lock))
+    monkeypatch.setattr(facts, "_now", clock.now)
+
     entered = threading.Event()
-    renews = []
+    renew_times = []
     real_update = facts._update_backfill
 
     def update(key, token, **fields):
         if "lease_until" in fields:
-            renews.append(1)
+            # The abort cannot arrive before the worker is inside process(),
+            # whatever the scheduler does; logical time is frozen while waiting.
+            assert entered.wait(10)
+            renew_times.append(clock.now())
             raise RuntimeError("transient scope failure")
         return real_update(key, token, **fields)
 
@@ -191,15 +230,21 @@ def test_T6_abort_before_scope_expiry(monkeypatch, setup):
 
     def process(*a, **kw):
         entered.set()
-        abort = kw["abort"]
-        assert wait_for(abort.is_set, 2)
+        assert wait_for(kw["abort"].is_set, 10)
 
     runner(monkeypatch, process)
     assert facts.run_backfill_once()
     bf = doc(BACKFILLS, "bf")
-    assert entered.is_set() and len(renews) == 3
+    assert entered.is_set() and len(renew_times) == 3
     assert bf["state"] == "failed" and not bf.get("cursor")
-    assert facts._parse_iso(bf["lease_until"]) > facts._now()
+    # The scope lease granted at claim was never extended, and the abort (the
+    # third failed renewal) happened on the logical clock before it ran out.
+    assert renew_times[-1] < facts._parse_iso(bf["lease_until"])
+
+
+def test_heartbeat_abort_window_fits_production_lease():
+    window = facts.HEARTBEAT_SECONDS + 2 * min(2, facts.HEARTBEAT_SECONDS / 4)
+    assert window < facts.BACKFILL_LEASE_SECONDS
 
 
 def test_job_renew_failure_does_not_abort_scope(monkeypatch, setup):
