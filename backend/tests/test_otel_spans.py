@@ -629,6 +629,42 @@ def test_governance_expiry_span(spans, monkeypatch):
     assert SECRET_QUERY not in _everything(spans)
 
 
+def test_attribute_builders_are_not_called_when_tracing_off(spans, monkeypatch):
+    from app import memory, store
+    calls = []
+    for name in ("es_attrs", "promote_attrs", "_kind_attrs", "retain_start_attrs"):
+        real = getattr(_otel, name)
+        monkeypatch.setattr(_otel, name,
+                            lambda *a, _n=name, _r=real, **k: calls.append(_n) or _r(*a, **k))
+    monkeypatch.setattr(memory, "_recall_inner", lambda *a, **k: {"fused": []})
+    monkeypatch.setattr(memory, "_retain_guarded", lambda *a, **k: {})
+    monkeypatch.setattr(memory, "_promote_inner", lambda *a, **k: {})
+    monkeypatch.setattr(store.urllib.request, "urlopen",
+                        lambda *a, **k: __import__("io").BytesIO(b"{}"))
+
+    def run_everything():
+        memory.recall("o", "q", size=1)
+        memory.retain("o", "semantic", "t", "private")
+        memory.promote("o", "semantic", "d", "team")
+        store.es("GET", "/am_semantic/_count")
+
+    monkeypatch.setattr(_otel, "tracer", lambda: None)
+    run_everything()
+    assert calls == [], f"builders ran with tracing off: {calls}"
+
+    monkeypatch.undo()
+    monkeypatch.setattr(memory, "_recall_inner", lambda *a, **k: {"fused": []})
+    monkeypatch.setattr(memory, "_retain_guarded", lambda *a, **k: {})
+    monkeypatch.setattr(memory, "_promote_inner", lambda *a, **k: {})
+    monkeypatch.setattr(store.urllib.request, "urlopen",
+                        lambda *a, **k: __import__("io").BytesIO(b"{}"))
+    spans.clear()
+    run_everything()
+    names = {s.name for s in spans.get_finished_spans()}
+    assert {"memory.recall", "memory.retain", "memory.promote"} <= names, names
+    assert _attrs(_by_name(spans, "memory.promote")[0])["memory.visibility"] == "team"
+
+
 # --- P2-1: query strings never reach URL attributes ---------------------------
 
 def test_query_string_canaries_stripped_from_url_attributes(spans, client, monkeypatch):

@@ -800,9 +800,9 @@ def run_backfill_once():
         target=_heartbeat, args=(key, token, stop, abort, current_job, job_lock),
         daemon=True)
     heartbeat.start()
-    with _otel.span("worker.backfill", {
+    with _otel.span("worker.backfill", lambda: {
             "worker.job.kind": "backfill",
-            "worker.backfill.visibility": doc.get("visibility", "")}):
+            "worker.backfill.visibility": _otel.safe_visibility(doc.get("visibility", ""))}):
         try:
             _run_backfill(key, doc, token, abort=abort,
                           current_job=current_job, job_lock=job_lock)

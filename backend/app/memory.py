@@ -402,7 +402,8 @@ def retain(owner_id: str, kind: str, text: str, visibility: str = "private",
            person: Optional[str] = None) -> dict:
     """OTEL-wrapped retain (`memory.retain` span: kind, visibility, passage and
     dedup counts; never the memory text). Behaviour is `_retain_guarded`."""
-    with _otel.span("memory.retain", _otel.retain_start_attrs(kind, visibility)):
+    with _otel.span("memory.retain",
+                    lambda: _otel.retain_start_attrs(kind, visibility)):
         out = _retain_guarded(owner_id, kind, text, visibility, occurred_at, doc_group,
                               tags, labels, extract_facts, supersedes_decision, person=person)
         _otel.set_attrs_from(_otel.retain_attrs, owner_id, kind, text, visibility, out)
@@ -1217,7 +1218,7 @@ def recall(owner_id: str, query: str, kinds=None, size: int = 8,
     """OTEL-wrapped recall: one `memory.recall` span carrying kinds, visibility
     mix, hit counts and timings (never the query text). Behaviour is
     `_recall_inner`, unchanged."""
-    with _otel.span("memory.recall", _otel._kind_attrs(kinds)):
+    with _otel.span("memory.recall", lambda: _otel._kind_attrs(kinds)):
         out = _recall_inner(owner_id, query, kinds, size, min_score, as_of, per_doc,
                             rerank, filter, rerank_depth, min_similarity,
                             include_inactive_decisions)
@@ -1515,7 +1516,8 @@ def promote(owner_id: str, kind: str, doc_id: str, to_visibility: str,
             person: Optional[str] = None) -> dict:
     """OTEL-wrapped promote (`memory.promote` span: kind + target visibility; the
     guarded text is never an attribute). Behaviour is `_promote_inner`."""
-    with _otel.span("memory.promote", _otel.promote_attrs(owner_id, kind, to_visibility)):
+    with _otel.span("memory.promote",
+                    lambda: _otel.promote_attrs(owner_id, kind, to_visibility)):
         return _promote_inner(owner_id, kind, doc_id, to_visibility, person)
 
 

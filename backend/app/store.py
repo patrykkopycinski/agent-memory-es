@@ -186,7 +186,7 @@ def es(method: str, path: str, body: Optional[dict] = None, timeout: float = 30)
         _es_url() + path, data=data, method=method,
         headers=_es_headers(),
     )
-    with _otel.span("es.request", _otel.es_attrs(method, path, None),
+    with _otel.span("es.request", lambda: _otel.es_attrs(method, path, None),
                     require_parent=True):
         try:
             result = json.load(urllib.request.urlopen(req, timeout=timeout))
@@ -195,7 +195,7 @@ def es(method: str, path: str, body: Optional[dict] = None, timeout: float = 30)
             _otel.set_attrs({"es.status_code": e.code,
                              "error.type": type(e).__name__})
             raise RuntimeError(f"ES {method} {path} -> {e.code}: {detail}") from e
-        _otel.set_attrs(_otel.es_attrs(method, path, result))
+        _otel.set_attrs_from(_otel.es_attrs, method, path, result)
         return result
 
 

@@ -429,11 +429,21 @@ def span(name: str, attrs: Optional[dict] = None, kind: Optional[str] = None,
     require_parent: with no active parent span the call is only recorded when
     it is slow (AMES_OTEL_ES_SLOW_MS) or fails, so idle background polling
     does not mint a trace per poll.
+
+    attrs: a dict, or a zero-argument callable returning one. A callable runs
+    only after the tracer check, so nothing is computed when tracing is off; a
+    builder that raises costs the span its start attributes, never the request.
     """
     tr = tracer()
     if tr is None:
         yield None
         return
+    if callable(attrs):
+        try:
+            attrs = attrs()
+        except Exception as exc:
+            _warn(f"span attr builder failed: {type(exc).__name__}")
+            attrs = None
     local = dict(attrs or {})
     if kind:
         local["memory.kind"] = safe_kind(kind)
