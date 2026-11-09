@@ -650,7 +650,7 @@ def test_attribute_builders_are_not_called_when_tracing_off(spans, monkeypatch):
         memory.recall("o", "q", size=1)
         memory.retain("o", "semantic", "t", "private")
         memory.promote("o", "semantic", "d", "team")
-        store.es("GET", "/am_semantic/_count")
+        store.es("GET", f"/{store.idx('semantic')}/_count")
 
     monkeypatch.setattr(_otel, "tracer", lambda: None)
     run_everything()
