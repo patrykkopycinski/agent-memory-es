@@ -34,6 +34,50 @@ def test_invalid_mode_is_rejected(monkeypatch):
         auth.es_mode()
 
 
+def test_empty_mode_falls_back_to_file(monkeypatch):
+    monkeypatch.setenv("AMES_KEY_STORE", "")
+    assert auth.es_mode() is False
+    monkeypatch.setenv("AMES_KEY_STORE", "  ")
+    assert auth.es_mode() is False
+    auth.validate_config()
+
+
+def test_migration_defaults_a_missing_role_but_skips_an_invalid_one(monkeypatch, tmp_path, capsys):
+    written = {}
+    monkeypatch.setattr(keystore_es, "migration_done", lambda: False)
+    monkeypatch.setattr(keystore_es, "mark_migrated", lambda: None)
+
+    def record(digest, entry):
+        written[digest] = dict(entry)
+        return True
+    monkeypatch.setattr(keystore_es, "put_digest", record)
+    path = tmp_path / "keys.json"
+    path.write_text(json.dumps({
+        "a" * 64: {"owner_id": "ks-norole"},
+        "b" * 64: {"owner_id": "ks-nullrole", "role": None},
+        "c" * 64: {"owner_id": "ks-badrole", "role": "root"},
+        "d" * 64: {"owner_id": "ks-approver", "role": "approver"}}))
+    assert keystore_migrate.main(["--from-file", str(path)]) == 0
+    assert json.loads(capsys.readouterr().out) == {"created": 3, "existing": 0, "skipped": 1}
+    assert written["a" * 64]["role"] == auth.DEFAULT_ROLE == "member"
+    assert written["b" * 64]["role"] == auth.DEFAULT_ROLE
+    assert written["d" * 64]["role"] == "approver"
+    assert "c" * 64 not in written
+
+
+def test_migration_prints_the_safe_key_store_message_only(monkeypatch, tmp_path, capsys):
+    def down():
+        raise auth.KeyStoreUnavailable("key store unavailable: sentinel check (ConnectionRefusedError)")
+    monkeypatch.setattr(keystore_es, "migration_done", down)
+    assert keystore_migrate.main(["--from-file", str(tmp_path / "k.json")]) == 1
+    assert "sentinel check (ConnectionRefusedError)" in capsys.readouterr().err
+    monkeypatch.setattr(keystore_es, "migration_done", lambda: False)
+    (tmp_path / "bad.json").write_text("{not json")
+    assert keystore_migrate.main(["--from-file", str(tmp_path / "bad.json")]) == 1
+    err = capsys.readouterr().err
+    assert err.strip() == "migration failed: JSONDecodeError"
+
+
 def test_create_and_lookup(es_keys):
     token = auth.create_key("ks-alice", "approver", person="Alice")
     assert auth.owner_of(token) == {"owner_id": "ks-alice", "role": "approver", "person": "alice"}

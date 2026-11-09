@@ -4,9 +4,10 @@
 
 Legacy plaintext name-keyed entries are normalized to digests first; only digests are written.
 Digests already present are left alone, and entries with a malformed digest or unknown role are
-skipped. A successful run writes a sentinel in the key store and a second run is refused unless
---force: a rerun would resurrect keys revoked in Elasticsearch since. Retire the file after
-migration. Prints counts only, never tokens."""
+skipped; an entry with no role is imported with the default role, as file mode treated it. A
+successful run writes a sentinel in the key store and a second run is refused unless --force: a
+rerun would resurrect keys revoked in Elasticsearch since. Retire the file after migration.
+Prints counts only, never tokens."""
 import argparse
 import json
 import re
@@ -33,7 +34,9 @@ def migrate(path: str, force: bool = False) -> dict:
         if not isinstance(entry, dict) or not entry.get("owner_id"):
             skipped += 1    # name-keyed plaintext copies: their digest entry was just added
             continue
-        if not _DIGEST_RE.fullmatch(str(digest)) or entry.get("role") not in auth.ROLES:
+        if entry.get("role") is None:
+            entry = dict(entry, role=auth.DEFAULT_ROLE)    # file mode accepted it: keep that key working
+        if not _DIGEST_RE.fullmatch(str(digest)) or entry["role"] not in auth.ROLES:
             skipped += 1
             continue
         if keystore_es.put_digest(digest, entry):
@@ -55,7 +58,10 @@ def main(argv=None) -> int:
     except AlreadyMigrated as exc:
         print(f"migration refused: {exc}", file=sys.stderr)
         return 1
-    except (OSError, ValueError, auth.KeyStoreUnavailable) as exc:
+    except auth.KeyStoreUnavailable as exc:
+        print(f"migration failed: {exc}", file=sys.stderr)    # operation + exception class only
+        return 1
+    except (OSError, ValueError) as exc:
         print(f"migration failed: {type(exc).__name__}", file=sys.stderr)
         return 1
     print(json.dumps(counts))

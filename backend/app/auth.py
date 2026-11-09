@@ -21,7 +21,7 @@ class KeyStoreUnavailable(RuntimeError):
 def es_mode() -> bool:
     """AMES_KEY_STORE=es keeps keys in Elasticsearch (stateless deploys: Cloud Run); the default
     `file` is the key volume. Read per call so tests can scope it."""
-    mode = os.environ.get("AMES_KEY_STORE", "file").strip().lower()
+    mode = os.environ.get("AMES_KEY_STORE", "file").strip().lower() or "file"
     if mode not in ("file", "es"):
         raise ValueError("AMES_KEY_STORE must be 'file' or 'es'")
     return mode == "es"
@@ -180,6 +180,7 @@ def _save(keys: dict) -> None:
 
 
 ROLES = ("member", "owner", "approver")
+DEFAULT_ROLE = "member"    # create_key without a role; file entries that carry none behave the same
 
 
 def clean_person(person: Optional[str]) -> str:
@@ -194,7 +195,7 @@ def _mint() -> tuple:
     return token, hashlib.sha256(token.encode()).hexdigest()
 
 
-def create_key(owner_id: str, role: str = "member", person: Optional[str] = None) -> str:
+def create_key(owner_id: str, role: str = DEFAULT_ROLE, person: Optional[str] = None) -> str:
     """Mint an API key for owner_id. Returns the plaintext key once. `person` is REQUIRED: it names
     the human behind the key, and governance counts people, not keys (a key with no person would
     store the owner id as the author of its proposals, which an approver key could not tell from
