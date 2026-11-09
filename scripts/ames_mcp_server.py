@@ -21,7 +21,7 @@ import urllib.request
 # scrubber) when it is importable, i.e. this script runs from a repo checkout or
 # the backend package is on PYTHONPATH. Otherwise the server runs untraced.
 _BACKEND_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "backend")
-sys.path.insert(0, _BACKEND_DIR)
+sys.path.append(_BACKEND_DIR)
 try:
     from app import telemetry as _otel
 except Exception:  # minimal install: leave no `backend/` entry shadowing `app`

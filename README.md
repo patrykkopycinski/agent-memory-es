@@ -173,7 +173,9 @@ runs MCP -> HTTP -> memory.recall -> es.request. Recall spans carry
 `memory.recall.quality.{hit_count,empty,top_score,min_score,score_spread}`.
 
 Privacy model: spans carry kinds, visibility, counts, lengths and timings, plus
-a truncated hash of the owner. Never memory text, queries, keys or owner ids.
+a truncated, unsalted hash of the owner (`ames.owner_hash`). That hash is a
+pseudonym, not anonymisation: a dictionary attack over guessable owner ids can
+reverse it. Never memory text, queries, keys or raw owner ids.
 Request strings (`kind`, `visibility`, `kinds`) are exported only when they are
 a known enum value; anything else is exported as `invalid`, and every string
 attribute is capped at 256 characters. Exception messages and stacktraces are

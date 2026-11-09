@@ -13,7 +13,9 @@ Three things live here:
 * attribute helpers (`set_attrs`, `record_recall`, `record_retain`, …) so the
   privacy rule lives in ONE place: spans carry kinds, visibility, counts,
   lengths and timings. Never memory text, never an API key, never an owner id
-  in the clear (only the same truncated sha256 the recall log line uses).
+  in the clear. Spans carry `ames.owner_hash`, the same truncated, unsalted
+  sha256 the recall log line uses; that is a pseudonym, not anonymisation: a
+  dictionary attack over guessable owner ids can reverse it.
   Exception messages and stacktraces are never recorded: they carry request
   and ES response bodies. Spans get the exception class name only.
 
