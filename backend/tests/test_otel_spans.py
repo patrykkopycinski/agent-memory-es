@@ -542,10 +542,13 @@ def test_worker_job_failure_records_class_only(spans, monkeypatch):
     assert CANARY not in _everything(spans)
 
 
+BACKFILL_OWNER = "backfill-owner-c4n4ry-77"
+
+
 def test_backfill_span_wraps_the_run(spans, monkeypatch):
     from app import facts
     monkeypatch.setattr(facts, "claim_backfill",
-                        lambda: ("k", {"visibility": "private", "owner_id": "o"}, "tok"))
+                        lambda: ("k", {"visibility": "private", "owner_id": BACKFILL_OWNER}, "tok"))
     monkeypatch.setattr(facts, "_heartbeat", lambda *a, **k: None)
 
     def fake_run(key, doc, token, **kw):
@@ -555,7 +558,8 @@ def test_backfill_span_wraps_the_run(spans, monkeypatch):
     a = _attrs(_by_name(spans, "worker.backfill")[0])
     assert a["worker.job.kind"] == "backfill"
     assert a["worker.backfill.queued"] == 7 and a["worker.job.outcome"] == "completed"
-    assert "o" != a.get("worker.backfill.visibility")  # visibility only, no owner
+    assert a["worker.backfill.visibility"] == "private"
+    assert BACKFILL_OWNER not in _everything(spans)  # visibility only, no owner
 
     monkeypatch.setattr(facts, "_run_backfill",
                         lambda *a, **k: (_ for _ in ()).throw(RuntimeError(CANARY)))
