@@ -35,7 +35,7 @@ def _drafts(substr=""):
 # --- setup: clean owner, seed a rivendell cluster ---
 _wipe(O)
 # The owner must exist in the key store for run_once() to report it at all.
-auth.create_key(O)
+auth.create_key(O, person=O)
 # Filler facts keep rivendell below the AMES_DRAFT_MAX_ENTITY_DF (0.3)
 # cutoff: with only the cluster facts, rivendell DF=1.0 and is (correctly)
 # skipped as noise. 12 fillers + 4 rivendell facts = 16 total, so rivendell

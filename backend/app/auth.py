@@ -26,8 +26,14 @@ def _normalize_legacy(keys: dict) -> bool:
     entries 401 for every token. Normalize in place: add a digest entry for each
     plaintext token (the plaintext token is never persisted by create_key; the
     name-keyed copy stays so hand-managed file expectations don't break).
-    Returns whether anything was added. Pure: never touches the file."""
+    Also lowercases every stored `person` (one human, one person string, however the file was
+    written). Returns whether anything changed. Pure: never touches the file."""
     changed = False
+    for entry in keys.values():
+        p = entry.get("person") if isinstance(entry, dict) else None
+        if isinstance(p, str) and p != p.strip().lower():
+            entry["person"] = p.strip().lower()
+            changed = True
     for name, val in list(keys.items()):
         if isinstance(val, str) and val.startswith("ame_"):
             digest = hashlib.sha256(val.encode()).hexdigest()
@@ -150,15 +156,56 @@ def _save(keys: dict) -> None:
         raise
 
 
-def create_key(owner_id: str, role: str = "member") -> str:
-    """Mint an API key for owner_id. Returns the plaintext key once."""
+ROLES = ("member", "owner", "approver")
+
+
+def clean_person(person: Optional[str]) -> str:
+    """Trimmed and lowercased: one human, one person string (`Alice` and `alice` are one person)."""
+    if not isinstance(person, str) or not person.strip() or len(person) > 200:
+        raise ValueError("person is required: the name of the human behind the key (1-200 chars)")
+    return person.strip().lower()
+
+
+def create_key(owner_id: str, role: str = "member", person: Optional[str] = None) -> str:
+    """Mint an API key for owner_id. Returns the plaintext key once. `person` is REQUIRED: it names
+    the human behind the key, and governance counts people, not keys (a key with no person would
+    store the owner id as the author of its proposals, which an approver key could not tell from
+    its own person). Keys that predate this carry no person and keep working as agent keys; give
+    them one with set_person."""
+    if role not in ROLES:
+        raise ValueError(f"role must be one of {ROLES}")
+    person = clean_person(person)
     token = "ame_" + secrets.token_hex(32)
     digest = hashlib.sha256(token.encode()).hexdigest()
+    entry = {"owner_id": owner_id, "role": role, "person": person}
     with _guard():
         keys = _load()
-        keys[digest] = {"owner_id": owner_id, "role": role}
+        keys[digest] = entry
         _save(keys)
     return token
+
+
+def set_person(owner_id: str, person: str) -> int:
+    """Admin: name the person behind every key of `owner_id` that has none (legacy keys). Keys that
+    already name a person are left alone. Returns how many keys were updated."""
+    person = clean_person(person)
+    with _guard():
+        keys = _load()
+        n = 0
+        for entry in keys.values():
+            if isinstance(entry, dict) and entry.get("owner_id") == owner_id and not entry.get("person"):
+                entry["person"] = person
+                n += 1
+        if n:
+            _save(keys)
+    return n
+
+
+def persons_of(owner_id: Optional[str]) -> set:
+    """Every person named on a key of `owner_id` (read-only, like the worker's key view)."""
+    return {e["person"].lower() for e in load_readonly().values()
+            if isinstance(e, dict) and e.get("owner_id") == owner_id
+            and isinstance(e.get("person"), str) and e["person"]}
 
 
 # Best-effort legacy migration is attempted at most once per (file version, backoff window)

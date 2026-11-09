@@ -219,7 +219,7 @@ def test_api_model_has_rerank_and_http_reaches_recall(monkeypatch):
     from app import auth
     assert RecallIn(query="x").rerank is None and RecallIn(query="x", rerank=False).rerank is False
     _seed()
-    c = TestClient(app); key = auth.create_key(OWNER)
+    c = TestClient(app); key = auth.create_key(OWNER, person=OWNER)
     r = c.post("/memory/recall", headers={"X-API-Key": key},
                json={"query": Q, "kinds": ["episodic"], "size": 3, "as_of": "2023-05-30", "rerank": False})
     assert r.status_code == 200 and r.json()["reranked"] is False
@@ -281,7 +281,7 @@ def test_http_rerank_true_actually_reaches_recall_and_default_stays_off(monkeypa
     from app import auth
     _seed()
     monkeypatch.setattr(reranker, "rerank", _fake([]))      # a reranker that "works"
-    c = TestClient(app); key = auth.create_key(OWNER)
+    c = TestClient(app); key = auth.create_key(OWNER, person=OWNER)
 
     def call(**extra):
         r = c.post("/memory/recall", headers={"X-API-Key": key},

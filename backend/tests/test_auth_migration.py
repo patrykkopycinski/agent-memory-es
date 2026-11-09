@@ -33,7 +33,7 @@ def test_legacy_plaintext_entry_migrates(tmp_path, monkeypatch):
 def test_digest_entries_untouched(tmp_path, monkeypatch):
     keys_file = tmp_path / "keys.json"
     monkeypatch.setattr(auth, "_keys_file", lambda: str(keys_file))
-    token = auth.create_key("alice")
+    token = auth.create_key("alice", person="alice")
     before = keys_file.read_text()
     auth.owner_of(token)  # triggers _load -> migrate (no-op)
     assert keys_file.read_text() == before
@@ -79,7 +79,7 @@ def _mint(path, owner, n, flock):
     if not flock:
         import contextlib
         auth._guard = contextlib.nullcontext  # emulate the old per-process threading.Lock only
-    return [auth.create_key(f"{owner}-{i}") for i in range(n)]
+    return [auth.create_key(f"{owner}-{i}", person=f"{owner}-{i}") for i in range(n)]
 
 
 def _mint_to_queue(path, owner, n, flock, q):
@@ -136,7 +136,7 @@ def test_owner_of_not_blocked_by_a_writer_holding_the_guard(tmp_path, monkeypatc
     import time
     keys_file = tmp_path / "keys.json"
     monkeypatch.setattr(auth, "_keys_file", lambda: str(keys_file))
-    token = auth.create_key("alice")
+    token = auth.create_key("alice", person="alice")
     held, release = threading.Event(), threading.Event()
 
     def writer():
@@ -172,7 +172,7 @@ def test_writer_on_unwritable_store_raises_clear_error(tmp_path, monkeypatch):
     d.chmod(0o500)
     try:
         with pytest.raises(auth.KeyStoreNotWritable, match="key store not writable"):
-            auth.create_key("alice")
+            auth.create_key("alice", person="alice")
     finally:
         d.chmod(0o700)
 
@@ -184,14 +184,14 @@ def test_save_preserves_file_mode(tmp_path, monkeypatch):
     keys_file.write_text("{}")
     keys_file.chmod(0o640)
     monkeypatch.setattr(auth, "_keys_file", lambda: str(keys_file))
-    auth.create_key("alice")
+    auth.create_key("alice", person="alice")
     assert (keys_file.stat().st_mode & 0o777) == 0o640
 
 
 def test_failed_write_keeps_original_and_leaves_no_temp(tmp_path, monkeypatch):
     keys_file = tmp_path / "keys.json"
     monkeypatch.setattr(auth, "_keys_file", lambda: str(keys_file))
-    auth.create_key("alice")
+    auth.create_key("alice", person="alice")
     before = keys_file.read_bytes()
 
     def boom(*a, **k):
@@ -199,7 +199,7 @@ def test_failed_write_keeps_original_and_leaves_no_temp(tmp_path, monkeypatch):
 
     monkeypatch.setattr(auth.json, "dump", boom)
     with pytest.raises(RuntimeError):
-        auth.create_key("bob")
+        auth.create_key("bob", person="bob")
     assert keys_file.read_bytes() == before
     assert sorted(p.name for p in tmp_path.iterdir() if p.name != "keys.json.lock") == ["keys.json"]
 
@@ -211,8 +211,8 @@ def test_save_uses_unique_temp_name_and_fsyncs_file_and_dir(tmp_path, monkeypatc
     real_replace, real_fsync = os.replace, os.fsync
     monkeypatch.setattr(auth.os, "replace", lambda s, d: (sources.append(os.path.basename(s)), real_replace(s, d))[1])
     monkeypatch.setattr(auth.os, "fsync", lambda fd: (synced.append(os.fstat(fd).st_mode), real_fsync(fd))[1])
-    auth.create_key("a")
-    auth.create_key("b")
+    auth.create_key("a", person="a")
+    auth.create_key("b", person="b")
     import stat
     assert len(sources) == 2 and sources[0] != sources[1]
     assert all(s != "keys.json.tmp" and s.startswith(".ames_keys.") and s.endswith(".tmp") for s in sources)
@@ -321,7 +321,7 @@ def test_owner_of_retries_migration_after_file_change_or_backoff(tmp_path, monke
 
 def test_owner_of_migration_still_persists_when_uncontended_and_keeps_deletes(tmp_path, monkeypatch):
     keys_file, token = _legacy_store(tmp_path, monkeypatch)
-    minted = auth.create_key("bob")  # create_key migrates under the guard
+    minted = auth.create_key("bob", person="bob")  # create_key migrates under the guard
     assert auth.owner_of(token)["owner_id"] == "hermes-default"  # type: ignore[index]
     assert auth.delete_key(minted) is True
     on_disk = json.loads(keys_file.read_text())

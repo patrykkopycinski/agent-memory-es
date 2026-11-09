@@ -19,7 +19,7 @@ INDEX_MISSING = RuntimeError(
 DOC_MISS = RuntimeError('ES GET /am_semantic/_doc/k -> 404: {"_index":"am_semantic","_id":"k","found":false}')
 
 client = TestClient(app, raise_server_exceptions=False)
-KEY = auth.create_key("getsource-owner")
+KEY = auth.create_key("getsource-owner", person="getsource-owner")
 H = {"X-API-Key": KEY}
 
 

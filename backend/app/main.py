@@ -11,7 +11,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, StrictBool
 
-from . import auth, embeddings, memory, pages as pages_mod, mental_models as mm_mod, reranker, tagfilter, facts
+from . import auth, embeddings, governance, memory, pages as pages_mod, mental_models as mm_mod, reranker, tagfilter, facts
 from .store import KINDS, ensure_indices, is_doc_miss
 
 app = FastAPI(title="agent-memory-es", version="0.2.0")
@@ -56,11 +56,31 @@ def _warm_embedder_in_background() -> None:
         logging.getLogger("ames.startup").warning("could not start embedder warm-up", exc_info=True)
 
 
-def caller(x_api_key: Optional[str] = Header(None)) -> dict:
+def _identify(x_api_key: Optional[str]) -> dict:
     who = auth.owner_of(x_api_key or "")
     if not who:
         raise HTTPException(401, "invalid or missing X-API-Key")
     return who
+
+
+def caller(x_api_key: Optional[str] = Header(None)) -> dict:
+    """Any key except an approver key: approving is a human act and an approver key is
+    good for the governance routes only, never for memory reads or writes."""
+    who = _identify(x_api_key)
+    if who.get("role") == "approver":
+        raise HTTPException(403, "approver keys are accepted on /governance/* only")
+    return who
+
+
+def any_key(x_api_key: Optional[str] = Header(None)) -> dict:
+    """Every valid key, approvers included (the read-only proposal list)."""
+    return _identify(x_api_key)
+
+
+def person_of(who: dict) -> Optional[str]:
+    """The human behind a key, None for a key that predates `person`. Authorship and approval are
+    compared on this, never on the key; governed writes refuse a key without one."""
+    return who.get("person")
 
 
 class RetainIn(BaseModel):
@@ -74,6 +94,7 @@ class RetainIn(BaseModel):
     extract_facts: bool = True  # opt out of asynchronous fact extraction for bulk imports
     tags: Optional[list] = None       # caller-supplied "key:value" tags (stored as keywords)
     labels: Optional[list] = None     # label groups to LLM-extract into tags (off when absent)
+    supersedes_decision: Optional[str] = None   # team decision proposal that overrides this ACTIVE decision id
 
 
 class RecallIn(BaseModel):
@@ -88,6 +109,7 @@ class RecallIn(BaseModel):
     min_similarity: Optional[float] = Field(None, ge=-1.0, le=1.0)  # kNN cosine floor (default: AMES_KNN_MIN_SIMILARITY, off)
     filter: Optional[dict] = None   # {all, any, none, narrow_any}: tag filter applied inside ES;
                                     # a filter that matches nothing abstains (results [])
+    include_inactive_decisions: StrictBool = False   # also return rejected / expired / superseded decisions
 
 
 class PromoteIn(BaseModel):
@@ -127,8 +149,19 @@ class ReflectIn(BaseModel):
     question: str
 
 
+class ApproveIn(BaseModel):
+    doc_id: str = Field(..., max_length=memory.MAX_ID_CHARS)
+    note: Optional[str] = Field(None, max_length=governance.MAX_NOTE_CHARS)
+
+
+class RejectIn(BaseModel):
+    doc_id: str = Field(..., max_length=memory.MAX_ID_CHARS)
+    reason: str = Field(..., min_length=1, max_length=governance.MAX_NOTE_CHARS)
+
+
 @app.post("/admin/keys")
-def mint_key(owner_id: str, role: str = "member", _admin: str = Header(None, alias="X-Admin-Token")):
+def mint_key(owner_id: str, role: str = "member", person: Optional[str] = None,
+             _admin: str = Header(None, alias="X-Admin-Token")):
     # No default token: an unset or empty AMES_ADMIN_TOKEN disables key minting
     # rather than accepting a guessable or empty header.
     expected = os.environ.get("AMES_ADMIN_TOKEN", "")
@@ -137,9 +170,47 @@ def mint_key(owner_id: str, role: str = "member", _admin: str = Header(None, ali
     if not _admin or not hmac.compare_digest(_admin.encode(), expected.encode()):
         raise HTTPException(403, "bad admin token")
     try:
-        return {"api_key": auth.create_key(owner_id, role), "owner_id": owner_id}
+        return {"api_key": auth.create_key(owner_id, role, person), "owner_id": owner_id}
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from None
     except auth.KeyStoreNotWritable as exc:
         # path/errno stay server-side; the client only learns the store is unavailable
+        logging.getLogger("ames.auth").error("%s", exc)
+        raise HTTPException(503, "key store not writable") from None
+
+
+@app.post("/admin/keys/person")
+def set_key_person(owner_id: str, person: str, _admin: str = Header(None, alias="X-Admin-Token")):
+    """Name the person behind the legacy (person-less) keys of an owner; they keep working as
+    agent keys either way."""
+    expected = os.environ.get("AMES_ADMIN_TOKEN", "")
+    if not expected:
+        raise HTTPException(403, "key admin disabled: AMES_ADMIN_TOKEN is not set")
+    if not _admin or not hmac.compare_digest(_admin.encode(), expected.encode()):
+        raise HTTPException(403, "bad admin token")
+    try:
+        person = auth.clean_person(person)
+        # audit BEFORE the change, strict: a change that cannot be audited does not happen
+        try:
+            memory._log_mutation("key_set_person", owner_id, "key", owner_id,
+                                 {"owner_id": owner_id, "person": person}, strict=True)
+        except Exception:  # noqa: BLE001 — any audit failure refuses the change
+            logging.getLogger("ames.auth").exception("set-person audit write failed for %s", owner_id)
+            raise HTTPException(503, "audit log unavailable: nothing was changed") from None
+        updated = auth.set_person(owner_id, person)
+        logging.getLogger("ames.auth").info(
+            "set-person: owner=%s person=%s keys_changed=%d", owner_id, person, updated)
+        # the first row records the intent; this one records the outcome (best effort)
+        try:
+            memory._log_mutation("key_set_person_done", owner_id, "key", owner_id,
+                                 {"owner_id": owner_id, "person": person, "keys_changed": updated})
+        except Exception:  # noqa: BLE001 — the change is made: report it, do not turn it into a 500
+            logging.getLogger("ames.auth").exception(
+                "set-person outcome row not written for %s", owner_id)
+        return {"owner_id": owner_id, "person": person, "updated": updated}
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from None
+    except auth.KeyStoreNotWritable as exc:
         logging.getLogger("ames.auth").error("%s", exc)
         raise HTTPException(503, "key store not writable") from None
 
@@ -199,7 +270,12 @@ def retain(body: RetainIn, who: dict = Depends(caller)):
     try:
         return memory.retain(who["owner_id"], body.kind, body.text, body.visibility,
                              body.occurred_at, body.doc_group, body.tags, body.labels,
-                             body.extract_facts)
+                             body.extract_facts, body.supersedes_decision,
+                             person=person_of(who))
+    except governance.GovernedError as e:
+        raise HTTPException(409, str(e))
+    except PermissionError as e:
+        raise HTTPException(403, str(e))
     except ValueError as e:
         raise HTTPException(422, str(e))
     except tagfilter.ExtractionError as e:
@@ -218,11 +294,14 @@ def delete_memory(kind: str, doc_id: str, retract: Literal["true", "false"] = "f
     # Literal, not bool: FastAPI's lax bool would read ?retract=yes/1/on as true, and a
     # misread flag here silently decides whether the text is blocked forever
     try:
-        return memory.delete(who["owner_id"], kind, doc_id, retract == "true")
+        return memory.delete(who["owner_id"], kind, doc_id, retract == "true",
+                             person=person_of(who))
     except ValueError as e:
         raise HTTPException(422, str(e))
     except PermissionError:
         raise HTTPException(403, "only the creator can delete their memory")
+    except governance.GovernedError as e:
+        raise HTTPException(409, str(e)) from None
     except memory.SupersededError as e:
         raise _superseded_409(e) from None
     except LookupError as e:
@@ -238,7 +317,8 @@ def recall(body: RecallIn, who: dict = Depends(caller)):
     try:
         return memory.recall(who["owner_id"], body.query, body.kinds, body.size,
                              body.min_score, body.as_of, body.per_doc, body.rerank, body.filter,
-                             rerank_depth=body.rerank_depth, min_similarity=body.min_similarity)
+                             rerank_depth=body.rerank_depth, min_similarity=body.min_similarity,
+                             include_inactive_decisions=body.include_inactive_decisions)
     except tagfilter.FilterError as e:
         raise HTTPException(422, str(e))
 
@@ -254,7 +334,10 @@ def exists(body: ExistsIn, who: dict = Depends(caller)):
 @app.post("/memory/promote")
 def promote(body: PromoteIn, who: dict = Depends(caller)):
     try:
-        return memory.promote(who["owner_id"], body.kind, body.doc_id, body.to_visibility)
+        return memory.promote(who["owner_id"], body.kind, body.doc_id, body.to_visibility,
+                              person=person_of(who))
+    except governance.GovernedError as e:
+        raise HTTPException(409, str(e))
     except LookupError as e:
         raise HTTPException(404, str(e))
     except (ValueError, PermissionError) as e:
@@ -268,7 +351,10 @@ def update(body: UpdateIn, who: dict = Depends(caller)):
         raise HTTPException(422, "nothing to update: pass at least one of text/tags/visibility/occurred_at")
     try:
         return memory.update(who["owner_id"], body.kind, body.doc_id, body.text,
-                             body.tags, body.visibility, body.occurred_at)
+                             body.tags, body.visibility, body.occurred_at,
+                             person=person_of(who))
+    except governance.GovernedError as e:
+        raise HTTPException(409, str(e))
     except memory.SupersededError as e:
         raise _superseded_409(e) from None
     except LookupError as e:
@@ -280,7 +366,10 @@ def update(body: UpdateIn, who: dict = Depends(caller)):
 @app.post("/memory/delete")
 def delete(body: DeleteIn, who: dict = Depends(caller)):
     try:
-        return memory.delete(who["owner_id"], body.kind, body.doc_id, body.retract)
+        return memory.delete(who["owner_id"], body.kind, body.doc_id, body.retract,
+                             person=person_of(who))
+    except governance.GovernedError as e:
+        raise HTTPException(409, str(e))
     except memory.SupersededError as e:
         raise _superseded_409(e) from None
     except LookupError as e:
@@ -416,13 +505,65 @@ def _exists_size(size) -> int:
     return size
 
 
+def approver(who: dict = Depends(any_key)) -> dict:
+    """Approving or rejecting a decision is a human act: only keys minted with the `approver` role
+    pass, and only if they name a person (approvals are counted per person, not per key). Agent
+    keys (member / owner) are refused, and no MCP tool maps to these routes."""
+    if who.get("role") != "approver":
+        raise HTTPException(403, "approver role required")
+    if not who.get("person"):
+        raise HTTPException(403, "this approver key names no person; ask an admin to mint one with person=")
+    return who
+
+
+def _governance_call(fn, *args):
+    try:
+        return fn(*args)
+    except governance.GovernedError as e:
+        raise HTTPException(409, str(e)) from None
+    except PermissionError as e:
+        raise HTTPException(403, str(e)) from None
+    except LookupError as e:
+        raise HTTPException(404, str(e)) from None
+    except ValueError as e:
+        raise HTTPException(422, str(e)) from None
+
+
+@app.get("/governance/proposals")
+def governance_proposals(limit: int = 50, who: dict = Depends(any_key)):
+    return governance.list_proposals(max(1, min(limit, governance.MAX_LIST)))
+
+
+@app.post("/governance/approve")
+def governance_approve(body: ApproveIn, who: dict = Depends(approver)):
+    return _governance_call(governance.approve, who["person"], body.doc_id, body.note,
+                            who["owner_id"])
+
+
+@app.post("/governance/reject")
+def governance_reject(body: RejectIn, who: dict = Depends(approver)):
+    return _governance_call(governance.reject, who["person"], body.doc_id, body.reason,
+                            who["owner_id"])
+
+
+@app.post("/admin/governance/backfill")
+def governance_backfill(_admin: str = Header(None, alias="X-Admin-Token")):
+    expected = os.environ.get("AMES_ADMIN_TOKEN", "")
+    if not expected:
+        raise HTTPException(403, "backfill disabled: AMES_ADMIN_TOKEN is not set")
+    if not _admin or not hmac.compare_digest(_admin.encode(), expected.encode()):
+        raise HTTPException(403, "bad admin token")
+    return governance.backfill()
+
+
 @app.post("/mcp/tools/{tool}")
 def mcp_tool(tool: str, body: dict, who: dict = Depends(caller)):
     """Minimal MCP-style tools surface (JSON in/out) for coding-farm clients."""
     handlers = {
         "retain": lambda b: memory.retain(who["owner_id"], b["kind"], b["text"],
                                           b.get("visibility", "private"),
-                                          b.get("occurred_at"), b.get("doc_group")),
+                                          b.get("occurred_at"), b.get("doc_group"),
+                                          person=person_of(who)),
         "recall": lambda b: memory.recall(who["owner_id"], b["query"], b.get("kinds"),
                                           _bounded_size(b.get("size", 8)), b.get("min_score"),
                                           b.get("as_of"), b.get("per_doc"), b.get("rerank"),
@@ -431,18 +572,22 @@ def mcp_tool(tool: str, body: dict, who: dict = Depends(caller)):
         "exists": lambda b: memory.exists(who["owner_id"], b.get("kind"), b.get("tags"),
                                           b.get("text"), _exists_size(b.get("size", 5))),
         "reflect": lambda b: memory.reflect(who["owner_id"], b["question"]),
-        "promote": lambda b: memory.promote(who["owner_id"], b["kind"], b["doc_id"], b["to_visibility"]),
+        "promote": lambda b: memory.promote(who["owner_id"], b["kind"], b["doc_id"], b["to_visibility"],
+                                            person=person_of(who)),
         "update": lambda b: memory.update(who["owner_id"], b["kind"], b["doc_id"],
                                           b.get("text"), b.get("tags"),
-                                          b.get("visibility"), b.get("occurred_at")),
+                                          b.get("visibility"), b.get("occurred_at"),
+                                          person=person_of(who)),
         "delete": lambda b: memory.delete(who["owner_id"], b["kind"], b["doc_id"],
-                                          b.get("retract", False)),
+                                          b.get("retract", False), person=person_of(who)),
         "unreject": lambda b: memory.unreject(who["owner_id"], b.get("text"), b.get("source_id")),
     }
     if tool not in handlers:
         raise HTTPException(404, f"unknown tool {tool}; available: {sorted(handlers)}")
     try:
         return {"result": handlers[tool](body)}
+    except governance.GovernedError as e:
+        raise HTTPException(409, str(e)) from None
     except memory.SupersededError as e:
         raise _superseded_409(e) from None
     except KeyError as e:                         # KeyError is a LookupError: a missing body field is not a 404

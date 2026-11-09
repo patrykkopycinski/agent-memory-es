@@ -107,7 +107,7 @@ def test_page_cap_fails_closed_with_distinct_capacity_error(owners, patched):
 
 def test_capacity_error_is_a_4xx_over_rest(owners, patched):
     o = owners("t3d")
-    key = auth.create_key(o)
+    key = auth.create_key(o, person=o)
     for i in range(12):
         tombstone.reject(o, f"probe filler{i:03d} unrelated{i:03d} noise{i:03d}", "filler")
     patched(PAGE=5, TERMS_CHUNK=3, MAX_PAGES=2)

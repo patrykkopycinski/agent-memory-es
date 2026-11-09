@@ -14,7 +14,7 @@ from fastapi.testclient import TestClient
 from app import auth, embeddings, main, memory  # noqa: E402
 
 client = TestClient(main.app)
-KEY = auth.create_key("embed-degradation-owner")
+KEY = auth.create_key("embed-degradation-owner", person="embed-degradation-owner")
 H = {"X-API-Key": KEY}
 
 

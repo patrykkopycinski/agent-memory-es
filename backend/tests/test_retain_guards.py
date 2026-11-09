@@ -19,7 +19,7 @@ from app.store import PREFIX, es, idx
 
 OWNER = "p3retainguard"
 client = TestClient(app)
-H = {"X-API-Key": auth.create_key(OWNER)}
+H = {"X-API-Key": auth.create_key(OWNER, person=OWNER)}
 
 FAKE_SK = "sk-" + "x1" * 12
 FAKE_GH = "ghp_" + "A1" * 15
@@ -88,7 +88,7 @@ def test_mcp_tools_maps_value_error_to_422_and_permission_error_to_403():
     bad = _post("/mcp/tools/retain", text="x", kind="nonsense")
     assert bad.status_code == 422 and "kind must be" in bad.json()["detail"]
     mine = _post("/memory/retain", text="permission probe: the shared fact owned by the guard owner")
-    other = {"X-API-Key": auth.create_key(OWNER + "other")}
+    other = {"X-API-Key": auth.create_key(OWNER + "other", person=OWNER + "other")}
     r = client.post("/mcp/tools/update", headers=other,
                     json={"kind": "semantic", "doc_id": mine.json()["_id"], "text": "hijack"})
     assert r.status_code == 403, r.text

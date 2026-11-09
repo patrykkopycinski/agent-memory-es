@@ -4,7 +4,9 @@ Works with any MCP client (Claude Code, Cursor, ...):
 
   ames-mcp --api-key KEY --url http://localhost:8123
 
-Tools: ames_recall, ames_retain, ames_reflect. The HTTP API must be
+Tools: ames_recall, ames_retain, ames_reflect, memory_proposals (read-only). Approving or
+rejecting a decision is deliberately not a tool: it is a human act (see scripts/ames_approve.py).
+The HTTP API must be
 X-API-Key authenticated; keys are minted via POST /admin/keys.
 """
 import argparse
@@ -30,6 +32,9 @@ TOOLS = [
                           "enum": ["episodic", "semantic", "procedural"]}},
                 "size": {"type": "integer", "default": 8, "minimum": 1,
                          "maximum": MAX_RECALL_SIZE},
+                "include_inactive_decisions": {"type": "boolean", "default": False,
+                                               "description": "also return rejected, expired "
+                                                              "and superseded decisions"},
             },
             "required": ["query"],
         },
@@ -47,6 +52,16 @@ TOOLS = [
                                "default": "private"},
             },
             "required": ["kind", "text"],
+        },
+    },
+    {
+        "name": "memory_proposals",
+        "description": "List open team decision proposals (read-only): text, author, who approved, "
+                       "approvals still needed. Approval is done by a human, not by an agent.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"limit": {"type": "integer", "default": 50, "minimum": 1,
+                                     "maximum": 100}},
         },
     },
     {
@@ -69,11 +84,50 @@ def http(url: str, key: str, path: str, body: dict) -> dict:
         return json.load(r)
 
 
+def http_get(url: str, key: str, path: str) -> dict:
+    req = urllib.request.Request(url.rstrip("/") + path, method="GET",
+                                 headers={"X-API-Key": key})
+    with urllib.request.urlopen(req, timeout=60) as r:
+        return json.load(r)
+
+
+PROPOSED_LABEL = "PROPOSED, not in force"
+
+
+def label_proposals(res: dict) -> dict:
+    """A proposed decision is not in force: say so in the hit text itself, so a reader that only
+    looks at `text` cannot mistake it for a standing decision."""
+    seen = set()
+
+    def mark(hit):
+        if isinstance(hit, dict) and hit.get("decision_status") == "proposed" and id(hit) not in seen:
+            seen.add(id(hit))
+            hit["label"] = PROPOSED_LABEL
+            hit["text"] = f"[{PROPOSED_LABEL}] {hit.get('text', '')}"
+
+    for key in ("results", "evidence", "fused"):
+        for hit in res.get(key) or []:
+            mark(hit)
+    for hits in (res.get("by_kind") or {}).values():
+        for hit in hits:
+            mark(hit)
+    return res
+
+
 def dispatch(url: str, key: str, name: str, args: dict) -> dict:
     if name == "ames_recall":
-        return http(url, key, "/memory/recall",
-                    {"query": args["query"], "kinds": args.get("kinds"),
-                     "size": min(max(int(args.get("size", 8)), 1), MAX_RECALL_SIZE)})
+        body = {"query": args["query"], "kinds": args.get("kinds"),
+                "size": min(max(int(args.get("size", 8)), 1), MAX_RECALL_SIZE)}
+        if args.get("include_inactive_decisions") is True:
+            body["include_inactive_decisions"] = True
+        return label_proposals(http(url, key, "/memory/recall", body))
+    if name == "memory_proposals":
+        limit = min(max(int(args.get("limit", 50)), 1), 100)
+        out = http_get(url, key, f"/governance/proposals?limit={limit}")
+        if out.get("override_conflicts"):
+            out["warning"] = ("override conflict: an active override could not supersede its target; "
+                              "both decisions are in force until an operator resolves it")
+        return out
     if name == "ames_retain":
         return http(url, key, "/memory/retain",
                     {"kind": args["kind"], "text": args["text"],

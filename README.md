@@ -20,7 +20,7 @@ cd backend && docker compose -f docker-compose.quickstart.yml up -d
 export AMES_ES_URL=http://localhost:19200
 # 2. mint a key:
 curl -X POST -H "X-Admin-Token: $AMES_ADMIN_TOKEN" \
-  'http://localhost:8123/admin/keys?owner_id=you'
+  'http://localhost:8123/admin/keys?owner_id=you&person=you'
 # 3. preflight:
 python ../scripts/ames_doctor.py
 # 4. import your existing memory (governance stores / Hindsight / CLAUDE.md):
@@ -74,6 +74,34 @@ Beyond the hybrid core:
 - **Write-time fact extraction** — every episodic `retain` queues an async job; a worker (`python -m app.worker --facts`) extracts up to 12 dated, source-linked facts into `semantic`. Contradicted facts get `valid_to`/`superseded_by` (kept for audit, excluded from recall after expiry). Durable lease-based queue with retries; `GET /memory/facts/drain`, `POST /memory/facts/backfill` (+ `--backfill` worker) for existing memory; `"extract_facts": false` opts out on bulk imports.
 - **Label filters** — caller tags + optional LLM label extraction on retain; recall `filter` (`all`/`any`/`none`/`narrow_any`) abstains instead of returning off-topic memories.
 
+## Decision governance
+
+Team memories tagged `kind:decision` are written as *proposals* and only take effect once people
+other than the author approve them (one approval for a new decision, two for an override of an
+active one). Active decisions are read-only, every transition is audited before it happens, and
+approval is restricted to a human-only `approver` key role that no MCP tool can reach. Approvers
+are counted per person (`person=` at mint time), and an approver key is accepted on `/governance/*`
+only. `scripts/ames_approve.py` is the approval CLI (https only, except loopback). See [docs/GOVERNANCE.md](docs/GOVERNANCE.md).
+
+### Release note: rollout steps for existing keys
+
+There is no switch to enable decision governance: it is on once the new build runs. Keys minted
+before `person` was required keep working, but they can no longer write team decisions (`403`)
+until their person is named. In this order:
+
+1. Deploy. Startup adds the `proposed_by_persons` mapping field (additive).
+2. Immediately name the person behind each owner's keys:
+   `POST /admin/keys/person?owner_id=<owner>&person=<name>` with the admin token (audited first;
+   persons are lowercased). Until then, person-less agent keys get `403` on team-decision writes.
+   Offline alternative: stop the service, edit the key file, then deploy. For entries in digest
+   form (`<sha256 of the token>` mapped to `{owner_id, role}`), add a `"person"` field, which must
+   be non-empty (it is lowercased on load). Entries still in the old plaintext form
+   (`{"<owner>": "ame_..."}`) are converted to person-less digest entries on first read, so use
+   the admin call for those.
+3. Run `POST /admin/governance/backfill` once, so earlier team decisions are in force.
+4. Mint approver keys with `person=` set to the same person as the matching agent keys.
+5. Set `AMES_GOV_VETO_OWNERS` to person ids (case-insensitive), if you use veto owners.
+
 ## Benchmarks
 
 Measured against [Hindsight](https://github.com/vectorize-io/hindsight) with the same harness, answer model and judge for both. Full method, per-type tables, development history and follow-ups: **[docs/BENCHMARKS.md](docs/BENCHMARKS.md)**.
@@ -117,7 +145,8 @@ export AMES_ADMIN_TOKEN=change-me
 docker compose up -d          # ames-backend :8123, ames-worker, Elasticsearch
 
 # mint a key (owner identity is bound to it)
-curl -s -X POST "localhost:8123/admin/keys?owner_id=alice" -H "X-Admin-Token: $AMES_ADMIN_TOKEN"
+curl -s -X POST "localhost:8123/admin/keys?owner_id=alice&person=alice" -H "X-Admin-Token: $AMES_ADMIN_TOKEN"
+# person=<the human behind the key> is required; optional role=member|owner|approver (approving needs approver)
 
 # remember something, then recall it
 curl -s -X POST localhost:8123/memory/retain -H "X-API-Key: $KEY" \

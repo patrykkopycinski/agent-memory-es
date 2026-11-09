@@ -136,7 +136,8 @@ class TestMcpServer:
         """Hermes sanitizer contract: tools must use inputSchema with properties."""
         m = _load("ames_mcp_server")
         names = {t["name"] for t in m.TOOLS}
-        assert names == {"ames_recall", "ames_retain", "ames_reflect"}
+        assert names == {"ames_recall", "ames_retain", "ames_reflect", "memory_proposals"}
+        assert not any("approve" in n or "reject" in n for n in names)
         for t in m.TOOLS:
             schema = t["inputSchema"]
             assert schema.get("type") == "object"
@@ -156,7 +157,8 @@ class TestMcpServer:
         lines = [json.loads(l) for l in proc.stdout.strip().splitlines()]
         assert lines[0]["result"]["serverInfo"]["name"] == "agent-memory-es"
         tools = lines[1]["result"]["tools"]
-        assert len(tools) == 3
+        assert len(tools) == 4
+        assert not any("approve" in t["name"] or "reject" in t["name"] for t in tools)
 
     def test_missing_key_exits(self):
         env = {k: v for k, v in os.environ.items() if k != "AMES_SERVICE_KEY"}

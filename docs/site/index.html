@@ -166,7 +166,7 @@
 <span class="o">cd</span> backend && <span class="o">export</span> AMES_ADMIN_TOKEN=<span class="s">change-me</span> && docker compose up <span class="k">-d</span>
 
 <span class="c"># 2. mint a key — owner identity binds to it</span>
-<span class="o">curl</span> -s -X POST <span class="s">"localhost:8123/admin/keys?owner_id=alice"</span> -H <span class="s">"X-Admin-Token: $AMES_ADMIN_TOKEN"</span>
+<span class="o">curl</span> -s -X POST <span class="s">"localhost:8123/admin/keys?owner_id=alice&amp;person=alice"</span> -H <span class="s">"X-Admin-Token: $AMES_ADMIN_TOKEN"</span>
 
 <span class="c"># 3. remember, then recall</span>
 <span class="o">curl</span> -s -X POST localhost:8123/memory/retain -H <span class="s">"X-API-Key: $KEY"</span> \

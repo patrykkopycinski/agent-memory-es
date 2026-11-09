@@ -103,7 +103,7 @@ def test_oversized_size_is_rejected_on_every_http_surface():
     from fastapi.testclient import TestClient
     from app import auth, main
     client = TestClient(main.app)
-    h = {"X-API-Key": auth.create_key("size-bound-owner")}
+    h = {"X-API-Key": auth.create_key("size-bound-owner", person="size-bound-owner")}
     top = memory.MAX_RECALL_SIZE
     for bad in (top + 1, 0, -3, 5000):
         assert client.post("/memory/recall", headers=h, json={"query": "q", "size": bad}).status_code == 422, bad

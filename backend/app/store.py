@@ -1,5 +1,6 @@
 """Elasticsearch client + index management for agent-memory-es."""
 import json
+import logging
 import os
 import re
 import urllib.error
@@ -29,6 +30,26 @@ API_KEYS_FILE = os.environ.get("AMES_API_KEYS_FILE", os.path.join(os.path.dirnam
 PREFIX = os.environ.get("AMES_INDEX_PREFIX", "")
 
 KINDS = ("episodic", "semantic", "procedural")
+
+# Decision-governance fields; also applied additively to pre-existing indices.
+GOVERNANCE_PROPERTIES = {
+    "decision_status": {"type": "keyword"},
+    "proposed_by": {"type": "keyword"},
+    "proposed_by_persons": {"type": "keyword"},
+    "proposal_for": {"type": "keyword"},
+    "approvals": {"properties": {
+        "by": {"type": "keyword"}, "at": {"type": "date"},
+        "text_hash": {"type": "keyword"},
+        "note": {"type": "text", "index": False}}},
+    "objections": {"properties": {
+        "by": {"type": "keyword"}, "at": {"type": "date"},
+        "text_hash": {"type": "keyword"},
+        "note": {"type": "text", "index": False},
+        "reason": {"type": "text", "index": False}}},
+    "decided_at": {"type": "date"},
+    "proposal_expires_at": {"type": "date"},
+    "approved_via": {"type": "keyword"},
+}
 
 MAPPINGS = {
     "settings": {"number_of_shards": 1, "number_of_replicas": 0},
@@ -60,6 +81,7 @@ MAPPINGS = {
             "fact_requested": {"type": "boolean"},
             "valid_from": {"type": "date"},
             "valid_to": {"type": "date"},
+            **GOVERNANCE_PROPERTIES,
         },
     },
 }
@@ -145,6 +167,31 @@ def es(method: str, path: str, body: Optional[dict] = None, timeout: float = 30)
 _indices_ready = False
 
 
+def _fields_mapped(expected: dict, actual: dict) -> bool:
+    """Every field of `expected` exists in `actual` with the same type (recursing into objects)."""
+    for name, spec in expected.items():
+        have = actual.get(name)
+        if not isinstance(have, dict):
+            return False
+        if "type" in spec and have.get("type") != spec["type"]:
+            return False
+        if "properties" in spec and not _fields_mapped(spec["properties"], have.get("properties") or {}):
+            return False
+    return True
+
+
+def _governance_mapped(index: str) -> bool:
+    """True when the index already maps every governance field with the right type. A failed read
+    is "unknown", so False: the migration is then attempted."""
+    try:
+        got = es("GET", f"/{index}/_mapping")
+        # an alias can span several indices: every one of them must map the fields
+        all_props = [v["mappings"].get("properties", {}) for v in got.values()]
+    except (RuntimeError, KeyError, AttributeError):
+        return False
+    return bool(all_props) and all(_fields_mapped(GOVERNANCE_PROPERTIES, p) for p in all_props)
+
+
 def ensure_indices() -> None:
     global _indices_ready
     for kind in KINDS:
@@ -169,6 +216,18 @@ def ensure_indices() -> None:
                                "valid_to": {"type": "date"}}})
         except RuntimeError:
             pass  # older cluster / no permission: exact-hash dedup degrades to kNN
+        # Fail closed: without these fields governed writes are rejected (dynamic: strict)
+        # or stored without a status. _indices_ready stays False so retain/recall refuse too.
+        # Already mapped (a role without put_mapping, a blocked index): nothing to migrate.
+        if _governance_mapped(idx(kind)):
+            continue
+        try:
+            es("PUT", f"/{idx(kind)}/_mapping", {"properties": GOVERNANCE_PROPERTIES})
+        except RuntimeError:
+            logging.getLogger("ames.store").error(
+                "governance mapping migration FAILED for %s; refusing to serve", idx(kind),
+                exc_info=True)
+            raise
     _indices_ready = True
 
 

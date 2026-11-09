@@ -107,7 +107,7 @@ def main() -> int:
         except urllib.error.HTTPError as e:
             all_ok &= bad(f"API key rejected ({e.code})",
                           "mint a new one: curl -X POST -H 'X-Admin-Token: <token>' "
-                          f"'{AMES_URL}/admin/keys?owner_id=you'")
+                          f"'{AMES_URL}/admin/keys?owner_id=you&person=you'")
         except Exception:
             pass  # service down already reported above
     else:

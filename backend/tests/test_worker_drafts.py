@@ -77,7 +77,7 @@ def _seed(owner, ents_n=4, filler=20):
 
 
 # --- flag off → run_once proposes zero model drafts -------------------------
-auth.create_key(O)
+auth.create_key(O, person=O)
 _seed(O)
 os.environ.pop("AMES_MODEL_DRAFTS", None)
 stats = run_once()
@@ -145,7 +145,7 @@ assert "rivendell facts and conventions" in pats, pats
 print("COVER-SUPERSET-NOT-COVERED: PASS")
 
 # --- shared (other-owner) active model does not cover ----------------------
-auth.create_key(O2)
+auth.create_key(O2, person=O2)
 _seed(O)
 mm.upsert_model(O2, "rivendell facts and conventions", "someone else's model.")
 pats = [x["question_pattern"] for x in _candidate_clusters(O, min_facts=3)]
@@ -273,7 +273,7 @@ res = memory.recall(O3, "rivendell facts and conventions")
 assert res["mental_model"].get("stale") is True, res["mental_model"]
 # corpus-size invariance: unrelated owners' docs must not flip the flag
 for o in ("fillerc", "fillerd"):
-    auth.create_key(o)
+    auth.create_key(o, person=o)
     _wipe(o)
     for t in FILLER_FACTS[:5]:
         memory.retain(o, "semantic", t)
