@@ -1128,3 +1128,41 @@ def test_failing_attr_builder_warns_class_name_only_once(spans, caplog):
     assert msgs == ["attr builder boom failed: RuntimeError"], msgs
     assert not any(m in caplog.text for m in BAD_MARKERS)
     _assert_no_canary(spans)
+
+
+# --- am_mutations setup must not look like a failing ES call -----------------
+
+def test_repeat_mutation_logs_emit_no_error_es_spans(spans, owner):
+    from app import memory
+    from app.store import PREFIX, es
+    es("DELETE", f"/{PREFIX}am_mutations?ignore_unavailable=true")
+    memory._forget_mutations_index()
+    try:
+        with _otel.span("test.parent"):
+            for i in range(3):
+                assert memory._log_mutation("update", "otel-alice", "semantic", f"d{i}", {})
+        es_spans = _by_name(spans, "es.request")
+        assert len(es_spans) >= 3
+        bad = [s for s in es_spans if s.status.status_code.name == "ERROR"
+               or "es.status_code" in _attrs(s)]
+        assert bad == [], [(s.name, _attrs(s)) for s in bad]
+    finally:
+        es("POST", f"/{PREFIX}am_mutations/_delete_by_query?refresh=true",
+           {"query": {"term": {"owner_id": "otel-alice"}}})
+
+
+def test_mutation_log_error_span_negative_control(spans):
+    """The harness does flag an ES 400: creating an index that exists is recorded as an error span.
+    Uses its own index so the shared am_mutations mapping is left alone."""
+    from app.store import PREFIX, es
+    name = f"/{PREFIX}am_mutations_negctl"
+    es("DELETE", f"{name}?ignore_unavailable=true")
+    es("PUT", name, {})
+    try:
+        spans.clear()
+        with _otel.span("test.parent"):
+            with pytest.raises(RuntimeError):
+                es("PUT", name, {})
+        assert [s for s in _by_name(spans, "es.request") if "es.status_code" in _attrs(s)]
+    finally:
+        es("DELETE", f"{name}?ignore_unavailable=true")

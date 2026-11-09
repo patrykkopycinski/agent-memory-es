@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import re
+import threading
 import time
 import urllib.parse
 import uuid
@@ -705,6 +706,49 @@ def _group_docs(owner_id: str, kind: str, doc_id: str) -> list:
     return [i for i, _ in _group_hits(owner_id, kind, doc_id)]
 
 
+_MUTATION_PROPERTIES = {
+    "intent": {"type": "keyword"}, "owner_id": {"type": "keyword"},
+    "kind": {"type": "keyword"}, "doc_id": {"type": "keyword"},
+    "at": {"type": "date"},
+}
+_mutations_lock = threading.Lock()
+_mutations_ready: Optional[str] = None   # name of the am_mutations index ensured by this process
+
+
+def _ensure_mutations_index() -> None:
+    """Create am_mutations (or add missing fields to a pre-existing one) once per process.
+    Indices created before doc_id was pinned as keyword would otherwise text-map it.
+    A failure leaves the flag unset so the next call retries."""
+    global _mutations_ready
+    from .store import PREFIX, _fields_mapped
+    index = f"{PREFIX}am_mutations"
+    if _mutations_ready == index:
+        return
+    with _mutations_lock:
+        if _mutations_ready == index:
+            return
+        # ignore_unavailable turns "missing" into an empty 200: no 404 for the tracer to record
+        got = es("GET", f"/{index}?ignore_unavailable=true")
+        if not got:
+            try:
+                es("PUT", f"/{index}", {
+                    "settings": {"number_of_shards": 1, "number_of_replicas": 0},
+                    "mappings": {"properties": _MUTATION_PROPERTIES},
+                })
+            except RuntimeError as exc:
+                if "resource_already_exists" not in str(exc):  # lost a creation race
+                    raise
+        elif not all(_fields_mapped(_MUTATION_PROPERTIES, v.get("mappings", {}).get("properties", {}))
+                     for v in got.values()):
+            es("PUT", f"/{index}/_mapping", {"properties": _MUTATION_PROPERTIES})
+        _mutations_ready = index
+
+
+def _forget_mutations_index() -> None:
+    global _mutations_ready
+    _mutations_ready = None
+
+
 def _log_mutation(intent: str, owner_id: str, kind: str, doc_id: str, detail: dict,
                   strict: bool = False) -> Optional[str]:
     """Best-effort intent log (who/what/when) written BEFORE the mutation runs.
@@ -713,32 +757,21 @@ def _log_mutation(intent: str, owner_id: str, kind: str, doc_id: str, detail: di
     from .store import PREFIX
     doc = {"intent": intent, "owner_id": owner_id, "kind": kind, "doc_id": doc_id,
            "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "detail": detail}
-    try:
-        es("PUT", f"/{PREFIX}am_mutations", {
-            "settings": {"number_of_shards": 1, "number_of_replicas": 0},
-            "mappings": {"properties": {
-                "intent": {"type": "keyword"}, "owner_id": {"type": "keyword"},
-                "kind": {"type": "keyword"}, "doc_id": {"type": "keyword"},
-                "at": {"type": "date"},
-            }},
-        })
-    except RuntimeError:
-        pass  # already exists
-    # Additive mapping migration (same pattern as store.ensure_indices): indices
-    # created before doc_id was pinned as keyword would otherwise text-map it.
-    try:
-        es("PUT", f"/{PREFIX}am_mutations/_mapping", {"properties": {
-            "intent": {"type": "keyword"}, "owner_id": {"type": "keyword"},
-            "kind": {"type": "keyword"}, "doc_id": {"type": "keyword"},
-            "at": {"type": "date"},
-        }})
-    except RuntimeError:
-        pass
-    try:
-        return es("POST", f"/{PREFIX}am_mutations/_doc?refresh=true", doc).get("_id")
-    except RuntimeError:
-        if strict:
-            raise
+    for attempt in (1, 2):
+        try:
+            _ensure_mutations_index()
+        except RuntimeError:
+            pass  # the write below still proceeds, as it did when the setup calls were swallowed
+        try:
+            return es("POST", f"/{PREFIX}am_mutations/_doc?refresh=true", doc).get("_id")
+        except RuntimeError as exc:
+            # index removed after it was ensured: re-ensure, then retry once
+            if attempt == 1 and "index_not_found" in str(exc):
+                _forget_mutations_index()
+                continue
+            if strict:
+                raise
+            return None
     return None
 
 
