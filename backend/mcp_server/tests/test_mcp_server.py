@@ -120,6 +120,42 @@ def test_recall_sends_key_header_and_slims_results():
     assert all("embedding" not in r and "rrf" not in r for r in out["results"])
 
 
+def test_recall_orders_by_confidence_before_the_cut_and_exposes_it():
+    items = [{"id": "lo", "kind": "semantic", "score": 0.9, "confidence": 0.1, "visibility": "private", "text": "a"},
+             {"id": "none", "kind": "semantic", "score": 0.8, "visibility": "private", "text": "b"},
+             {"id": "hi", "kind": "semantic", "score": 0.7, "confidence": 0.9, "visibility": "private", "text": "c"},
+             {"id": "mid", "kind": "semantic", "score": 0.6, "confidence": 0.5, "visibility": "private", "text": "d"}]
+    mcp = build_server(_client([], results=items))
+    out = _call(mcp, "memory_recall", {"query": "q", "k": 2})
+    assert [r["id"] for r in out["results"]] == ["hi", "mid"]
+    assert [r["confidence"] for r in out["results"]] == [0.9, 0.5]
+    out = _call(mcp, "memory_recall", {"query": "q", "k": 4})
+    assert [r["id"] for r in out["results"]] == ["hi", "mid", "lo", "none"]
+
+
+def test_recall_keeps_backend_order_when_a_cross_encoder_rerank_ran():
+    # rerank_rank present => the backend kept the reranker's order; sorting by confidence
+    # here would discard it. Confidence deliberately opposes the rerank order.
+    items = [{"id": "r1", "kind": "semantic", "score": 0.9, "confidence": 0.1, "rerank_rank": 1, "visibility": "private", "text": "a"},
+             {"id": "r2", "kind": "semantic", "score": 0.8, "confidence": 0.9, "rerank_rank": 2, "visibility": "private", "text": "b"},
+             {"id": "r3", "kind": "semantic", "score": 0.7, "confidence": 0.5, "rerank_rank": 3, "visibility": "private", "text": "c"}]
+    mcp = build_server(_client([], results=items))
+    out = _call(mcp, "memory_recall", {"query": "q", "k": 2})
+    assert [r["id"] for r in out["results"]] == ["r1", "r2"]
+    out = _call(mcp, "memory_recall", {"query": "q", "k": 2, "visibility": "private"})
+    assert [r["id"] for r in out["results"]] == ["r1", "r2"]
+
+
+def test_recall_visibility_filter_keeps_backend_order_after_dropping_items():
+    # the filter only drops items; the surviving backend order must survive too
+    items = [{"id": "1", "kind": "semantic", "score": 0.9, "confidence": 0.1, "visibility": "private", "text": "a"},
+             {"id": "2", "kind": "semantic", "score": 0.8, "confidence": 0.9, "visibility": "team", "text": "b"},
+             {"id": "3", "kind": "semantic", "score": 0.7, "confidence": 0.5, "visibility": "private", "text": "c"}]
+    mcp = build_server(_client([], results=items))
+    out = _call(mcp, "memory_recall", {"query": "q", "k": 3, "visibility": "private"})
+    assert [r["id"] for r in out["results"]] == ["3", "1"]
+
+
 def test_recall_visibility_filter_is_client_side_and_overfetches():
     calls = []
     mcp = build_server(_client(calls, results=ITEMS))
