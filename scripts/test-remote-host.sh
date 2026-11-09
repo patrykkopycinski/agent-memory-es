@@ -133,6 +133,33 @@ log "ES healthy: $ES"
 curl -s -m 20 -XPOST "$ES/_license/start_trial?acknowledge=true" | tr -d '\n' | cut -c1-120 | sed 's/^/  license: /'
 echo
 
+# The built-in rerank endpoint downloads/deploys its model on first use (>30 s), which would hit whichever
+# suite runs first (head) and trip the backend's 30 s rerank timeout. Warm it before any suite. A warm-up that
+# never succeeds is only a WARNING: the rerank tests then fail honestly and the base comparison still applies.
+status "running warming-rerank"
+# The body is full-size (50 passages of ~1.2 kB, like a depth-50 recall): a 2-passage call only deploys the
+# model, and the first full-size calls were still 35-45 s afterwards.
+WARM_DOC=$(printf 'quarterly warehouse relocation budget plan item %.0s' $(seq 1 25))
+WARM_BODY='{"query":"warehouse relocation budget","input":['
+for i in $(seq 1 50); do WARM_BODY="$WARM_BODY\"$WARM_DOC $i\","; done
+WARM_BODY="${WARM_BODY%,}]}"
+WARM_T0=$(date +%s); WARM_CODE=000; WARM_TIMES=
+while [ $(( $(date +%s) - WARM_T0 )) -lt 300 ]; do
+  C0=$(date +%s)
+  WARM_CODE=$(curl -s -m 120 -o /dev/null -w '%{http_code}' -XPOST -H 'content-type: application/json' \
+    "$ES/_inference/rerank/.rerank-v1-elasticsearch" -d "$WARM_BODY")
+  C1=$(( $(date +%s) - C0 )); WARM_TIMES="$WARM_TIMES ${WARM_CODE}/${C1}s"
+  # warm = a full-size call that answers 200 quickly; a slow 200 means the model is still settling
+  [ "$WARM_CODE" = 200 ] && [ "$C1" -le 10 ] && break
+  sleep 5
+done
+log "rerank warm-up calls (code/time):$WARM_TIMES"
+if [ "$WARM_CODE" = 200 ] && [ "$C1" -le 10 ]; then
+  log "rerank warm-up ok: HTTP $WARM_CODE after $(( $(date +%s) - WARM_T0 ))s"
+else
+  log "WARNING: rerank warm-up did not settle: last HTTP $WARM_CODE (${C1}s) after $(( $(date +%s) - WARM_T0 ))s; rerank tests may fail on a cold endpoint"
+fi
+
 # ---- 2. the prod backend image already carries every runtime dependency
 BACKEND_IMAGE=$(docker inspect -f '{{.Config.Image}}' ames-backend 2>/dev/null)
 [ -n "$BACKEND_IMAGE" ] || { RESULT="infra no ames-backend container to take the image from"; exit 70; }
