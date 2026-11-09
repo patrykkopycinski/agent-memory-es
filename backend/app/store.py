@@ -107,6 +107,13 @@ def _guard_path(path: str, method: str) -> None:
     p = path.split("?", 1)[0].lstrip("/")
     if p == "":
         return
+    if p.startswith("_index_template/"):
+        name = p.split("/", 1)[1]
+        if not name or "/" in name or "*" in name or not name.startswith(PREFIX):
+            raise RuntimeError(
+                f"ES test guard: refusing {method} {path} — index template "
+                f"{name!r} does not start with required test prefix {PREFIX!r}.")
+        return
     if p.startswith("_"):
         first = p.split("/", 1)[0]
         if method not in ("GET", "HEAD"):

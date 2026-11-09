@@ -33,6 +33,15 @@ def _drop_index():
     es("DELETE", f"/{INDEX}?ignore_unavailable=true")
 
 
+def _drop_template():
+    # an index created before the template existed does not inherit its mapping
+    try:
+        es("DELETE", f"/_index_template/{INDEX}")
+    except RuntimeError as exc:
+        if "-> 404" not in str(exc):
+            raise
+
+
 def test_repeat_calls_issue_the_setup_requests_at_most_once(calls):
     _drop_index()
     ids = [memory._log_mutation("update", OWNER, "semantic", f"d{i}", {}) for i in range(4)]
@@ -56,6 +65,7 @@ def test_existing_index_is_never_created_over(calls):
 
 def test_index_missing_the_pinned_fields_gets_a_mapping_update_once(calls):
     _drop_index()
+    _drop_template()
     es("PUT", f"/{INDEX}", {"mappings": {"properties": {"intent": {"type": "keyword"}}}})
     for i in range(3):
         memory._log_mutation("update", OWNER, "semantic", f"d{i}", {})
@@ -86,6 +96,43 @@ def test_index_deleted_underneath_is_re_ensured_on_the_next_call(calls, monkeypa
     assert memory._mutations_ready == INDEX
     props = es("GET", f"/{INDEX}/_mapping")[INDEX]["mappings"]["properties"]
     assert props["doc_id"]["type"] == "keyword"       # re-created with the pinned mapping, not dynamic
+
+
+def test_index_recreated_by_a_write_gets_the_pinned_mapping(calls):
+    memory._log_mutation("update", OWNER, "semantic", "warm", {})
+    assert memory._mutations_ready == INDEX
+    _drop_index()
+    # real cluster, auto-create on: the write recreates the index itself
+    assert memory._log_mutation("update", OWNER, "semantic", "after-delete", {})
+    props = es("GET", f"/{INDEX}/_mapping")[INDEX]["mappings"]["properties"]
+    assert props["doc_id"]["type"] == "keyword" and props["at"]["type"] == "date"
+    hits = es("POST", f"/{INDEX}/_search", {"query": {"term": {"doc_id": "after-delete"}}})
+    assert hits["hits"]["total"]["value"] >= 1
+
+
+def test_index_template_is_installed_once_per_process(calls):
+    for i in range(4):
+        memory._log_mutation("update", OWNER, "semantic", f"d{i}", {})
+    templates = [c for c in calls if c[1] == f"/_index_template/{INDEX}"]
+    assert len(templates) == 1 and templates[0][0] == "PUT", calls
+    assert INDEX in es("GET", f"/_index_template/{INDEX}")["index_templates"][0]["index_template"]["index_patterns"]
+
+
+def test_conflicting_existing_mapping_fails_at_most_once(calls, caplog):
+    _drop_index()
+    _drop_template()
+    es("PUT", f"/{INDEX}", {"mappings": {"properties": {
+        "intent": {"type": "keyword"}, "doc_id": {"type": "text"}}}})
+    try:
+        with caplog.at_level("WARNING", logger="ames.mutations"):
+            ids = [memory._log_mutation("update", OWNER, "semantic", f"c{i}", {}) for i in range(5)]
+        assert all(ids)
+        assert len([c for c in calls if c[1].endswith("/_mapping")]) <= 1, calls
+        assert len([c for c in calls if c[0] == "GET" and c[1].startswith(f"/{INDEX}?")]) == 1, calls
+        assert memory._mutations_ready == INDEX
+        assert len([r for r in caplog.records if r.name == "ames.mutations"]) == 1
+    finally:
+        _drop_index()
 
 
 def test_non_strict_failure_is_swallowed_and_strict_raises(monkeypatch):
@@ -125,3 +172,4 @@ def test_governance_outcome_update_still_applies(calls):
 def teardown_module(_m):
     es("POST", f"/{INDEX}/_delete_by_query?refresh=true&ignore_unavailable=true",
        {"query": {"term": {"owner_id": OWNER}}})
+    es("DELETE", f"/_index_template/{INDEX}")

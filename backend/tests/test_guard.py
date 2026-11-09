@@ -66,6 +66,15 @@ def test_cluster_level_allowlist_refuses_bulk_apis():
     _refused_get("/_reindex")
 
 
+def test_index_template_allowed_only_for_the_test_prefix():
+    store._guard_path(f"/_index_template/{P}am_mutations", "PUT")
+    if P:
+        _refused("/_index_template/am_mutations")
+    _refused(f"/_index_template/{P}x/y")
+    _refused(f"/_index_template/{P}*")
+    _refused("/_index_template/")
+
+
 def test_legitimate_paths_pass():
     _ok(f"/{P}episodic/_doc")
     _ok(f"/{P}semantic/_search")

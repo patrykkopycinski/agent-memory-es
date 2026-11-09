@@ -711,14 +711,17 @@ _MUTATION_PROPERTIES = {
     "kind": {"type": "keyword"}, "doc_id": {"type": "keyword"},
     "at": {"type": "date"},
 }
+_MUTATION_SETTINGS = {"number_of_shards": 1, "number_of_replicas": 0}
 _mutations_lock = threading.Lock()
 _mutations_ready: Optional[str] = None   # name of the am_mutations index ensured by this process
+_mutations_log = logging.getLogger("ames.mutations")
 
 
 def _ensure_mutations_index() -> None:
     """Create am_mutations (or add missing fields to a pre-existing one) once per process.
     Indices created before doc_id was pinned as keyword would otherwise text-map it.
-    A failure leaves the flag unset so the next call retries."""
+    A transient failure leaves the flag unset so the next call retries; a mapping conflict
+    on an existing index cannot be fixed by retrying, so it is logged once and the flag set."""
     global _mutations_ready
     from .store import PREFIX, _fields_mapped
     index = f"{PREFIX}am_mutations"
@@ -727,12 +730,24 @@ def _ensure_mutations_index() -> None:
     with _mutations_lock:
         if _mutations_ready == index:
             return
+        # Elasticsearch auto-creates a missing index on write with dynamic mapping (doc_id would
+        # become text); the template pins the mapping for an index recreated after this check.
+        try:
+            es("PUT", f"/_index_template/{index}", {
+                "index_patterns": [index],
+                "template": {"settings": _MUTATION_SETTINGS,
+                             "mappings": {"properties": _MUTATION_PROPERTIES}},
+            })
+        except RuntimeError:
+            _mutations_log.warning("am_mutations index template not installed; "
+                                   "an index recreated by a write gets dynamic mapping",
+                                   exc_info=True)
         # ignore_unavailable turns "missing" into an empty 200: no 404 for the tracer to record
         got = es("GET", f"/{index}?ignore_unavailable=true")
         if not got:
             try:
                 es("PUT", f"/{index}", {
-                    "settings": {"number_of_shards": 1, "number_of_replicas": 0},
+                    "settings": _MUTATION_SETTINGS,
                     "mappings": {"properties": _MUTATION_PROPERTIES},
                 })
             except RuntimeError as exc:
@@ -740,7 +755,14 @@ def _ensure_mutations_index() -> None:
                     raise
         elif not all(_fields_mapped(_MUTATION_PROPERTIES, v.get("mappings", {}).get("properties", {}))
                      for v in got.values()):
-            es("PUT", f"/{index}/_mapping", {"properties": _MUTATION_PROPERTIES})
+            try:
+                es("PUT", f"/{index}/_mapping", {"properties": _MUTATION_PROPERTIES})
+            except RuntimeError as exc:
+                if "-> 400:" not in str(exc):
+                    raise
+                _mutations_log.warning(
+                    "am_mutations has a field mapping that cannot be changed in place; "
+                    "term queries on it may not match until the index is reindexed")
         _mutations_ready = index
 
 
