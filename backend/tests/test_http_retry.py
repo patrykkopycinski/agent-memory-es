@@ -332,6 +332,28 @@ def test_temperature_explicit_value_used(monkeypatch):
         assert payload["temperature"] == 0.7
 
 
+@pytest.mark.parametrize("value", [None, "", "0", "true"])
+def test_disable_thinking_off_sends_no_template_kwargs(monkeypatch, value):
+    if value is None:
+        monkeypatch.delenv("AMES_LLM_DISABLE_THINKING", raising=False)
+    else:
+        monkeypatch.setenv("AMES_LLM_DISABLE_THINKING", value)
+    payload = _capture_payload(lambda: llm.chat_json("s", "u"))
+    assert "chat_template_kwargs" not in payload
+
+
+def test_disable_thinking_on_sets_enable_thinking_false(monkeypatch):
+    monkeypatch.setenv("AMES_LLM_DISABLE_THINKING", "1")
+    payload = _capture_payload(lambda: llm.chat_json("s", "u"))
+    assert payload["chat_template_kwargs"] == {"enable_thinking": False}
+
+
+def test_disable_thinking_never_reaches_chat(monkeypatch):
+    monkeypatch.setenv("AMES_LLM_DISABLE_THINKING", "1")
+    payload = _capture_payload(lambda: llm.chat("q", [{"id": "am_1", "text": "t"}]))
+    assert "chat_template_kwargs" not in payload
+
+
 def test_chat_json_user_message_keeps_json_word():
     reqs = []
 

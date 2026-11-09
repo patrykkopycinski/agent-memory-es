@@ -30,7 +30,7 @@ MAX_K = 50
 _TRUE = {"1", "true", "yes", "on"}
 
 # fields of a recalled item worth sending to the model (drops embeddings, rrf internals)
-_ITEM_FIELDS = ("id", "kind", "score", "visibility", "text", "occurred_at",
+_ITEM_FIELDS = ("id", "kind", "score", "confidence", "visibility", "text", "occurred_at",
                 "entities", "doc_group")
 
 
@@ -129,6 +129,12 @@ def _recall(client, query, k, visibility, kinds, as_of) -> dict:
     scanned = len(items)
     if visibility is not None:
         items = [i for i in items if i.get("visibility") == visibility]
+    # Backend order is the answer order: confidence-descending, or the cross-encoder's
+    # when hits carry rerank_rank. The visibility filter only drops items, so this sort
+    # just restores that order for the cut to k.
+    if not any("rerank_rank" in i for i in items):
+        items = sorted(items, key=lambda i: (i.get("confidence") is None,
+                                             -(i.get("confidence") or 0.0)))
     items = items[:k]
     out = {"query": query, "count": len(items),
            "results": [_slim(i) for i in items],

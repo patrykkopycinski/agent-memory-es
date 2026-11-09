@@ -230,15 +230,27 @@ def _recency_boost(occurred_at: Optional[str], now=None) -> float:
     return RECENCY_WEIGHT * recency_decay(occurred_at, now) / (RANK_CONSTANT + 1)
 
 
+def _confidence_key(hit: dict) -> tuple:
+    c = hit.get("confidence")
+    return (c is None, -(c or 0.0))
+
+
+def _sort_by_confidence(hits: list) -> list:
+    """Best confidence first. Stable (ties keep the input order); a hit with no confidence goes
+    last. Returns a new list."""
+    return sorted(hits, key=_confidence_key)
+
+
 def _apply_budgets(ordered: list, size: int, per_kind_budget: Optional[int] = None,
-                   per_doc_budget: int = PER_DOC_BUDGET) -> list:
+                   per_doc_budget: int = PER_DOC_BUDGET, by_confidence: bool = False) -> list:
     """Cap how much of the fused window any one kind or source doc can occupy.
 
     Pass 1 admits at most per_kind_budget per kind and per_doc_budget per doc group
     (doc_group defaults to the doc id), so one kind or one chunked/long retain cannot
     fill the window. Pass 2 backfills any leftover slots with the best remaining hits
     still respecting the per-doc cap, so a query whose matches live in one kind is not
-    starved. Returns the (score-ordered) window.
+    starved. Returns the window score-ordered, or confidence-descending with `by_confidence`
+    (score breaks ties).
     """
     if per_kind_budget is None:
         n = max(1, len({it.get("kind") for it in ordered}) or 1)
@@ -266,8 +278,11 @@ def _apply_budgets(ordered: list, size: int, per_kind_budget: Optional[int] = No
         if doc_count.get(doc, 0) < per_doc_budget:
             picked.append(it)
             doc_count[doc] = doc_count.get(doc, 0) + 1
-    # reranked lists carry rerank_rank (cross-encoder order); otherwise score-ordered
-    picked.sort(key=lambda x: (x["rerank_rank"],) if "rerank_rank" in x else (-x.get("score", 0.0),))
+    # reranked lists carry rerank_rank (cross-encoder order); otherwise score- or confidence-ordered
+    if by_confidence:
+        picked.sort(key=lambda x: (*_confidence_key(x), -x.get("score", 0.0)))
+    else:
+        picked.sort(key=lambda x: (x["rerank_rank"],) if "rerank_rank" in x else (-x.get("score", 0.0),))
     return picked[:size]
 
 
@@ -1459,9 +1474,18 @@ def _recall_inner(owner_id: str, query: str, kinds=None, size: int = 8,
         ordered, rerank_info = _rerank_fused_meta(query, ordered, rerank_depth)
         reranked = rerank_info["applied"]
         timings["rerank"] = rerank_ms = _ms(t_rerank)
-    window = _apply_budgets(ordered, size, per_doc_budget=per_doc or PER_DOC_BUDGET)
+    # Callers read the first hit as the answer, so unless a cross-encoder rerank ran (its order
+    # wins) the list is confidence-descending. The sort comes BEFORE the budgets and the size cut,
+    # so a confident hit deep in the fused order is not cut off by `size`.
+    by_conf = not reranked
+    if by_conf:
+        ordered = _sort_by_confidence(ordered)
+    window = _apply_budgets(ordered, size, per_doc_budget=per_doc or PER_DOC_BUDGET, by_confidence=by_conf)
     # Extracted facts have a separate evidence lane and do not displace chunks.
-    fact_hits = [h for h in results.get("semantic", []) if h.get("source_id")][:24] if "semantic" in kinds else []
+    fact_hits = []
+    if "semantic" in kinds:
+        facts = [h for h in results.get("semantic", []) if h.get("source_id")]
+        fact_hits = (_sort_by_confidence([fused[h["id"]] for h in facts]) if by_conf else facts)[:24]
     chunks = [h for h in ordered if not h.get("source_id")][:8]
     evidence = fact_hits + chunks
     # `fuse` = everything after the per-kind searches, rerank excluded: RRF, the graph and
@@ -1484,7 +1508,7 @@ def _recall_inner(owner_id: str, query: str, kinds=None, size: int = 8,
     }
     # True when nothing in the window is confidently relevant: the caller should say "I don't
     # know" instead of presenting the top hit as an answer. A hint, not a filter: results stay.
-    out["abstain_hint"] = max((h["confidence"] for h in window), default=0.0) < ABSTAIN_CONFIDENCE
+    out["abstain_hint"] = max((h.get("confidence") or 0.0 for h in window), default=0.0) < ABSTAIN_CONFIDENCE
     if embed_error:
         out["embed_error"] = embed_error
     if rerank_info is not None:

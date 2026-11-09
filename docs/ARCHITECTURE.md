@@ -51,7 +51,8 @@ Every document carries the same envelope (`store.py` MAPPINGS):
 1. **BM25 arm** — match over `text` + `entities`
 2. **kNN arm** — dense_vector top-k (embeddings via ES `_bulk` inference or any OpenAI-compatible endpoint, `embeddings.py`; on embedding failure the system degrades to BM25-only — `memory.py:retain` swallows the embed error)
 3. **RRF fusion** — rank-based, no score tuning across arms
-4. **Token-budget cut** — top fused hits until the budget is spent
+4. **Confidence order** — `results` (and its deprecated alias `fused`) are sorted by per-hit `confidence`, descending: stable, so ties keep fused order, and hits with no `confidence` go last. The sort runs before the per-doc budget and the size cut, so a confident hit deep in the fused order is not dropped. When a cross-encoder rerank ran, its order is kept instead. The MCP `memory_recall` tool applies the same order before cutting to `k`, and keeps the rerank order when hits carry `rerank_rank`.
+5. **Token-budget cut** — top fused hits until the budget is spent
 
 ## Consolidation worker (`worker.py`)
 

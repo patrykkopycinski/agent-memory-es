@@ -24,12 +24,10 @@ def _sampling(default):
 
 
 def _template_kwargs():
-    """AMES_LLM_DISABLE_THINKING=1 => disable the chat template's thinking phase
-    (chat_template_kwargs.enable_thinking=false). Needed for thinking-by-default
-    local lanes (oMLX Groot/Nemotron): without it the model spends the entire
-    max_tokens budget on reasoning and returns empty content. Harmless elsewhere:
-    the gateway drops the field for providers that reject it (claude whitelist
-    translator; glm verified tolerant)."""
+    """AMES_LLM_DISABLE_THINKING=1 => send chat_template_kwargs.enable_thinking=false.
+    For models whose chat template thinks by default and can spend the whole
+    max_tokens budget on reasoning, returning empty content. Leave unset for
+    providers that reject unknown request fields."""
     if os.environ.get("AMES_LLM_DISABLE_THINKING") == "1":
         return {"chat_template_kwargs": {"enable_thinking": False}}
     return {}
