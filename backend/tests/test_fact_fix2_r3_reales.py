@@ -207,7 +207,7 @@ class _SteppedEvent(threading.Event):
 def test_T6_abort_before_scope_expiry(monkeypatch, setup):
     seed()
     clock = _LogicalClock(facts._now())
-    _SteppedEvent.clock = clock
+    monkeypatch.setattr(_SteppedEvent, "clock", clock)
     # facts only uses Event (heartbeat stop/abort), Thread and Lock from threading.
     monkeypatch.setattr(facts, "threading", types.SimpleNamespace(
         Event=_SteppedEvent, Thread=threading.Thread, Lock=threading.Lock))
@@ -221,7 +221,7 @@ def test_T6_abort_before_scope_expiry(monkeypatch, setup):
         if "lease_until" in fields:
             # The abort cannot arrive before the worker is inside process(),
             # whatever the scheduler does; logical time is frozen while waiting.
-            assert entered.wait(10)
+            entered.wait(10)  # a failed assert here would be swallowed by _heartbeat
             renew_times.append(clock.now())
             raise RuntimeError("transient scope failure")
         return real_update(key, token, **fields)
@@ -242,9 +242,31 @@ def test_T6_abort_before_scope_expiry(monkeypatch, setup):
     assert renew_times[-1] < facts._parse_iso(bf["lease_until"])
 
 
-def test_heartbeat_abort_window_fits_production_lease():
-    window = facts.HEARTBEAT_SECONDS + 2 * min(2, facts.HEARTBEAT_SECONDS / 4)
-    assert window < facts.BACKFILL_LEASE_SECONDS
+@pytest.mark.parametrize("heartbeat,lease", [(15, 90), (0.05, 0.3)], ids=["production", "fixture-scale"])
+def test_heartbeat_abort_window_fits_lease(monkeypatch, heartbeat, lease):
+    """Drive the real _heartbeat with every scope renewal failing, on the logical
+    clock and without ES: it must abort before the scope lease granted at its
+    start would expire. (15, 90) are the production constants; the second pair
+    keeps the retry spacing observable, since at production scale the retry delay
+    is capped at 2s whatever HEARTBEAT_SECONDS / 4 evaluates to.
+    Assumes ES calls return promptly: per-call ES latency (store.es timeout) is
+    not modelled and is a separate production concern."""
+    clock = _LogicalClock(facts._now())
+    monkeypatch.setattr(_SteppedEvent, "clock", clock)
+    monkeypatch.setattr(facts, "_now", clock.now)
+    monkeypatch.setattr(facts, "HEARTBEAT_SECONDS", heartbeat)
+    monkeypatch.setattr(facts, "BACKFILL_LEASE_SECONDS", lease)
+    renewals = []
+
+    def down(*a, **kw):
+        renewals.append(1)
+        raise RuntimeError("scope store down")
+
+    monkeypatch.setattr(facts, "_update_backfill", down)
+    start, abort = clock.now(), _SteppedEvent()
+    facts._heartbeat("bf", "tok", _SteppedEvent(), abort)
+    assert abort.is_set() and len(renewals) == 3
+    assert (clock.now() - start).total_seconds() < lease
 
 
 def test_job_renew_failure_does_not_abort_scope(monkeypatch, setup):
