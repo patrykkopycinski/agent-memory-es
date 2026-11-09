@@ -1288,7 +1288,9 @@ def _recall_inner(owner_id: str, query: str, kinds=None, size: int = 8,
     kinds = kinds or list(KINDS)
     sim_floor = KNN_MIN_SIMILARITY if min_similarity is None else _parse_similarity(min_similarity)
     t_embed = time.perf_counter()
-    qvecs, embed_error = embeddings.embed_safe([query])
+    with _otel.span("memory.embed"):
+        qvecs, embed_error = embeddings.embed_safe([query])
+        _otel.set_attrs_from(_otel.embed_attrs, embeddings.backend_name(), 1, bool(embed_error))
     qvec = qvecs[0] if qvecs else None
     timings["embed"] = _ms(t_embed)
     results = {}

@@ -1166,3 +1166,47 @@ def test_mutation_log_error_span_negative_control(spans):
         assert [s for s in _by_name(spans, "es.request") if "es.status_code" in _attrs(s)]
     finally:
         es("DELETE", f"{name}?ignore_unavailable=true")
+
+
+# --- memory.embed: attribute the pre-ES latency of recall --------------------
+
+def test_recall_embed_span_is_child_of_recall_with_no_text(spans, client, owner):
+    r = client.post("/memory/recall", headers=H(owner),
+                    json={"query": SECRET_QUERY, "size": 3})
+    assert r.status_code == 200, r.text
+    recall = _by_name(spans, "memory.recall")
+    embed = _by_name(spans, "memory.embed")
+    assert len(recall) == 1 and len(embed) == 1
+    assert embed[0].parent is not None
+    assert embed[0].parent.span_id == recall[0].context.span_id
+    a = _attrs(embed[0])
+    assert a["memory.embed.inputs"] == 1
+    assert a["memory.embed.backend"] in _otel.EMBED_BACKENDS
+    assert a["memory.embed.failed"] is False
+    assert SECRET_QUERY not in _everything(spans)
+    assert all(not isinstance(v, str) or len(v) < 32 for v in a.values())
+
+
+def test_recall_embed_failure_is_flagged_without_the_error_text(spans, client, owner, monkeypatch):
+    from app import embeddings
+    monkeypatch.setattr(embeddings, "embed",
+                        lambda texts: (_ for _ in ()).throw(RuntimeError("boom " + BAD_KIND)))
+    r = client.post("/memory/recall", headers=H(owner), json={"query": "anything", "size": 3})
+    assert r.status_code == 200, r.text
+    a = _attrs(_by_name(spans, "memory.embed")[0])
+    assert a["memory.embed.failed"] is True
+    _assert_no_canary(spans)
+
+
+def test_embed_attrs_allowlist_and_negative_control():
+    a = _otel.embed_attrs("SECRET-backend-c4n4ry", 1, False)
+    assert a["memory.embed.backend"] == "invalid"
+    assert "c4n4ry" not in str(a)
+
+
+def test_recall_makes_no_embed_span_when_tracing_off(spans, monkeypatch):
+    from app import memory
+    monkeypatch.setattr(_otel, "tracer", lambda: None)
+    out = memory.recall("otel-alice", "anything", size=1)
+    assert "fused" in out
+    assert _by_name(spans, "memory.embed") == [] and _by_name(spans, "memory.recall") == []

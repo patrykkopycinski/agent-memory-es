@@ -658,6 +658,17 @@ def promote_attrs(owner_id: str, kind: str, to_visibility: str) -> dict:
             "memory.visibility": safe_visibility(to_visibility)}
 
 
+EMBED_BACKENDS = ("local", "es", "omniroute", "auto")
+
+
+def embed_attrs(backend, inputs: int, failed: bool) -> dict:
+    """Embedding step attributes: backend (allowlisted, the env value is operator-set), input count
+    and outcome. Never the texts."""
+    return {"memory.embed.backend": backend if backend in EMBED_BACKENDS else INVALID,
+            "memory.embed.inputs": inputs,
+            "memory.embed.failed": bool(failed)}
+
+
 def retain_start_attrs(kind, visibility) -> dict:
     return {"memory.kind": safe_kind(kind), "memory.visibility": safe_visibility(visibility)}
 
