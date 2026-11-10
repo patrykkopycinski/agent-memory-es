@@ -161,7 +161,8 @@ while :; do
   # after a client-side timeout the call may still be queued in ES: back off longer before adding load
   pause=5; [ "$WARM_CODE" = 000 ] && pause=15
   left=$(( WARM_BUDGET_S - ($(date +%s) - WARM_T0) ))
-  [ "$left" -gt 0 ] && sleep $(( left < pause ? left : pause ))
+  [ "$left" -gt "$pause" ] || break
+  sleep "$pause"
 done
 log "rerank warm-up calls (code/time):$WARM_TIMES"
 if [ "$WARM_SETTLED" = 1 ] && [ "$C1" -le 10 ]; then
