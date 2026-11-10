@@ -413,7 +413,8 @@ def _reject_secret(text, tags) -> None:
 def _reject_ephemeral(kind, text) -> None:
     """ValueError (HTTP 422) if a `semantic` memory reads as a single-run incident report
     (event tallies, precise timestamps, past-tense durations). Episodic keeps dates and
-    counts by design; procedural/semantic carry durable claims only."""
+    counts by design. Only `semantic` is pattern-checked: procedural text is expected to
+    carry durable claims too, but that is enforced by the extraction prompt, not here."""
     if kind == "semantic":
         ephemeral_guard.reject_ephemeral(text)
 

@@ -1,10 +1,12 @@
 """Anti-ephemeral retain guard (Cortex-style durable-only policy): a `semantic` memory that
 reads as a single-run report — an event tally, a precise timestamp, a past-tense duration —
 is refused 422 on both retain surfaces; `episodic` accepts the same text unchanged, and
-durable semantic text is untouched. Pattern rules live in tests first: a new rejection or
-an allowable case is added here before the pattern changes.
+durable semantic text (including schedules with clock times and rate/size limits) is
+untouched. Pattern rules live in tests first: a new rejection or an allowable case is added
+here before the pattern changes.
 
-Runs against the throwaway test ES only (tests/_safety.py).
+Runs against the throwaway test ES only (tests/_safety.py). An autouse fixture clears this
+owner's slice before and after every test so no writes leak into the shared test index.
 """
 import os
 import sys
@@ -30,12 +32,18 @@ INCIDENT_REPORTS = [
     "about 97 percent of requests failed",           # counted noun 'requests'
     "we saw 12 timeouts across the fleet",
     "roughly 40 pods could not schedule",
-    # precise timestamps
+    # the rate limit frames the first number; the later tally is one run's and still rejects
+    "the gateway handles 5000 requests per second yet dropped 5944 requests tonight",
+    # precise timestamps: full dates, month-day dates, clock moments
     "the check ran on 2026-11-10 and failed",
     "incident started 2026-11-10T10:42:15Z",
-    "the run finished at 10:42",
+    "the run finished at 10:42",                     # past-tense verb pins the clock time
+    "the outage window was at 22:10",
+    "the collector crashed at 07:45 on Nov 9",       # month-day date, not ISO
+    "the node went down on September 21",
     # past-tense durations: how long one finished thing lasted
     "the pipeline took 18 minutes to drain",
+    "the pipeline took twenty minutes to drain",     # spelled-out tens, not just 1-12
     "es was down for 2 hours",
     "it lasted six minutes",
 ]
@@ -49,6 +57,12 @@ DURABLE_FACTS = [
     "two approvals are required to override a decision",         # configuration, not a tally
     "the nightly job takes 2 hours every night",                 # habitual present tense
     "kibana service accounts land in 9.6",
+    # schedules may carry clock times (bare HH:MM or HH:MM am/pm) on a present-tense verb
+    "the nightly batch job starts at 02:00",
+    "the ferry departs at 6:30 pm daily",
+    # rate and size limits are durable configuration, not one-run tallies
+    "the api accepts at most 100 requests per second",
+    "the ingest index is capped at 5000 documents",
 ]
 
 
@@ -62,7 +76,11 @@ def _clean():
         pass
 
 
-_clean()
+@pytest.fixture(autouse=True)
+def _clean_slice():
+    _clean()
+    yield
+    _clean()
 
 
 def test_pattern_rules_accept_every_durable_fact():
@@ -84,7 +102,7 @@ def test_semantic_incident_report_is_422_on_both_retain_surfaces(text):
     assert via_mcp.status_code == 422, via_mcp.text
 
 
-@pytest.mark.parametrize("text", INCIDENT_REPORTS[:5])
+@pytest.mark.parametrize("text", INCIDENT_REPORTS)
 def test_episodic_accepts_the_same_text(text):
     r = client.post("/memory/retain", headers=H, json={"kind": "episodic", "text": text})
     assert r.status_code == 200, r.text

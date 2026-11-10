@@ -4,12 +4,12 @@ pure (prompt in, facts out), so the eval isolates what the extractor learns from
 — mirroring how the Nightshift `cortex-optimize` dataset replays saved rounds through the
 real optimiser and scores the wiki pages it writes (kibana PR #303323).
 
-Deterministic checks run always; LLM-judged scoring runs only when the gateway is up
-(same probe as tests/_llm_gate.py — script mode, so a missing gateway prints SKIP for the
-judged half and exits 0 with the deterministic half still reported).
+Both halves call the LLM gateway: extraction itself runs `facts._extract` -> `llm.chat_json`
+before any scoring. With the gateway unreachable nothing is measurable, so the script probes
+first (same probe as tests/_llm_gate.py), prints SKIP for both halves, and exits 0.
 
-Run:  python tests/eval_extraction_replay.py           # deterministic + judged if gateway up
-      AMES_LLM_PROBE_ONLY=1 python tests/...          # deterministic checks only
+Run:  python tests/eval_extraction_replay.py           # needs the gateway; judged half included
+      AMES_LLM_PROBE_ONLY=1 python tests/...          # skips only the judged half
 """
 import json
 import os
@@ -69,7 +69,9 @@ CORPUS = [
         "not 9200 — the old number came from a stale note written before the port "
         "registry existed. Any doc still saying 9200 for review ES is wrong.",
         ["9291"],
-        ["9200 for review"],
+        # the stale port must not survive even as a correcting aside: v3-durable distils
+        # the corrected state only, so any "9200" in a fact is a leak
+        ["9200"],
     ),
     (
         "Follow-up after re-testing: the rerank cache effect applies only to repeated "
@@ -131,6 +133,18 @@ def judged_report(all_facts):
 
 
 def main():
+    # Both halves call the gateway (extraction itself does), so probe before extracting —
+    # even in probe-only mode: a down gateway prints SKIP for both halves instead of
+    # crashing mid-loop.
+    from _llm_gate import llm_unreachable_reason
+    gateway_down = llm_unreachable_reason()
+    probe_only = os.environ.get("AMES_LLM_PROBE_ONLY") == "1"
+
+    if gateway_down:
+        print(f"SKIP extraction+deterministic (llm gateway unreachable: {gateway_down}); "
+              f"judged=skipped")
+        return 0
+
     all_facts = []
     for doc, _, _ in CORPUS:
         # _extract takes the document date; use a fixed one so the corpus is reproducible
@@ -148,14 +162,8 @@ def main():
               + (f" forbidden={r['forbidden_present']}" if r["forbidden_present"] else ""))
     det_line = f"docs={len(CORPUS)} deterministic_failures={failed}"
 
-    if os.environ.get("AMES_LLM_PROBE_ONLY") == "1":
+    if probe_only:
         print(f"{det_line} judged=skipped (probe-only mode)")
-        return 0 if failed == 0 else 1
-
-    from _llm_gate import llm_unreachable_reason
-    reason = llm_unreachable_reason()
-    if reason:
-        print(f"{det_line} judged=skipped (llm gateway unreachable: {reason})")
         return 0 if failed == 0 else 1
 
     judged, n = judged_report(all_facts)

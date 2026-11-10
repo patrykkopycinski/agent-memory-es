@@ -9,14 +9,15 @@ memory is a dated event, so dates and counts are its substance, not pollution.
 The line between a durable fact and an incident report is judgement, not mechanics, so this
 guard stays deliberately small and explicit:
 
-1. a count of concrete events (``5,944 errors`` / ``23 restarts`` / ``97 percent of
-   requests``) — the number is a property of one run, not of the system;
-2. a timestamp (or date-time pair) more precise than a calendar year — the moment one
-   thing happened is never durable, and its precision makes recall worse (an ask
-   phrased at another granularity never matches);
-3. a *past-tense* duration — ``took 18 minutes`` / ``was down for 2 hours`` report how long
-   one incident lasted, unlike a still-true schedule ("``departs at 6``"), which keeps a
-   present-tense verb.
+1. a count of concrete events (``5,944 errors`` / ``23 restarts``) that is not a rate or
+   size limit of the system — ``at most 100 requests per second`` / ``capped at 5000
+   documents`` are durable configuration; ``5944 errors`` is a property of one run;
+2. a timestamp more precise than a calendar year — the moment one thing happened is never
+   durable, and its precision makes recall worse (an ask phrased at another granularity
+   never matches);
+3. a past-tense duration — ``took 18 minutes`` / ``was down for 2 hours`` report how long
+   one incident lasted, unlike a still-true schedule ("``departs at 6``", "``starts at
+   02:00``"), which keeps a present-tense verb.
 
 Anything the patterns miss is left to recall ranking and the reader; the guard must stay
 cheap (no model call) and its rejections explainable (each message names the pattern, never
@@ -43,22 +44,60 @@ _COUNT_RE = re.compile(
     re.IGNORECASE,
 )
 
-# A timestamp more precise than a year: 2026-11-10, 10:42, 10:42:15, 10.42, T10:42Z,
-# 07:45+02:00, 2026-11-10T10:42:15Z. A bare year (2026) or a bare month+year does not
-# match; a date with a time always does; a bare calendar date does too — "checked on
-# Nov 9" is one-run detail, while "since 2026" is a durable qualifier the extraction
-# prompt itself asks for.
+# A rate or size limit states a durable property of the system, not of one run. It is
+# recognised either by a limiting verb carrying the same number ("accepts at most 100
+# requests", "capped at 5000 documents") or by a per-unit denominator right after the
+# counted noun ("100 requests per second", "500 docs a day", "2 connections per node").
+# A per-unit rate on a past-tense incident ("dropped 5944 errors per hour that night")
+# also frames a limit-shaped number; separating those needs judgement the guard defers
+# to recall ranking (see the module docstring).
+_LIMIT_FRAME_RE = re.compile(
+    r"\b(?:accepts?|allows?|handles?|supports?|serves?|rate.?limits?|limits?|"
+    r"caps?\s+(?:at\s+)?|capped\s+(?:at\s+)?|max(?:imum)?|min(?:imum)?|"
+    r"at most|at least|up to|no more than|no fewer than)"
+    r"(?:\s*(?:of|is|are|to|at|:)\s*)?"
+    r"(?:about\s+|roughly\s+|approximately\s+|~\s*)?\d[\d.,]*",
+    re.IGNORECASE,
+)
+_PER_UNIT_RE = re.compile(
+    r"\s*(?:per\s+|an?\s+|each\s+)(?:milli?seconds?|ms|seconds?|secs?|minutes?|mins?|"
+    r"hours?|hrs?|days?|weeks?|months?|pods?|nodes?|instances?|shards?|indices?|"
+    r"indexes?|users?|workers?|hosts?|cores?|calls?)\b",
+    re.IGNORECASE,
+)
+
+# A timestamp more precise than a year, in shapes that are moments by themselves: a full
+# calendar date (2026-11-10, Nov 9, November 9th — "may" is excluded because the modal
+# verb makes "may 5" unreadable), a clock time with seconds (10:42:15 — schedules are
+# never stated to the second), or a clock time with a timezone (10:42Z, 07:45+02:00 —
+# an offset marks a moment). A bare year (2026) or month+year stays writable. A bare
+# HH:MM — with or without am/pm — is writable too: "starts at 02:00" and "departs at
+# 6:30 pm nightly" are schedules, so their moment reading ("finished at 10:42 am") is
+# caught by the past-tense verb in _CLOCK_MOMENT_RE, not here.
 _PRECISE_TS_RE = re.compile(
-    r"(?:\d{4}-\d{2}-\d{2}(?:[T ]\d{1,2}:\d{2}(?::\d{2})?Z?(?:[+-]\d{2}:?\d{2})?)?)"
-    r"|\b\d{1,2}:\d{2}(?::\d{2})?\s*(?:am|pm)?\b"
-    r"|\b\d{1,2}[.:]\d{2}\s*(?:am|pm)\b"
-    r"|\b(?:0?\d|1[0-2]):[0-5]\d(?:\s*[ap]\.?m\.?)\b"
-    r"|\d{4}-\d{2}-\d{2}T[\d:.]+Z",
+    r"\d{4}-\d{2}-\d{2}"
+    r"|\b\d{1,2}:\d{2}:\d{2}\b"
+    r"|\b\d{1,2}:\d{2}(?:Z\b|[+-]\d{2}:?\d{2})"
+    r"|\b(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|jun(?:e)?|jul(?:y)?|"
+    r"aug(?:ust)?|sept?(?:ember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\.?\s+\d{1,2}"
+    r"(?:st|nd|rd|th)?\b",
+    re.IGNORECASE,
+)
+
+# A bare clock time reads as a moment only through a past-tense event verb ("the run
+# finished at 10:42", "the outage was at 22:10"); the same time after a present-tense
+# verb ("starts at 02:00 daily", "departs at 6:30 pm nightly") is a schedule and stays
+# writable — the tense marker mirrors _DURATION_RE.
+_CLOCK_MOMENT_RE = re.compile(
+    r"\b(?:finished|ended|completed|stopped|halted|crashed|failed|occurred|happened|"
+    r"started|began|ran|dropped|aborted|timed out|went down|was|were)\s+"
+    r"(?:at|by|around|about)\s+(?:about\s+|roughly\s+)?\d{1,2}:\d{2}"
+    r"(?:\s*(?:am|pm)\b|\s*[ap]\.?\s*m\.?)?",
     re.IGNORECASE,
 )
 
 # A duration attached to a past-tense verb: "took 18 minutes", "was down for 2 hours",
-# "ran for 40 seconds", "lasted 3 days", "took six minutes". The tense marker keeps
+# "ran for 40 seconds", "lasted 3 days", "took twenty minutes". The tense marker keeps
 # schedules ("departs at 6", "takes 2 hours every night" — habitual present) writable;
 # only a report of how long one finished thing lasted is refused.
 _DURATION_RE = re.compile(
@@ -66,14 +105,22 @@ _DURATION_RE = re.compile(
     r"had been down for|is still down for|went down for|went on for|elapsed)\s+"
     r"(?:about\s+|roughly\s+|approximately\s+|~\s*)?"
     r"(?:\d+[\d.,]*|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|"
-    r"a couple of|a few|several|half an?|an?)\s+"
+    r"thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|thirty|forty|"
+    r"fifty|sixty|seventy|eighty|ninety|a couple of|a few|several|half an?|an?)\s+"
     r"(?:milli?seconds?|ms|seconds?|secs?|minutes?|mins?|hours?|hrs?|days?|weeks?|months?)\b",
     re.IGNORECASE,
 )
 
-_EXEMPT_PREFIXES = (
-    # An episodic memory is a dated event by design; other kinds get no exemption.
-)
+
+def _limit_frames(text: str, count_match: "re.Match") -> bool:
+    """True when a rate/size limit frames this counted noun (durable configuration, not a
+    one-run tally): a per-unit denominator right after the noun, or a limiting verb whose
+    number overlaps the counted span. Overlap (not just co-occurrence) keeps a mixed
+    sentence honest — "accepts at most 100 requests; dropped 5944 requests" still rejects."""
+    if _PER_UNIT_RE.match(text, count_match.end()):
+        return True
+    frame = _LIMIT_FRAME_RE.search(text)
+    return frame is not None and frame.start() < count_match.end() and frame.end() > count_match.start()
 
 
 def reject_ephemeral(text: str) -> None:
@@ -82,7 +129,7 @@ def reject_ephemeral(text: str) -> None:
     secrets_guard on the same retain path; the `semantic` kind only."""
     if not text:
         return
-    if _COUNT_RE.search(text):
+    if any(m for m in _COUNT_RE.finditer(text) if not _limit_frames(text, m)):
         raise ValueError(
             "text reports a count of events (numbers like tallies belong to one run, not "
             "to the system); write the pattern instead (e.g. 'errors recur', 'restarts "
@@ -91,6 +138,10 @@ def reject_ephemeral(text: str) -> None:
         raise ValueError(
             "text carries a precise timestamp (a moment one thing happened); durable facts "
             "keep at most a year")
+    if _CLOCK_MOMENT_RE.search(text):
+        raise ValueError(
+            "text pins a clock time to a finished event (a moment one thing happened); "
+            "keep the time on the episodic memory or drop it from the durable claim")
     if _DURATION_RE.search(text):
         raise ValueError(
             "text reports how long one past event lasted; distil it into a durable claim "
