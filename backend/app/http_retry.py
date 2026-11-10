@@ -75,9 +75,14 @@ def urlopen(req, timeout=120, **kwargs):
     return _retry(lambda remaining: urllib.request.urlopen(req, timeout=remaining), timeout, **kwargs)
 
 
-def request_json(req, timeout=120, **kwargs):
-    """Include response reads in transport retries; never retry JSON errors."""
+def request_with(req, read, timeout=120, **kwargs):
+    """Include response reads in transport retries; `read(response)` parses the body, and its
+    non-transport errors (bad JSON, bad stream) are never retried."""
     def operation(remaining):
         with urllib.request.urlopen(req, timeout=remaining) as response:
-            return json.load(response)
+            return read(response)
     return _retry(operation, timeout, **kwargs)
+
+
+def request_json(req, timeout=120, **kwargs):
+    return request_with(req, json.load, timeout, **kwargs)

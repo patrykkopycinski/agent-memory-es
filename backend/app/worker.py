@@ -4,7 +4,7 @@ import logging
 import os
 import time
 
-from . import auth, embeddings, governance, memory, mental_models as mm
+from . import auth, embeddings, governance, llm, memory, mental_models as mm
 from . import telemetry
 from .store import KINDS, es, idx
 
@@ -27,11 +27,26 @@ _DRAFT_MAX_ENTITY_DF = float(os.environ.get("AMES_DRAFT_MAX_ENTITY_DF", "0.3"))
 
 
 def known_owners() -> list:
-    keys = auth.load_readonly()  # the key volume is mounted :ro here; never migrate-write
+    try:
+        keys = auth.load_readonly()  # the key volume is mounted :ro here; never migrate-write
+    except auth.KeyStoreUnavailable as exc:
+        log.error("key store unreachable: %s", exc)
+        return []
     # digest entries only — the file also keeps name-keyed plaintext copies
     # (legacy migration) which would blow up v["owner_id"].
     return sorted({v["owner_id"] for v in keys.values()
                    if isinstance(v, dict)})
+
+
+def _warn_if_zero_owners_with_data() -> None:
+    """No owners but memory docs exist means the key store is unreachable or empty, not a fresh
+    install: say so loudly, once per loop. Never raises (the loop must keep running)."""
+    try:
+        has_docs = any(es("POST", f"/{idx(kind)}/_count", {}).get("count", 0) > 0 for kind in KINDS)
+    except Exception:  # noqa: BLE001 — a failed probe must not stop the loop
+        return
+    if has_docs:
+        log.error("zero owners: key store unreachable or empty")
 
 
 def _already_covered(owner: str, pattern: str) -> bool:
@@ -104,6 +119,7 @@ def run_once() -> dict:
     over zero owners emits nothing."""
     owners = known_owners()
     if not owners:
+        _warn_if_zero_owners_with_data()
         return {}
     with telemetry.span("worker.consolidate", {"worker.owners": len(owners)}):
         stats = _consolidate_owners(owners)
@@ -259,6 +275,12 @@ if __name__ == "__main__":
     # `python -m app.worker`: without this entry the module imports, exits 0,
     # and the container crash-loops under `restart: unless-stopped`.
     import sys
+    try:
+        auth.validate_config()
+        llm.validate_config()
+    except ValueError as exc:
+        logging.getLogger("ames.worker").error("invalid configuration: %s", exc)
+        sys.exit(2)
     setup_telemetry()
     if "--backfill" in sys.argv:
         from .facts import backfill_loop
