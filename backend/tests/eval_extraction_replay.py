@@ -60,7 +60,8 @@ CORPUS = [
         "dense scores only when both backends are enabled was wrong. The fusion path "
         "runs whenever either backend returns hits; an empty side simply gets zero "
         "weight. Update your mental model accordingly.",
-        ["fusion", "either backend"],
+        # any phrasing of the corrected semantics; the extraction often rewords
+        ["fusion", "either the lexical or dense backend", "either backend", "lexical or dense"],
         [],
     ),
     (
