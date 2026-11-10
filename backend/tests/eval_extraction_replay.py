@@ -64,6 +64,20 @@ CORPUS = [
         [],
     ),
     (
+        "Correction to the runbook: the runner talks to the throwaway ES on port 9291, "
+        "not 9200 — the old number came from a stale note written before the port "
+        "registry existed. Any doc still saying 9200 for review ES is wrong.",
+        ["9291"],
+        ["9200 for review"],
+    ),
+    (
+        "Follow-up after re-testing: the rerank cache effect applies only to repeated "
+        "identical texts. We first claimed it made rerank free in general; that was "
+        "overbroad. New text always pays the full rerank cost, so budget for it.",
+        ["new text", "identical"],
+        [],
+    ),
+    (
         "Notes from the perf session: the pipeline took 18 minutes to drain and the "
         "collector crashed twice at 07:45. Durable conclusion: drain time scales with "
         "shard count, so cap shards per index at three for ingest-heavy workloads.",
@@ -117,6 +131,8 @@ def main():
         # _extract takes the document date; use a fixed one so the corpus is reproducible
         # (the date is stamped into the fact prefix by the extraction path itself).
         all_facts.append(facts._extract(doc, "2026-11-10"))
+        for f in all_facts[-1]:
+            print(f"  doc {len(all_facts) - 1}: {f}")
         print(f"doc {len(all_facts) - 1}: {len(all_facts[-1])} facts")
 
     rows, failed = deterministic_report(all_facts)
