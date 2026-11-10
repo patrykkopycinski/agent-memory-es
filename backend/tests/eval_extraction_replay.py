@@ -61,7 +61,7 @@ CORPUS = [
         "runs whenever either backend returns hits; an empty side simply gets zero "
         "weight. Update your mental model accordingly.",
         # any phrasing of the corrected semantics; the extraction often rewords
-        ["fusion", "either the lexical or dense backend", "either backend", "lexical or dense"],
+        ["fusion", ("either the lexical or dense backend", "either backend", "lexical or dense")],
         [],
     ),
     (
@@ -102,7 +102,11 @@ def deterministic_report(all_facts):
     rows, failed = [], 0
     for (doc, required, forbidden), facts_for_doc in zip(CORPUS, all_facts):
         joined = " || ".join(f.lower() for f in facts_for_doc)
-        missing = [r for r in required if r.lower() not in joined]
+        # a required entry is a string (must appear) or a tuple of alternatives
+        # (at least one must appear): extraction rewords, specs match semantics
+        missing = [r for r in required
+                   if (r.lower() not in joined if isinstance(r, str)
+                       else not any(a.lower() in joined for a in r))]
         present = [f for f in forbidden if f.lower() in joined]
         ok = not missing and not present
         failed += 0 if ok else 1
