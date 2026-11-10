@@ -14,7 +14,7 @@ from typing import Any, Optional
 
 from .store import KINDS, es, idx, is_doc_miss, ensure_indices, ensure_indices_once, knn_num_candidates
 from . import embeddings
-from . import secrets_guard
+from . import ephemeral_guard, secrets_guard
 from . import tagfilter as _tf
 from . import telemetry as _otel
 from . import tombstone
@@ -410,6 +410,14 @@ def _reject_secret(text, tags) -> None:
         raise ValueError(f"a tag looks like a secret ({hit}); remove the credential and retry")
 
 
+def _reject_ephemeral(kind, text) -> None:
+    """ValueError (HTTP 422) if a `semantic` memory reads as a single-run incident report
+    (event tallies, precise timestamps, past-tense durations). Episodic keeps dates and
+    counts by design; procedural/semantic carry durable claims only."""
+    if kind == "semantic":
+        ephemeral_guard.reject_ephemeral(text)
+
+
 def retain(owner_id: str, kind: str, text: str, visibility: str = "private",
            occurred_at: Optional[str] = None, doc_group: Optional[str] = None,
            tags: Optional[list] = None, labels: Optional[list] = None,
@@ -430,9 +438,11 @@ def _retain_guarded(owner_id: str, kind: str, text: str, visibility: str = "priv
                     tags: Optional[list] = None, labels: Optional[list] = None,
                     extract_facts: bool = True, supersedes_decision: Optional[str] = None,
                     person: Optional[str] = None) -> dict:
-    """Write a memory, refusing text that looks like a credential (ValueError -> HTTP 422) and
+    """Write a memory, refusing text that looks like a credential (ValueError -> HTTP 422),
+    refusing single-run incident detail on `semantic` (HTTP 422), and
     flagging over-long text with a `too_long` hint on the result (the write still happens)."""
     _reject_secret(text, tags)
+    _reject_ephemeral(kind, text)
     out = _retain(owner_id, kind, text, visibility, occurred_at, doc_group, tags, labels,
                   extract_facts, supersedes_decision, person=person)
     if isinstance(text, str) and len(text) > RETAIN_SOFT_MAX_CHARS:
