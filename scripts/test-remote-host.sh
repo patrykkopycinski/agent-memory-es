@@ -138,14 +138,14 @@ echo
 # never succeeds is only a WARNING: the rerank tests then fail honestly and the base comparison still applies.
 # Each attempt is capped at 25 s (and by the budget left) so the TERM trap and `--abort` are never held up long.
 status "running warming-rerank"
-WARM_BUDGET_S=${AMES_TEST_WARM_BUDGET_S:-300}
-# The body is full-size (50 passages of ~1.2 kB, like a depth-50 recall): a 2-passage call only deploys the
-# model, and the first full-size calls were still 35-45 s afterwards.
+WARM_BUDGET_S=300
+# The body is a mid-size rerank (10 passages of ~1.2 kB): a 2-passage call only deploys the model and the
+# first realistic calls were still 35-45 s afterwards, while a 50-passage warm-up cost ~160 s per run.
 WARM_DOC=$(printf 'quarterly warehouse relocation budget plan item %.0s' $(seq 1 25))
 WARM_BODY='{"query":"warehouse relocation budget","input":['
-for i in $(seq 1 50); do WARM_BODY="$WARM_BODY\"$WARM_DOC $i\","; done
+for i in $(seq 1 10); do WARM_BODY="$WARM_BODY\"$WARM_DOC $i\","; done
 WARM_BODY="${WARM_BODY%,}]}"
-WARM_T0=$(date +%s); WARM_CODE=000; WARM_TIMES=; C1=0
+WARM_T0=$(date +%s); WARM_CODE=000; WARM_TIMES=; C1=0; WARM_OK=0; WARM_SETTLED=0
 while :; do
   left=$(( WARM_BUDGET_S - ($(date +%s) - WARM_T0) ))
   [ "$left" -gt 0 ] || break
@@ -153,16 +153,21 @@ while :; do
   WARM_CODE=$(curl -s -m $(( left < 25 ? left : 25 )) -o /dev/null -w '%{http_code}' -XPOST -H 'content-type: application/json' \
     "$ES/_inference/rerank/.rerank-v1-elasticsearch" -d "$WARM_BODY")
   C1=$(( $(date +%s) - C0 )); WARM_TIMES="$WARM_TIMES ${WARM_CODE}/${C1}s"
-  # warm = a full-size call that answers 200 quickly; a slow 200 means the model is still settling
-  [ "$WARM_CODE" = 200 ] && [ "$C1" -le 10 ] && break
+  if [ "$WARM_CODE" = 200 ]; then WARM_OK=$((WARM_OK + 1)); else WARM_OK=0; fi
+  # settled = one fast 200, or two consecutive 200s however slow (a warm but slow host must not burn the budget)
+  if [ "$WARM_OK" -ge 2 ] || { [ "$WARM_CODE" = 200 ] && [ "$C1" -le 10 ]; }; then WARM_SETTLED=1; break; fi
   # a permanent client error (e.g. 403 expired trial on a reused ES) will not heal: surface it now
   case "$WARM_CODE" in 400|401|403|404) break;; esac
+  # after a client-side timeout the call may still be queued in ES: back off longer before adding load
+  pause=5; [ "$WARM_CODE" = 000 ] && pause=15
   left=$(( WARM_BUDGET_S - ($(date +%s) - WARM_T0) ))
-  [ "$left" -gt 0 ] && sleep $(( left < 5 ? left : 5 ))
+  [ "$left" -gt 0 ] && sleep $(( left < pause ? left : pause ))
 done
 log "rerank warm-up calls (code/time):$WARM_TIMES"
-if [ "$WARM_CODE" = 200 ] && [ "$C1" -le 10 ]; then
+if [ "$WARM_SETTLED" = 1 ] && [ "$C1" -le 10 ]; then
   log "rerank warm-up ok: HTTP $WARM_CODE after $(( $(date +%s) - WARM_T0 ))s"
+elif [ "$WARM_SETTLED" = 1 ]; then
+  log "rerank warm-up ok (slow: last call ${C1}s) after $(( $(date +%s) - WARM_T0 ))s"
 else
   log "WARNING: rerank warm-up did not settle: last HTTP $WARM_CODE (${C1}s) after $(( $(date +%s) - WARM_T0 ))s; rerank tests may fail on a cold endpoint"
 fi
