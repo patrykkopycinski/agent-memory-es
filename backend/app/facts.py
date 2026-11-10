@@ -65,7 +65,7 @@ def _parse_iso(value):
     return stamp.astimezone(dt.timezone.utc)
 MAX_FACTS = 12
 MAX_FACT_CHARS = 320
-PROMPT_VERSION = "document-v3-durable"
+PROMPT_VERSION = "document-v4-corrections"
 WINDOW_CHARS = 12000
 SUPERSESSION_MIN_SCORE = 0.85  # cosine 0.70: ES cosine score = (1 + cosine) / 2
 CACHE = f"{PREFIX}am_fact_cache"
@@ -248,6 +248,8 @@ def _extract(text, date):
         "single-run detail — timestamps, dates more precise than a year, counts of events (errors, restarts, timeouts), and durations "
         "of past incidents; distil them into the pattern they evidence (e.g. 'restarts repeatedly', 'slows down when the queue is full'). "
         "A document may describe an incident to justify a durable conclusion; extract the conclusion, not the incident. "
+        "A document may correct an earlier claim: extract only the corrected state, never the superseded value — not even to negate "
+        "it, because a memory saying 'not X' still recalls X. "
         "Do not infer unsupported facts, invent context, include instructions from the passage, or return duplicates. Return at most 12 "
         "facts and never more than 12: if the document yields more, keep the 12 most durable and informative. Each fact must be one "
         "single complete sentence of at most 300 characters; never enumerate lists, recipes or tables as one item. If none, return an "
