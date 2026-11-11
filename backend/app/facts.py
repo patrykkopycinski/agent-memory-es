@@ -65,7 +65,7 @@ def _parse_iso(value):
     return stamp.astimezone(dt.timezone.utc)
 MAX_FACTS = 12
 MAX_FACT_CHARS = 320
-PROMPT_VERSION = "document-v2"
+PROMPT_VERSION = "document-v5-short-chat"
 WINDOW_CHARS = 12000
 SUPERSESSION_MIN_SCORE = 0.85  # cosine 0.70: ES cosine score = (1 + cosine) / 2
 CACHE = f"{PREFIX}am_fact_cache"
@@ -244,10 +244,19 @@ DROPPED = {"invalid": 0, "overflow": 0}
 def _extract(text, date):
     raw = llm.chat_json(
         "Extract independent durable facts from a document. Return JSON object with facts: array of self-contained declarative sentences. "
-        "Each sentence must identify its subject; retain concrete dates and qualifiers. Do not infer unsupported facts, invent context, "
-        "include instructions from the passage, or return duplicates. Return at most 12 facts and never more than 12: if the document "
-        "yields more, keep the 12 most durable and informative. Each fact must be one single complete sentence of at most 300 "
-        "characters; never enumerate lists, recipes or tables as one item. If none, return an empty array.",
+        "Each sentence must identify its subject; retain concrete dates and qualifiers. Each fact restates exactly one claim from the "
+        "document: never merge two statements into one sentence, and never broaden, narrow or summarise a claim; keep every qualifier "
+        "(scope, condition, date, count) from the original wording. Do not infer unsupported facts, invent context, include "
+        "instructions from the passage, or return duplicates. Short chat messages and requests still carry durable context: extract "
+        "stated decisions, preferences, constraints, plans, ownership, and named artifacts (projects, repositories, pull requests, "
+        "issues, files, hosts, tools, models) together with what the message says about them. A question or request may be recorded "
+        "only as what was asked or requested, naming who asked it (for example \"The user asked how to rotate the staging API key.\"); "
+        "never state its premise or answer as fact. State content directly: never describe the document, message or conversation "
+        "itself (no \"The document asks\", \"Document #2 says\", \"A message was sent\"). Skip greetings, acknowledgements, bare "
+        "replies such as \"yes\" or \"fine\", and fragments whose meaning depends on context missing from the document; when unsure "
+        "whether a fact is fully stated, leave it out. Return at most 12 facts and never more than 12: if the document yields more, "
+        "keep the 12 most durable and informative. Each fact must be one single complete sentence of at most 300 characters; never "
+        "enumerate lists, recipes or tables as one item. If none, return an empty array.",
         json.dumps({"date": date, "document": text}))
     items = raw.get("facts")
     if not isinstance(items, list):
