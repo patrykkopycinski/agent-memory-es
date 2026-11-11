@@ -74,15 +74,15 @@ def _recall_texts(key, query):
 
 
 def test_update_fixes_text_in_place():
-    doc = _retain(ALICE, text="weekly eval board seeded on 2026-30-26 with 2/1 suites")
-    r = _update(ALICE, doc["_id"], text="weekly eval board seeded on 2026-10-26 with 2/11 suites")
+    doc = _retain(ALICE, text="weekly eval board seeded with 2/1 suites in the alpha slice")
+    r = _update(ALICE, doc["_id"], text="weekly eval board seeded with 2/11 suites in the alpha slice")
     assert r.status_code == 200, r.text
     out = r.json()
     assert out["updated"] is True
     assert out["doc_group"] == doc["doc_group"], "doc_group must stay stable across update"
     texts = _recall_texts(ALICE, "weekly eval board seeded suites")
-    assert any("2026-10-26" in t and "2/11" in t for t in texts), texts
-    assert not any("2026-30-26" in t for t in texts), f"stale typo still recallable: {texts}"
+    assert any("2/11" in t for t in texts), texts
+    assert not any("2/1 " in t or "2/1 suites" in t for t in texts), f"stale count still recallable: {texts}"
 
 
 def test_update_old_passages_gone():
@@ -154,11 +154,11 @@ def test_update_missing_doc_404():
 
 
 def test_e2e_retain_update_recall_roundtrip():
-    doc = _retain(ALICE, text="e2e roundtrip: matrix run hapened on 2026-30-26")  # typo'd
+    doc = _retain(ALICE, text="e2e roundtrip: matrix run hapened in the alpha slice")  # typo'd
     hits = _recall_texts(ALICE, "e2e roundtrip matrix run")
-    assert any("2026-30-26" in t for t in hits)
-    r = _update(ALICE, doc["_id"], text="e2e roundtrip: matrix run happened on 2026-10-26")
+    assert any("alpha slice" in t for t in hits)
+    r = _update(ALICE, doc["_id"], text="e2e roundtrip: matrix run happened in the alpha slice")
     assert r.status_code == 200, r.text
     hits = _recall_texts(ALICE, "e2e roundtrip matrix run")
-    assert any("happened on 2026-10-26" in t for t in hits), hits
-    assert not any("2026-30-26" in t or "hapened" in t for t in hits), hits
+    assert any("happened in the alpha slice" in t for t in hits), hits
+    assert not any("hapened" in t for t in hits), hits

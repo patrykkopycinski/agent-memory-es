@@ -68,6 +68,9 @@ DURABLE_FACTS = [
     "the api accepts at most 100 requests per second",
     "the ingest index is capped at 5000 documents",
     "the gateway handles up to 5000 requests",
+    # model and version names embed an ISO-shaped date; identifiers, not moments
+    "token: gpt-4o-2024-08-06 (accept probe)",
+    "the frontier model is claude-opus-4-5-20251101",
     "the auth migration finished; token estimator docs live in the wiki",
     "the ferry timetable changed to a 6 o'clock departure",      # present-tense schedule
     "since 2026 the team standard is trunk-based development",   # bare year is allowed

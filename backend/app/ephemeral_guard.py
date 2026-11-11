@@ -95,14 +95,15 @@ _PER_UNIT_RE = re.compile(
 
 # A timestamp more precise than a year, in shapes that are moments by themselves: a full
 # calendar date (2026-11-10, Nov 9, November 9th — "may" is excluded because the modal
-# verb makes "may 5" unreadable), a clock time with seconds (10:42:15 — schedules are
-# never stated to the second), or a clock time with a timezone (10:42Z, 07:45+02:00 —
-# an offset marks a moment). A bare year (2026) or month+year stays writable. A bare
-# HH:MM — with or without am/pm — is writable too: "starts at 02:00" and "departs at
-# 6:30 pm nightly" are schedules, so their moment reading ("finished at 10:42 am") is
-# caught by the past-tense verb in _CLOCK_MOMENT_RE, not here.
+# verb makes "may 5" unreadable; a date glued to a word/hyphen/dot prefix is a model or
+# version name — "gpt-4o-2024-08-06" — not a moment), a clock time with seconds
+# (10:42:15 — schedules are never stated to the second), or a clock time with a timezone
+# (10:42Z, 07:45+02:00 — an offset marks a moment). A bare year (2026) or month+year
+# stays writable. A bare HH:MM — with or without am/pm — is writable too: "starts at
+# 02:00" and "departs at 6:30 pm nightly" are schedules, so their moment reading
+# ("finished at 10:42 am") is caught by the past-tense verb in _CLOCK_MOMENT_RE, not here.
 _PRECISE_TS_RE = re.compile(
-    r"\d{4}-\d{2}-\d{2}"
+    r"(?<![\w.-])\d{4}-\d{2}-\d{2}"
     r"|\b\d{1,2}:\d{2}:\d{2}\b"
     r"|\b\d{1,2}:\d{2}(?:Z\b|[+-]\d{2}:?\d{2})"
     r"|\b(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|jun(?:e)?|jul(?:y)?|"

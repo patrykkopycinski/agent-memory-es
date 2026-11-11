@@ -13,7 +13,7 @@ def test_extract_prompt_states_caps():
     assert "at most 12" in system
     assert "at most 300" in system
     assert "one single complete sentence" in system
-    assert facts.PROMPT_VERSION == "document-v2"
+    assert facts.PROMPT_VERSION == "document-v5-current-state"
 
 
 def test_prompt_version_bumped_with_prompt_change():
