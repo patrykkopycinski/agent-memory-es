@@ -124,12 +124,22 @@ def judged_report(all_facts):
     scores = raw.get("scores")
     if not isinstance(scores, list) or not scores:
         raise ValueError("judge returned no scores")
+    n_submitted = sum(len(fs) for fs in all_facts)
+    if len(scores) != n_submitted:
+        # a judge that skips or duplicates facts changes the denominator: refuse to score
+        raise ValueError(f"judge scored {len(scores)} facts but {n_submitted} were submitted")
     per_criterion = {"durable": 0, "self_contained": 0, "grounded": 0}
     for s in scores:
         for c in per_criterion:
             per_criterion[c] += 1 if s.get(c) else 0
     n = len(scores)
     return {c: round(v / n, 3) for c, v in per_criterion.items()}, n
+
+
+# Judged floors (v4 measured 0.824/1.0/0.941 at 17 facts): a prompt or harness change that
+# drops durable below 0.80, self_contained below 0.90, or grounded below 0.90 fails the
+# run even when every substring check passes — the judged half gates the exit code.
+JUDGED_FLOORS = {"durable": 0.80, "self_contained": 0.90, "grounded": 0.90}
 
 
 def main():
@@ -146,10 +156,15 @@ def main():
         return 0
 
     all_facts = []
-    for doc, _, _ in CORPUS:
+    for i, (doc, _, _) in enumerate(CORPUS):
         # _extract takes the document date; use a fixed one so the corpus is reproducible
         # (the date is stamped into the fact prefix by the extraction path itself).
-        all_facts.append(facts._extract(doc, "2026-11-10"))
+        try:
+            doc_facts = facts._extract(doc, "2026-11-10")
+        except Exception as exc:  # one flaky doc must not kill the corpus report
+            print(f"doc {i}: EXTRACT-ERROR {type(exc).__name__}: {exc}")
+            doc_facts = []
+        all_facts.append(doc_facts)
         for f in all_facts[-1]:
             print(f"  doc {len(all_facts) - 1}: {f}")
         print(f"doc {len(all_facts) - 1}: {len(all_facts[-1])} facts")
@@ -168,6 +183,10 @@ def main():
 
     judged, n = judged_report(all_facts)
     print(f"{det_line} judged_facts={n} " + " ".join(f"{k}={v}" for k, v in judged.items()))
+    below = [f"{k}={v:.3f}<{JUDGED_FLOORS[k]}" for k, v in judged.items() if v < JUDGED_FLOORS[k]]
+    if below:
+        print(f"JUDGED-FAIL: " + ", ".join(below))
+        return 1
     return 0 if failed == 0 else 1
 
 

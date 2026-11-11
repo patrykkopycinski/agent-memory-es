@@ -37,8 +37,8 @@ INCIDENT_REPORTS = [
     # precise timestamps: full dates, month-day dates, clock moments
     "the check ran on 2026-11-10 and failed",
     "incident started 2026-11-10T10:42:15Z",
-    "the run finished at 10:42",                     # past-tense verb pins the clock time
-    "the outage window was at 22:10",
+    "the run finished at 10:42",                     # completed-event verb pins the clock time
+    "the node went down at 22:10",
     "the collector crashed at 07:45 on Nov 9",       # month-day date, not ISO
     "the node went down on September 21",
     # past-tense durations: how long one finished thing lasted
@@ -60,10 +60,20 @@ DURABLE_FACTS = [
     # schedules may carry clock times (bare HH:MM or HH:MM am/pm) on a present-tense verb
     "the nightly batch job starts at 02:00",
     "the ferry departs at 6:30 pm daily",
+    # tense-ambiguous verbs carry schedules too; only completed-event verbs pin moments
+    "the maintenance window was at 02:00 every night",
+    "the sync started at 02:00 nightly",
     # rate and size limits are durable configuration, not one-run tallies
     "the api accepts at most 100 requests per second",
     "the ingest index is capped at 5000 documents",
+    # possession/retention statements of present state stay writable
+    "kafka retains 7 days of messages",
+    "the index has 3 shards",
+    "the archive holds 2000 records",
 ]
+
+TWO_LIMITS = ("the gateway handles 5000 requests per second; "
+              "the ingest index is capped at 5000 documents")
 
 
 def _clean():
@@ -92,6 +102,21 @@ def test_pattern_rules_reject_every_incident_report():
     for text in INCIDENT_REPORTS:
         with pytest.raises(ValueError):
             ephemeral_guard.reject_ephemeral(text)
+
+
+def test_two_framed_limits_in_one_text_stay_writable():
+    ephemeral_guard.reject_ephemeral(TWO_LIMITS)  # no raise
+
+
+def test_every_counted_noun_rejects_when_unframed():
+    # the noun list is closed but long; a noun that stops rejecting would silently
+    # widen the durable path, so every noun is exercised mechanically
+    import re as _re
+    nouns = _re.sub(r"\?.*", "", "|".join(ephemeral_guard._COUNTED_NOUNS)).split("|")
+    for noun in nouns:
+        base = _re.sub(r"\?.*", "", noun)
+        with pytest.raises(ValueError):
+            ephemeral_guard.reject_ephemeral(f"we observed 30 {base} during the incident")
 
 
 @pytest.mark.parametrize("text", INCIDENT_REPORTS)
