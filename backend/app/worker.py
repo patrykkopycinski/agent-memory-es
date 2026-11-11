@@ -5,6 +5,7 @@ import os
 import time
 
 from . import auth, embeddings, governance, llm, memory, mental_models as mm
+from . import links
 from . import telemetry
 from .store import KINDS, es, idx
 
@@ -227,6 +228,27 @@ def governance_pass() -> dict:
     return out
 
 
+def links_pass() -> dict:
+    """Hidden-connections pass for every owner: propose (never write) edges
+    between similar-but-unlinked semantic docs. `worker.links` span, recorded
+    only when a pass ran; per-owner failures never stop the loop."""
+    started = time.time_ns()
+    owners = known_owners()
+    stats = {}
+    for owner in owners:
+        try:
+            stats[owner] = links.hidden_connections_pass(owner)
+        except Exception as exc:  # noqa: BLE001 — one owner must not stop the rest
+            log.warning("links pass failed for %s: %s", owner, exc)
+            stats[owner] = {"error": str(exc)[:200]}
+    did_work = any(v.get("proposed") or v.get("scanned") for v in stats.values())
+    if did_work:
+        telemetry.record_pass("worker.links", started, {
+            "worker.links.owners": len(owners),
+            "worker.links.proposed": sum(v.get("proposed", 0) for v in stats.values())})
+    return stats
+
+
 def run_forever(interval_s: int = 0):
     interval_s = interval_s or int(os.environ.get("AMES_CONSOLIDATE_INTERVAL", "600"))
     while True:
@@ -242,6 +264,10 @@ def run_forever(interval_s: int = 0):
             print(time.strftime("%H:%M:%S"), "governance", governance_pass(), flush=True)
         except Exception as e:  # noqa: BLE001 — a failed pass must not stop the loop
             print(time.strftime("%H:%M:%S"), "governance error:", e, flush=True)
+        try:
+            print(time.strftime("%H:%M:%S"), "links", links_pass(), flush=True)
+        except Exception as e:  # noqa: BLE001 — a failed pass must not stop the loop
+            print(time.strftime("%H:%M:%S"), "links error:", e, flush=True)
         time.sleep(interval_s)
 
 
@@ -282,7 +308,12 @@ if __name__ == "__main__":
         logging.getLogger("ames.worker").error("invalid configuration: %s", exc)
         sys.exit(2)
     setup_telemetry()
-    if "--backfill" in sys.argv:
+    if "--links" in sys.argv:
+        # one hidden-connections pass (proposal-only), then exit: cron-friendly
+        owners = known_owners()
+        out = {o: links.hidden_connections_pass(o) for o in owners}
+        print(time.strftime("%H:%M:%S"), "links-once", out, flush=True)
+    elif "--backfill" in sys.argv:
         from .facts import backfill_loop
         backfill_loop()
     elif "--facts" in sys.argv:

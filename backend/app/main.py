@@ -12,6 +12,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, StrictBool
 
 from . import auth, embeddings, governance, llm, memory, pages as pages_mod, mental_models as mm_mod, reranker, tagfilter, facts
+from . import links as links_mod
 from . import telemetry as _otel
 from .store import KINDS, ensure_indices, is_doc_miss
 
@@ -480,6 +481,108 @@ def page_get(scope: str, who: dict = Depends(caller)):
     if not p:
         raise HTTPException(404, "no page for scope")
     return p
+
+
+# ---- hidden connections / stored edges -------------------------------------------------
+
+class FindRelatedIn(BaseModel):
+    doc_id: str = Field(..., max_length=memory.MAX_ID_CHARS)
+    kind: str = "semantic"
+    threshold: float = Field(0.70, ge=0.0, le=1.0)   # real cosine floor
+    k: int = Field(5, ge=1, le=20)
+    exclude_linked: bool = True   # False also returns already-linked docs with their cosine
+
+
+class EdgeActionIn(BaseModel):
+    edge_id: str = Field(..., max_length=64)
+
+
+class LinkIn(BaseModel):
+    kind: str = "semantic"
+    src: str = Field(..., max_length=memory.MAX_ID_CHARS)
+    dst: str = Field(..., max_length=memory.MAX_ID_CHARS)
+    reason: Optional[str] = Field(None, max_length=256)
+
+
+@app.post("/memory/links/find_related")
+def links_find_related(body: FindRelatedIn, who: dict = Depends(caller)):
+    """Similar-but-(optionally)-unlinked memories for one doc: hypotheses the
+    embedding space generates, never auto-linked. Superseded/inactive excluded."""
+    if body.kind not in KINDS:
+        raise HTTPException(422, f"kind must be one of {KINDS}")
+    r = links_mod.find_similar(who["owner_id"], body.kind, body.doc_id,
+                               threshold=body.threshold, k=body.k,
+                               exclude_linked=body.exclude_linked)
+    if not r and not _doc_exists(who["owner_id"], body.kind, body.doc_id):
+        raise HTTPException(404, "doc not found in this bank")
+    return {"results": r}
+
+
+def _doc_exists(owner_id: str, kind: str, doc_id: str) -> bool:
+    from .store import es, idx
+    try:
+        es("GET", f"/{idx(kind)}/_doc/{doc_id}")
+        return True
+    except RuntimeError as exc:
+        if is_doc_miss(exc):
+            return False
+        raise
+
+
+@app.post("/memory/links")
+def links_link(body: LinkIn, who: dict = Depends(caller)):
+    """Write a human edge between two of the caller's memories (active at once:
+    a human authored it, unlike the worker's system proposals)."""
+    if body.src == body.dst:
+        raise HTTPException(422, "src and dst are the same doc")
+    try:
+        return links_mod.link(who["owner_id"], body.kind, body.src, body.dst,
+                              "human", status="active", proposer=who["owner_id"],
+                              reason=body.reason)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from None
+
+
+@app.get("/memory/links")
+def links_list(status: Optional[str] = None, edge_source: Optional[str] = None,
+               size: int = 100, who: dict = Depends(caller)):
+    return {"edges": links_mod.list_edges(who["owner_id"], status, edge_source, size)}
+
+
+@app.post("/memory/links/approve")
+def links_approve(body: EdgeActionIn, who: dict = Depends(caller)):
+    """Activate a system-proposed edge (owner decision; nothing auto-links)."""
+    try:
+        return links_mod.approve_edge(body.edge_id, who["owner_id"])
+    except KeyError as exc:
+        raise HTTPException(404, str(exc).strip("'")) from None
+    except PermissionError as exc:
+        raise HTTPException(403, str(exc)) from None
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from None
+
+
+@app.post("/memory/links/reject")
+def links_reject(body: EdgeActionIn, who: dict = Depends(caller)):
+    """Reject a system-proposed edge: the pair stays unlinked and the rejected
+    edge is kept so the pass does not re-propose it."""
+    try:
+        return links_mod.reject_edge(body.edge_id, who["owner_id"])
+    except KeyError as exc:
+        raise HTTPException(404, str(exc).strip("'")) from None
+    except PermissionError as exc:
+        raise HTTPException(403, str(exc)) from None
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from None
+
+
+@app.get("/memory/links/structure")
+def links_structure(kind: str = "semantic", who: dict = Depends(caller)):
+    """Structure snapshot of the caller's bank: orphan rate, connected
+    components, degree hubs, articulation-point bridges."""
+    if kind not in KINDS:
+        raise HTTPException(422, f"kind must be one of {KINDS}")
+    return links_mod.orphan_rate(who["owner_id"], kind)
 
 
 class ModelIn(BaseModel):
