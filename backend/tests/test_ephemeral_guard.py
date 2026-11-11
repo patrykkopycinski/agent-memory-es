@@ -144,6 +144,14 @@ def test_episodic_accepts_the_same_text(text):
     assert r.status_code == 200, r.text
 
 
+@pytest.mark.parametrize("text", INCIDENT_REPORTS)
+def test_procedural_retain_is_exempt_from_the_ephemeral_guard(text):
+    # the guard's kind-scoping branch (semantic only) has an exempt side too: a procedural
+    # memory carrying incident-shaped text must write, or the guard has quietly widened
+    r = client.post("/memory/retain", headers=H, json={"kind": "procedural", "text": text})
+    assert r.status_code == 200, r.text
+
+
 def test_durable_semantic_fact_still_writes_clean():
     r = client.post("/memory/retain", headers=H,
                     json={"kind": "semantic", "text": DURABLE_FACTS[0]})
