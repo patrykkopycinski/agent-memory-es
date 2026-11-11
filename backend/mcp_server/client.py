@@ -2,6 +2,7 @@
 X-API-Key header of the underlying httpx client; it is never put in exception
 text, repr(), or logs."""
 from typing import Any, Optional
+from urllib.parse import quote, urlencode
 
 import httpx
 
@@ -72,6 +73,40 @@ class AmesClient:
         if occurred_at:
             body["occurred_at"] = occurred_at
         return self._request("POST", "/memory/retain", body)
+
+    # ---- links (hidden connections / stored edges) ----
+
+    def links_find_related(self, doc_id: str, kind: str = "semantic",
+                           threshold: float = 0.3, k: int = 5,
+                           exclude_linked: bool = True) -> dict:
+        return self._request("POST", "/memory/links/find_related", {
+            "doc_id": doc_id, "kind": kind, "threshold": threshold,
+            "k": k, "exclude_linked": exclude_linked})
+
+    def links_list(self, status: Optional[str] = None,
+                   edge_source: Optional[str] = None, size: int = 50) -> dict:
+        q = {"size": str(size)}
+        if status:
+            q["status"] = status
+        if edge_source:
+            q["edge_source"] = edge_source
+        return self._request("GET", "/memory/links?" + urlencode(q))
+
+    def links_link(self, kind: str, src: str, dst: str,
+                   reason: Optional[str] = None) -> dict:
+        body: dict = {"kind": kind, "src": src, "dst": dst}
+        if reason:
+            body["reason"] = reason
+        return self._request("POST", "/memory/links", body)
+
+    def links_approve(self, edge_id: str) -> dict:
+        return self._request("POST", "/memory/links/approve", {"edge_id": edge_id})
+
+    def links_reject(self, edge_id: str) -> dict:
+        return self._request("POST", "/memory/links/reject", {"edge_id": edge_id})
+
+    def links_structure(self, kind: str = "semantic") -> dict:
+        return self._request("GET", "/memory/links/structure?kind=" + quote(kind))
 
     def close(self) -> None:
         self._http.close()
