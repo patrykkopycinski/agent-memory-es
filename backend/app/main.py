@@ -510,9 +510,15 @@ def links_find_related(body: FindRelatedIn, who: dict = Depends(caller)):
     embedding space generates, never auto-linked. Superseded/inactive excluded."""
     if body.kind not in KINDS:
         raise HTTPException(422, f"kind must be one of {KINDS}")
-    r = links_mod.find_similar(who["owner_id"], body.kind, body.doc_id,
-                               threshold=body.threshold, k=body.k,
-                               exclude_linked=body.exclude_linked)
+    try:
+        r = links_mod.find_similar(who["owner_id"], body.kind, body.doc_id,
+                                   threshold=body.threshold, k=body.k,
+                                   exclude_linked=body.exclude_linked)
+    except PermissionError:
+        # Another owner's private doc: not-found semantics, so the probe
+        # reveals nothing about whether the doc exists (same masking rule as
+        # find_similar's visibility guard).
+        raise HTTPException(404, "doc not found in this bank") from None
     if not r and not _doc_exists(who["owner_id"], body.kind, body.doc_id):
         raise HTTPException(404, "doc not found in this bank")
     return {"results": r}
@@ -535,6 +541,18 @@ def links_link(body: LinkIn, who: dict = Depends(caller)):
     a human authored it, unlike the worker's system proposals)."""
     if body.src == body.dst:
         raise HTTPException(422, "src and dst are the same doc")
+    if body.kind not in KINDS:
+        raise HTTPException(422, f"kind must be one of {KINDS}")
+    # Both endpoints must be real docs visible to this caller: a human edge
+    # naming arbitrary/foreign-private ids would poison structure() and
+    # find_similar with garbage pairs.
+    for endpoint in (body.src, body.dst):
+        try:
+            links_mod.assert_visible(body.kind, endpoint, who["owner_id"])
+        except KeyError:
+            raise HTTPException(404, f"doc {endpoint} not found in this bank") from None
+        except PermissionError:
+            raise HTTPException(404, f"doc {endpoint} not found in this bank") from None
     try:
         return links_mod.link(who["owner_id"], body.kind, body.src, body.dst,
                               "human", status="active", proposer=who["owner_id"],

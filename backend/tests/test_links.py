@@ -316,6 +316,103 @@ def test_rest_links_surface():
         assert r.status_code == 409, r.text
 
 
+def test_cross_owner_same_pair_keeps_separate_edges():
+    # finding #1: edge_id must include owner_id — two owners linking the same
+    # doc pair (team/common docs both can see) each keep their own edge; the
+    # second write must not flip the first owner's edge to the other owner.
+    _wipe_edges()
+    o1, o2 = "edgeown1", "edgeown2"
+    auth.create_key(o1, person=o1)
+    auth.create_key(o2, person=o2)
+    t1 = _seed(o1, "Cross-owner pair test fact one about shared deploy tooling",
+               visibility="team")
+    t2 = _seed(o2, "Cross-owner pair test fact two about shared deploy tooling",
+               visibility="team")
+    e1 = links.link(o1, "semantic", t1, t2, "human")
+    e2 = links.link(o2, "semantic", t1, t2, "human")
+    assert e1["id"] != e2["id"], "owner_id missing from edge identity"
+    got1 = es("GET", f"/{EDGES}/_doc/{e1['id']}")["_source"]
+    got2 = es("GET", f"/{EDGES}/_doc/{e2['id']}")["_source"]
+    assert got1["owner_id"] == o1 and got2["owner_id"] == o2
+    # each owner's list sees only their own edge
+    assert [e["id"] for e in links.list_edges(o1)] == [e1["id"]]
+    assert [e["id"] for e in links.list_edges(o2)] == [e2["id"]]
+
+
+def test_find_related_cross_owner_private_is_404_not_500():
+    # finding #2: probing another owner's PRIVATE doc must be 404 (masking
+    # existence), never an unhandled PermissionError -> 500.
+    _wipe_edges()
+    owner = "probe404"
+    _wipe_docs(owner)
+    key = auth.create_key(owner, person=owner)
+    secret = _seed(owner, "Private fact about the secret deploy key rotation")
+    r = client.post("/memory/links/find_related", headers=H(BOB),
+                    json={"doc_id": secret, "threshold": 0.0})
+    assert r.status_code == 404, r.text
+
+
+def test_human_link_rejects_invisible_endpoints():
+    # finding #5: a human edge naming a nonexistent or foreign-private doc is
+    # refused (404), not silently stored.
+    _wipe_edges()
+    owner = "vislink"
+    _wipe_docs(owner)
+    key = auth.create_key(owner, person=owner)
+    a = _seed(owner, "Visible link endpoint fact about gateway restarts")
+    foreign_doc = {"kind": "semantic", "owner_id": "otherowner",
+                   "visibility": "private",
+                   "text": "Foreign private fact never to be linked",
+                   "entities": memory.extract_entities("Foreign private fact never to be linked"),
+                   "occurred_at": "2026-01-01T00:00:00Z", "active": True,
+                   "embedding": embeddings.embed(["Foreign private fact never to be linked"])[0]}
+    foreign = es("POST", f"/{idx('semantic')}/_doc?refresh=true", foreign_doc)["_id"]
+    r = client.post("/memory/links", headers=H(key),
+                    json={"kind": "semantic", "src": a, "dst": "does-not-exist"})
+    assert r.status_code == 404, r.text
+    r = client.post("/memory/links", headers=H(BOB),
+                    json={"kind": "semantic", "src": a, "dst": foreign})
+    assert r.status_code == 404, r.text
+    # sanity: a visible pair still links
+    b = _seed(owner, "Visible link endpoint fact about gateway restarts two")
+    r = client.post("/memory/links", headers=H(key),
+                    json={"kind": "semantic", "src": a, "dst": b})
+    assert r.status_code == 200, r.text
+
+
+def test_decided_edge_never_reproposed_even_when_scrolled_past():
+    # finding #3: a rejected edge must keep its status even when the pass's
+    # existing-edge window no longer sees it (simulated by a direct link()
+    # call — the guard must live on the write, not the caller's bookkeeping).
+    _wipe_edges()
+    owner = "decidedowner"
+    _wipe_docs(owner)
+    auth.create_key(owner, person=owner)
+    a = _seed(owner, "Decided edge fact alpha about trace waterfall exports")
+    b = _seed(owner, "Decided edge fact beta about trace waterfall exports")
+    e = links.link(owner, "semantic", a, b, "co_occurrence", status="proposed",
+                   proposer="system")
+    links.reject_edge(e["id"], owner)
+    # a pass-like write with the SAME identity but status proposed: skipped
+    out = links.link(owner, "semantic", a, b, "co_occurrence", status="proposed",
+                     proposer="system", score=0.9)
+    assert out.get("skipped") == "decided", out
+    got = es("GET", f"/{EDGES}/_doc/{e['id']}")["_source"]
+    assert got["status"] == "rejected", got          # rejection survived
+    # an active human write of the same pair but different mechanism is a
+    # DIFFERENT edge id: unaffected
+    h = links.link(owner, "semantic", a, b, "human")
+    assert h["id"] != e["id"] and h["status"] == "active"
+    # and an ACTIVE write over the rejected edge (what retain's near-dup
+    # mirror does on a re-retain of the same pair) is skipped too: the
+    # owner's rejection binds until they explicitly approve.
+    out2 = links.link(owner, "semantic", a, b, "co_occurrence", status="active",
+                      proposer="system", score=0.95)
+    assert out2.get("skipped") == "decided", out2
+    got = es("GET", f"/{EDGES}/_doc/{e['id']}")["_source"]
+    assert got["status"] == "rejected", got
+
+
 def test_worker_links_pass_and_entry_flag():
     _wipe_edges()
     owner = "wlinks"

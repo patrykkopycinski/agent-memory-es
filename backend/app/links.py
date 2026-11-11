@@ -83,10 +83,11 @@ def _now() -> str:
     return _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def edge_id(src: str, dst: str, edge_source: str) -> str:
-    """Deterministic id per (src, dst, mechanism): re-runs of a pass overwrite
-    in place instead of duplicating."""
-    return hashlib.sha1(f"{src}\0{dst}\0{edge_source}".encode()).hexdigest()
+def edge_id(owner_id: str, src: str, dst: str, edge_source: str) -> str:
+    """Deterministic id per (owner, src, dst, mechanism): re-runs of a pass
+    overwrite in place instead of duplicating, and two owners linking the same
+    doc pair each get their own edge (no cross-owner overwrite)."""
+    return hashlib.sha1(f"{owner_id}\0{src}\0{dst}\0{edge_source}".encode()).hexdigest()
 
 
 def _canonical_pair(a: str, b: str) -> tuple:
@@ -124,8 +125,25 @@ def link(owner_id: str, kind: str, src: str, dst: str, edge_source: str,
         doc["score"] = round(float(score), 4)
     if reason:
         doc["reason"] = reason[:256]
-    es("PUT", f"/{EDGES}/_doc/{edge_id(a, b, edge_source)}?refresh=true", doc)
-    return {"id": edge_id(a, b, edge_source), **doc}
+    eid = edge_id(owner_id, a, b, edge_source)
+    # A DECIDED edge (active or rejected) is never silently overwritten at a
+    # different status by link(): an owner's rejection must survive pass
+    # re-runs (even when the pass's existing-edge window, list_edges bounded,
+    # has scrolled past it) AND survive a near-dup mirror re-write flipping
+    # it back to active. Explicit transitions go through approve_edge /
+    # reject_edge, which flip status deliberately.
+    try:
+        cur = es("GET", f"/{EDGES}/_doc/{eid}")
+        cur_status = cur["_source"].get("status")
+        if cur_status != status and cur_status in ("active", "rejected"):
+            log.info("skip overwrite of %s edge %s (status=%s, new=%s)",
+                     edge_source, eid, cur_status, status)
+            return {"id": eid, "status": cur_status, "skipped": "decided"}
+    except RuntimeError as exc:
+        if not is_doc_miss(exc):
+            raise
+    es("PUT", f"/{EDGES}/_doc/{eid}?refresh=true", doc)
+    return {"id": eid, **doc}
 
 
 def unlink(edge_id_value: str) -> dict:
@@ -170,6 +188,22 @@ def list_edges(owner_id: str, status: Optional[str] = None,
         "size": size, "query": {"bool": {"filter": filt}},
         "sort": [{"created_at": {"order": "desc"}}]})
     return [{"id": h["_id"], **h["_source"]} for h in r["hits"]["hits"]]
+
+
+def assert_visible(kind: str, doc_id: str, owner_id: str) -> None:
+    """Raise KeyError (missing) or PermissionError (another owner's private
+    doc) unless `doc_id` is a doc this owner may act on. Same visibility rule
+    as find_similar."""
+    from .store import idx as _idx
+    try:
+        r = es("GET", f"/{_idx(kind)}/_doc/{doc_id}?_source_includes=owner_id,visibility")
+        src = r["_source"]
+    except RuntimeError as exc:
+        if is_doc_miss(exc):
+            raise KeyError(f"doc {doc_id} not found") from None
+        raise
+    if src.get("owner_id") != owner_id and src.get("visibility") not in ("team", "common"):
+        raise PermissionError("doc is not visible to this owner")
 
 
 def find_similar(owner_id: str, kind: str, doc_id: str, threshold: float = 0.7,
@@ -280,7 +314,7 @@ def hidden_connections_pass(owner_id: str, kind: str = "semantic",
                             exclude_linked=True)
         for s in sims:
             pair = _canonical_pair(doc_id, s["id"])
-            eid = edge_id(pair[0], pair[1], "co_occurrence")
+            eid = edge_id(owner_id, pair[0], pair[1], "co_occurrence")
             if eid in existing:
                 stats["skipped_existing"] += 1
             else:
@@ -366,6 +400,9 @@ def structure(owner_id: str, kind: str = "semantic") -> dict:
     from .store import idx as _idx
     ensure_edges_index()
     edges = _active_edges(owner_id, kind)
+    # _active_edges is bounded: a bank past the bound is reported as truncated
+    # rather than silently wrong (components/hubs/orphans are then partial).
+    truncated = len(edges) >= 2000
     adj = {}
     for a, b in edges:
         adj.setdefault(a, set()).add(b)
@@ -450,4 +487,5 @@ def structure(owner_id: str, kind: str = "semantic") -> dict:
         "components": components, "largest_component": largest,
         "hubs": [{"id": n, "degree": d} for n, d in hubs],
         "bridges": bridges,
+        "truncated": truncated,
     }
