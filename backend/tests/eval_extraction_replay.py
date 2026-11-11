@@ -69,8 +69,8 @@ CORPUS = [
         "not 9200 — the old number came from a stale note written before the port "
         "registry existed. Any doc still saying 9200 for review ES is wrong.",
         ["9291"],
-        # the stale port must not survive even as a correcting aside: v3-durable distils
-        # the corrected state only, so any "9200" in a fact is a leak
+        # the stale port must not survive even as a correcting aside: the current-state
+        # prompt distils the corrected state only, so any "9200" in a fact is a leak
         ["9200"],
     ),
     (
@@ -128,6 +128,18 @@ def judged_report(all_facts):
     if len(scores) != n_submitted:
         # a judge that skips or duplicates facts changes the denominator: refuse to score
         raise ValueError(f"judge scored {len(scores)} facts but {n_submitted} were submitted")
+    # identity check: each score must name a submitted (doc, fact) pair — a judge that
+    # attributes facts to the wrong document or invents text still changes the averages
+    submitted = {}
+    for i, fs in enumerate(all_facts):
+        for f in fs:
+            submitted[(i, f)] = submitted.get((i, f), 0) + 1
+    seen = {}
+    for s in scores:
+        key = (s.get("doc"), s.get("fact"))
+        seen[key] = seen.get(key, 0) + 1
+        if seen[key] > submitted.get(key, 0):
+            raise ValueError(f"judge scored an unsubmitted or duplicated fact (doc={key[0]})")
     per_criterion = {"durable": 0, "self_contained": 0, "grounded": 0}
     for s in scores:
         for c in per_criterion:
@@ -165,9 +177,15 @@ def main():
             print(f"doc {i}: EXTRACT-ERROR {type(exc).__name__}: {exc}")
             doc_facts = []
         all_facts.append(doc_facts)
-        for f in all_facts[-1]:
-            print(f"  doc {len(all_facts) - 1}: {f}")
-        print(f"doc {len(all_facts) - 1}: {len(all_facts[-1])} facts")
+        for f in doc_facts:
+            print(f"  doc {i}: {f}")
+        print(f"doc {i}: {len(doc_facts)} facts")
+
+    # a doc whose extraction crashed is reported, never silently dropped: it has no
+    # facts, so its required substrings are missing and the deterministic check fails
+    crashed = [i for i, fs in enumerate(all_facts) if not fs]
+    if crashed:
+        print(f"WARNING: docs with zero facts (extraction crashed or empty): {crashed}")
 
     rows, failed = deterministic_report(all_facts)
     for i, r in enumerate(rows):

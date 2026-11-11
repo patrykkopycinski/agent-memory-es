@@ -32,6 +32,16 @@ INCIDENT_REPORTS = [
     "about 97 percent of requests failed",           # counted noun 'requests'
     "we saw 12 timeouts across the fleet",
     "roughly 40 pods could not schedule",
+    # 'has/have' framing a present-tense event tally is not a durable possession
+    "the collector has 23 restarts",
+    "the run has 5944 errors",
+    "the fleet have seen 12 failures",
+    # 'up to'/'a maximum of' inside an incident narrative is a one-run peak, not a limit
+    "traffic ramped up to 5944 requests during the outage",
+    "a maximum of 5944 requests were dropped",
+    "up to 40 nodes failed simultaneously",
+    # hyphenated spelled-out numbers are durations too
+    "the pipeline took forty-five minutes",
     # the rate limit frames the first number; the later tally is one run's and still rejects
     "the gateway handles 5000 requests per second yet dropped 5944 requests tonight",
     # precise timestamps: full dates, month-day dates, clock moments
@@ -51,6 +61,13 @@ INCIDENT_REPORTS = [
 DURABLE_FACTS = [
     "the ingest worker drops errors repeatedly when the queue backs up",
     "restart loops recur on the collector after config reloads",
+    # present-tense 'has' frames a durable possession, not a one-run tally
+    "the index has 3 shards",
+    "the archive holds 2000 records",
+    "kafka retains 7 days of messages",
+    "the api accepts at most 100 requests per second",
+    "the ingest index is capped at 5000 documents",
+    "the gateway handles up to 5000 requests",
     "the auth migration finished; token estimator docs live in the wiki",
     "the ferry timetable changed to a 6 o'clock departure",      # present-tense schedule
     "since 2026 the team standard is trunk-based development",   # bare year is allowed
@@ -63,13 +80,6 @@ DURABLE_FACTS = [
     # tense-ambiguous verbs carry schedules too; only completed-event verbs pin moments
     "the maintenance window was at 02:00 every night",
     "the sync started at 02:00 nightly",
-    # rate and size limits are durable configuration, not one-run tallies
-    "the api accepts at most 100 requests per second",
-    "the ingest index is capped at 5000 documents",
-    # possession/retention statements of present state stay writable
-    "kafka retains 7 days of messages",
-    "the index has 3 shards",
-    "the archive holds 2000 records",
 ]
 
 TWO_LIMITS = ("the gateway handles 5000 requests per second; "
@@ -110,13 +120,14 @@ def test_two_framed_limits_in_one_text_stay_writable():
 
 def test_every_counted_noun_rejects_when_unframed():
     # the noun list is closed but long; a noun that stops rejecting would silently
-    # widen the durable path, so every noun is exercised mechanically
-    import re as _re
-    nouns = _re.sub(r"\?.*", "", "|".join(ephemeral_guard._COUNTED_NOUNS)).split("|")
+    # widen the durable path, so every noun is exercised mechanically. '?' (optional
+    # plural) is stripped per-noun; a join-then-strip collapses the list to the first
+    # noun, which the length assert catches.
+    nouns = [noun.replace("?", "") for noun in ephemeral_guard._COUNTED_NOUNS]
+    assert len(set(nouns)) == len(ephemeral_guard._COUNTED_NOUNS) > 1
     for noun in nouns:
-        base = _re.sub(r"\?.*", "", noun)
         with pytest.raises(ValueError):
-            ephemeral_guard.reject_ephemeral(f"we observed 30 {base} during the incident")
+            ephemeral_guard.reject_ephemeral(f"we observed 30 {noun} during the incident")
 
 
 @pytest.mark.parametrize("text", INCIDENT_REPORTS)

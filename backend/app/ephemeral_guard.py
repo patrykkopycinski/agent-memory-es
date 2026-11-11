@@ -45,22 +45,46 @@ _COUNT_RE = re.compile(
 )
 
 # A rate or size limit — or a possession/retention statement — names a durable property of
-# the system, not of one run. It is recognised either by a limiting or possessive verb
-# carrying the same number ("accepts at most 100 requests", "capped at 5000 documents",
-# "kafka retains 7 days of messages", "the index has 3 shards") or by a per-unit
-# denominator right after the counted noun ("100 requests per second", "500 docs a day",
-# "2 connections per node"). Present tense only: "had 23 restarts" stays a tally. A
-# per-unit rate on a past-tense incident ("dropped 5944 errors per hour that night") also
-# frames a limit-shaped number; separating those needs judgement the guard defers to
-# recall ranking (see the module docstring).
+# the system, not of one run. It is recognised either by a framing verb carrying the number
+# ("accepts at most 100 requests", "capped at 5000 documents", "kafka retains 7 days of
+# messages", "the index has 3 shards") or by a per-unit denominator right after the counted
+# noun ("100 requests per second", "500 docs a day", "2 connections per node"). A bare
+# quantity phrase without a framing verb — "ramped up to 5944 requests", "a maximum of
+# 5944 requests were dropped" — is a one-run peak, not a limit, and does not exempt: real
+# configuration limits carry a verb ("accepts", "is capped at") or a per-unit rate.
+# Present tense only: "had 23 restarts" stays a tally. A per-unit rate on a past-tense
+# incident ("dropped 5944 errors per hour that night") also frames a limit-shaped number;
+# separating those needs judgement the guard defers to recall ranking (see the module
+# docstring).
+_NUM_WORD = (
+    "one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|"
+    "thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|thirty|forty|"
+    "fifty|sixty|seventy|eighty|ninety"
+)
 _LIMIT_FRAME_RE = re.compile(
     r"\b(?:accepts?|allows?|handles?|supports?|serves?|rate.?limits?|limits?|"
     r"holds?|contains?|stores?|retains?|has|have|"
-    r"caps?\s+(?:at\s+)?|capped\s+(?:at\s+)?|max(?:imum)?|min(?:imum)?|"
-    r"at most|at least|up to|no more than|no fewer than)"
+    r"caps?\s+(?:at\s+)?|capped\s+(?:at\s+)?)"
     r"(?:\s*(?:of|is|are|to|at|:)\s*|\s+)"
+    r"(?:(?:at most|at least|up to|no more than|no fewer than|"
+    r"max(?:imum)?|min(?:imum)?)(?:\s+of)?\s+)?"
     r"(?:about\s+|roughly\s+|approximately\s+|~\s*)?\d[\d.,]*",
     re.IGNORECASE,
+)
+
+# Nouns of occurrence, not of state: possession of them ("has 23 restarts", "the run has
+# 5944 errors") is a tally in present-tense clothing, so has/have never frames them —
+# unlike "the index has 3 shards", possession of a structural thing. Checked against the
+# head of the counted span with regular plural forms precomputed.
+_EVENT_NOUN_BASES = (
+    "error", "failure", "failed attempt", "warning", "timeout", "abort",
+    "restart", "crash", "panic", "drop", "occurrence", "incident", "alert",
+    "event", "hit", "miss", "retry",
+)
+_EVENT_NOUN_FORMS = frozenset(
+    form
+    for base in _EVENT_NOUN_BASES
+    for form in (base, base + "s", base + "es")
 )
 _PER_UNIT_RE = re.compile(
     r"\s*(?:per\s+|an?\s+|each\s+)(?:milli?seconds?|ms|seconds?|secs?|minutes?|mins?|"
@@ -112,8 +136,9 @@ _DURATION_RE = re.compile(
     r"(?:about\s+|roughly\s+|approximately\s+|~\s*)?"
     r"(?:\d+[\d.,]*|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|"
     r"thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|thirty|forty|"
-    r"fifty|sixty|seventy|eighty|ninety|a couple of|a few|several|half an?|an?)\s+"
-    r"(?:milli?seconds?|ms|seconds?|secs?|minutes?|mins?|hours?|hrs?|days?|weeks?|months?)\b",
+    r"fifty|sixty|seventy|eighty|ninety|a couple of|a few|several|half an?|an?)"
+    r"(?:[-\s]+(?:" + _NUM_WORD + r"))?"
+    r"\s+(?:milli?seconds?|ms|seconds?|secs?|minutes?|mins?|hours?|hrs?|days?|weeks?|months?)\b",
     re.IGNORECASE,
 )
 
@@ -126,8 +151,16 @@ def _limit_frames(text: str, count_match: "re.Match") -> bool:
     dropped 5944 requests' still rejects."""
     if _PER_UNIT_RE.match(text, count_match.end()):
         return True
-    return any(frame.start() < count_match.end() and frame.end() > count_match.start()
-               for frame in _LIMIT_FRAME_RE.finditer(text))
+    for frame in _LIMIT_FRAME_RE.finditer(text):
+        if frame.start() < count_match.end() and frame.end() > count_match.start():
+            # has/have + a noun of occurrence is a tally in present-tense clothing
+            # ('the collector has 23 restarts'), not durable possession
+            if frame.group().lower().startswith(("has", "have")):
+                noun = count_match.group().lower().split()[-1]
+                if noun in _EVENT_NOUN_FORMS:
+                    continue
+            return True
+    return False
 
 
 def reject_ephemeral(text: str) -> None:
