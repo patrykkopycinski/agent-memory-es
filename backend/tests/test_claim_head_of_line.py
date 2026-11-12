@@ -62,3 +62,12 @@ def test_job_id_claim_reaches_backfill_owner_and_owner_claim_stays_gated(queues)
     assert facts.claim(job_id="owner-a-1")[0] == "owner-a-1"
     # unchanged: only the exact-id path (the backfill runner) may take these jobs
     assert facts.claim(owner_id="owner-a") is None
+
+
+def test_backfill_owner_cap_overflow_logs_warning(monkeypatch, caplog):
+    reply = {"aggregations": {"owners": {"sum_other_doc_count": 7,
+                                         "buckets": [{"key": "owner-a"}]}}}
+    monkeypatch.setattr(facts, "es", lambda *args, **kwargs: reply)
+    with caplog.at_level("WARNING", logger=facts.log.name):
+        assert facts._backfill_owners() == ["owner-a"]
+    assert "truncated" in caplog.text and "7" in caplog.text

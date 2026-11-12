@@ -189,7 +189,11 @@ def _backfill_owners():
     result = es("POST", f"/{BACKFILLS}/_search", {"size": 0,
         "query": {"terms": {"state": ["pending", "running"]}},
         "aggs": {"owners": {"terms": {"field": "owner_id", "size": MAX_BACKFILL_OWNERS}}}})
-    return [b["key"] for b in result["aggregations"]["owners"]["buckets"]]
+    owners = result["aggregations"]["owners"]
+    if owners.get("sum_other_doc_count", 0) > 0:
+        log.warning("backfill owner list truncated at %d: %d more backfill docs not excluded",
+                    MAX_BACKFILL_OWNERS, owners["sum_other_doc_count"])
+    return [b["key"] for b in owners["buckets"]]
 
 
 def claim(owner_id=None, job_id=None, lease_seconds=LEASE_SECONDS):
@@ -208,7 +212,8 @@ def claim(owner_id=None, job_id=None, lease_seconds=LEASE_SECONDS):
         **({"must_not": {"terms": {"owner_id": excluded}}} if excluded else {})}}})
     for hit in response["hits"]["hits"]:
         if not job_id:
-            # Race guard only: a backfill created after the owner lookup above.
+            # Not redundant: covers a backfill created after the owner lookup above
+            # and owners beyond MAX_BACKFILL_OWNERS that the query did not exclude.
             active = es("POST", f"/{BACKFILLS}/_count", {"query": {"bool": {"filter": [
                 {"term": {"owner_id": hit["_source"]["owner_id"]}},
                 {"terms": {"state": ["pending", "running"]}}]}}})["count"]
