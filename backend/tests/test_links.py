@@ -48,6 +48,30 @@ def _wipe_docs(owner):
        {"query": {"term": {"owner_id": owner}}})
 
 
+# Every owner this suite seeds. Wiped by the autouse teardown: leftover docs
+# poison LATER tests' recalls — team-visible ones (the cross-owner pair test)
+# enter every owner's kNN candidate pool through the visibility filter, and
+# recall-order tests (test_recall_confidence_order) flip when foreign docs
+# join the fused set. Private leftovers are invisible to other owners but are
+# wiped too: the shared suite index must look the same after this file as it
+# did before it.
+_SEED_OWNERS = ("linksim", "probe_owner", "carol_probe", "hcowner", "idemowner",
+                "orphowner", "structowner", "edgeown1", "edgeown2", "probe404",
+                "vislink", "decidedowner", "wlinks", "otherowner")
+
+
+@pytest.fixture(autouse=True)
+def _clean_slice():
+    """Isolation: wipe this suite's docs+edges before AND after every test."""
+    _wipe_edges()
+    for o in _SEED_OWNERS:
+        _wipe_docs(o)
+    yield
+    _wipe_edges()
+    for o in _SEED_OWNERS:
+        _wipe_docs(o)
+
+
 # ---- link() core: identity, validation, idempotency -----------------------------------
 
 def test_link_validation_and_idempotency():
