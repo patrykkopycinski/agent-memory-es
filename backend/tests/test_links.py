@@ -57,7 +57,8 @@ def _wipe_docs(owner):
 # did before it.
 _SEED_OWNERS = ("linksim", "probe_owner", "carol_probe", "hcowner", "idemowner",
                 "orphowner", "structowner", "edgeown1", "edgeown2", "probe404",
-                "vislink", "decidedowner", "wlinks", "otherowner")
+                "vislink", "decidedowner", "wlinks", "otherowner",
+                "near_dup_owner", "restowner", "raceowner")
 
 
 @pytest.fixture(autouse=True)
@@ -404,7 +405,47 @@ def test_human_link_rejects_invisible_endpoints():
     assert r.status_code == 200, r.text
 
 
-def test_decided_edge_never_reproposed_even_when_scrolled_past():
+def test_link_write_is_optimistic_concurrent():
+    # reviewer round 2: link()'s decided-guard must not be raceable — the
+    # write carries if_seq_no/if_primary_term from the read, so a concurrent
+    # writer that flips status between our GET and PUT makes the PUT 409 and
+    # the single retry re-reads the now-decided state and skips.
+    _wipe_edges()
+    owner = "raceowner"
+    _wipe_docs(owner)
+    auth.create_key(owner, person=owner)
+    a = _seed(owner, "Race guard fact alpha about golden trace waterfalls")
+    b = _seed(owner, "Race guard fact beta about golden trace waterfalls")
+    e = links.link(owner, "semantic", a, b, "co_occurrence", status="proposed",
+                   proposer="system")
+    # first write hit a doc-miss GET: unconditional create (no if_seq_no)
+    real_es = links.es
+    seen = []
+
+    def spy_es(method, path, body=None):
+        seen.append((method, path))
+        return real_es(method, path, body)
+
+    links.es = spy_es
+    try:
+        # a second write of the same edge at the same status re-reads and
+        # re-PUTs WITH if_seq_no (guarded overwrite, not blind)
+        links.link(owner, "semantic", a, b, "co_occurrence", status="proposed",
+                   proposer="system")
+        put_paths = [p for m, p in seen if m == "PUT"]
+        assert put_paths and all("if_seq_no=" in p for p in put_paths), put_paths
+        # and the decided-guard still skips a rejected edge (bidirectional)
+        links.reject_edge(e["id"], owner)
+        seen.clear()
+        out = links.link(owner, "semantic", a, b, "co_occurrence", status="proposed",
+                         proposer="system")
+        assert out.get("skipped") == "decided", out
+        assert not [p for m, p in seen if m == "PUT"], "decided edge must not be PUT"
+    finally:
+        links.es = real_es
+
+
+
     # finding #3: a rejected edge must keep its status even when the pass's
     # existing-edge window no longer sees it (simulated by a direct link()
     # call — the guard must live on the write, not the caller's bookkeeping).

@@ -43,6 +43,11 @@ REMOVAL_PROBE_LIMIT = 200
 # miscount). Beyond this many docs the snapshot falls back to the estimate.
 STRUCT_DOC_LIMIT = 2000
 
+# _active_edges is bounded to this many edges; structure() flags its snapshot
+# `truncated` at the same bound instead of silently returning partial
+# components/hubs/orphans. Keep the two in one place: they are one limit.
+STRUCT_EDGE_LIMIT = 2000
+
 EDGE_MAPPINGS = {
     "settings": {"number_of_shards": 1, "number_of_replicas": 0},
     "mappings": {
@@ -132,18 +137,33 @@ def link(owner_id: str, kind: str, src: str, dst: str, edge_source: str,
     # has scrolled past it) AND survive a near-dup mirror re-write flipping
     # it back to active. Explicit transitions go through approve_edge /
     # reject_edge, which flip status deliberately.
-    try:
-        cur = es("GET", f"/{EDGES}/_doc/{eid}")
-        cur_status = cur["_source"].get("status")
-        if cur_status != status and cur_status in ("active", "rejected"):
-            log.info("skip overwrite of %s edge %s (status=%s, new=%s)",
-                     edge_source, eid, cur_status, status)
-            return {"id": eid, "status": cur_status, "skipped": "decided"}
-    except RuntimeError as exc:
-        if not is_doc_miss(exc):
-            raise
-    es("PUT", f"/{EDGES}/_doc/{eid}?refresh=true", doc)
-    return {"id": eid, **doc}
+    # The write is optimistic (if_seq_no/if_primary_term from the read): a
+    # concurrent writer that flipped the status in our read-decide-write
+    # window makes the PUT 409, and one retry re-reads the now-decided state
+    # and skips — the guard cannot be raced past.
+    for _ in range(2):
+        try:
+            cur = es("GET", f"/{EDGES}/_doc/{eid}")
+            cur_status = cur["_source"].get("status")
+            if cur_status != status and cur_status in ("active", "rejected"):
+                log.info("skip overwrite of %s edge %s (status=%s, new=%s)",
+                         edge_source, eid, cur_status, status)
+                return {"id": eid, "status": cur_status, "skipped": "decided"}
+            seq, term = cur["_seq_no"], cur["_primary_term"]
+        except RuntimeError as exc:
+            if not is_doc_miss(exc):
+                raise
+            seq = term = None   # fresh edge: unconditional create
+        try:
+            q = "" if seq is None else f"&if_seq_no={seq}&if_primary_term={term}"
+            es("PUT", f"/{EDGES}/_doc/{eid}?refresh=true{q}", doc)
+            return {"id": eid, **doc}
+        except RuntimeError as exc:
+            # 409 conflict: another writer won the race — retry the guard once
+            if "-> 409:" not in str(exc) or _ == 1:
+                raise
+            continue
+    raise RuntimeError("unreachable")  # pragma: no cover
 
 
 def unlink(edge_id_value: str) -> dict:
@@ -298,7 +318,8 @@ def hidden_connections_pass(owner_id: str, kind: str = "semantic",
             {"exists": {"field": "embedding"}}]}},
         "sort": [{"occurred_at": {"order": "desc"}}]})
     hits = scan["hits"]["hits"]
-    stats = {"scanned": len(hits), "proposed": 0, "skipped_existing": 0, "candidates": []}
+    stats = {"scanned": len(hits), "proposed": 0, "skipped_existing": 0,
+             "skipped_decided": 0, "candidates": []}
     # Everything the pass already decided about: proposed (awaiting decision),
     # active (linked), rejected (known-bad — re-proposing would overwrite the
     # rejection, so rejected ids are treated as decided too).
@@ -318,14 +339,19 @@ def hidden_connections_pass(owner_id: str, kind: str = "semantic",
             if eid in existing:
                 stats["skipped_existing"] += 1
             else:
-                link(owner_id, kind, pair[0], pair[1], "co_occurrence",
-                     status="proposed", score=s["cosine"],
-                     reason=f"cosine {s['cosine']:.3f} unlinked similarity",
-                     proposer="system")
+                out = link(owner_id, kind, pair[0], pair[1], "co_occurrence",
+                           status="proposed", score=s["cosine"],
+                           reason=f"cosine {s['cosine']:.3f} unlinked similarity",
+                           proposer="system")
                 existing.add(eid)
-                stats["proposed"] += 1
-                stats["candidates"].append({"edge": eid, "src": pair[0], "dst": pair[1],
-                                            "cosine": s["cosine"]})
+                if out.get("skipped") == "decided":
+                    # link()'s write-path guard stopped a decided pair the
+                    # window no longer saw: count it as skipped, not proposed
+                    stats["skipped_decided"] += 1
+                else:
+                    stats["proposed"] += 1
+                    stats["candidates"].append({"edge": eid, "src": pair[0], "dst": pair[1],
+                                                "cosine": s["cosine"]})
             if stats["proposed"] >= max_proposals_per_pass:
                 break
     return stats
@@ -372,7 +398,8 @@ def orphan_rate(owner_id: str, kind: str = "semantic") -> dict:
     return structure(owner_id, kind)
 
 
-def _active_edges(owner_id: str, kind: Optional[str] = None, limit: int = 2000) -> list:
+def _active_edges(owner_id: str, kind: Optional[str] = None,
+                  limit: int = STRUCT_EDGE_LIMIT) -> list:
     """Active edges as (src, dst) tuples. `kind` narrows to edges stored for one
     memory kind: the structure snapshot divides active docs (per kind) by linked
     docs, so an edge from another kind must not count toward this kind's total."""
@@ -402,7 +429,7 @@ def structure(owner_id: str, kind: str = "semantic") -> dict:
     edges = _active_edges(owner_id, kind)
     # _active_edges is bounded: a bank past the bound is reported as truncated
     # rather than silently wrong (components/hubs/orphans are then partial).
-    truncated = len(edges) >= 2000
+    truncated = len(edges) >= STRUCT_EDGE_LIMIT
     adj = {}
     for a, b in edges:
         adj.setdefault(a, set()).add(b)
