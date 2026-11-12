@@ -2,6 +2,7 @@
 import datetime as dt
 import threading
 import time
+import types
 import uuid
 
 import pytest
@@ -175,15 +176,53 @@ def test_T5_expired_race_does_not_revive_foreign_token(monkeypatch, setup):
     assert doc(QUEUE, "job")["state"] == "completed"
 
 
+class _LogicalClock:
+    """Frozen replacement for facts._now(); time moves only when advance() is called."""
+
+    def __init__(self, start):
+        self._now, self._lock = start, threading.Lock()
+
+    def now(self):
+        with self._lock:
+            return self._now
+
+    def advance(self, seconds):
+        with self._lock:
+            self._now += dt.timedelta(seconds=seconds)
+
+
+class _SteppedEvent(threading.Event):
+    """Event whose timed wait consumes logical time instead of sleeping.
+
+    The heartbeat only ever waits on its stop event, so every heartbeat/retry
+    interval elapses on the logical clock and the renew schedule is exact."""
+    clock = None
+
+    def wait(self, timeout=None):
+        if timeout is not None and not self.is_set():
+            self.clock.advance(timeout)
+        return self.is_set()
+
+
 def test_T6_abort_before_scope_expiry(monkeypatch, setup):
     seed()
+    clock = _LogicalClock(facts._now())
+    monkeypatch.setattr(_SteppedEvent, "clock", clock)
+    # facts only uses Event (heartbeat stop/abort), Thread and Lock from threading.
+    monkeypatch.setattr(facts, "threading", types.SimpleNamespace(
+        Event=_SteppedEvent, Thread=threading.Thread, Lock=threading.Lock))
+    monkeypatch.setattr(facts, "_now", clock.now)
+
     entered = threading.Event()
-    renews = []
+    renew_times = []
     real_update = facts._update_backfill
 
     def update(key, token, **fields):
         if "lease_until" in fields:
-            renews.append(1)
+            # The abort cannot arrive before the worker is inside process(),
+            # whatever the scheduler does; logical time is frozen while waiting.
+            entered.wait(10)  # a failed assert here would be swallowed by _heartbeat
+            renew_times.append(clock.now())
             raise RuntimeError("transient scope failure")
         return real_update(key, token, **fields)
 
@@ -191,15 +230,43 @@ def test_T6_abort_before_scope_expiry(monkeypatch, setup):
 
     def process(*a, **kw):
         entered.set()
-        abort = kw["abort"]
-        assert wait_for(abort.is_set, 2)
+        assert wait_for(kw["abort"].is_set, 10)
 
     runner(monkeypatch, process)
     assert facts.run_backfill_once()
     bf = doc(BACKFILLS, "bf")
-    assert entered.is_set() and len(renews) == 3
+    assert entered.is_set() and len(renew_times) == 3
     assert bf["state"] == "failed" and not bf.get("cursor")
-    assert facts._parse_iso(bf["lease_until"]) > facts._now()
+    # The scope lease granted at claim was never extended, and the abort (the
+    # third failed renewal) happened on the logical clock before it ran out.
+    assert renew_times[-1] < facts._parse_iso(bf["lease_until"])
+
+
+@pytest.mark.parametrize("heartbeat,lease", [(15, 90), (0.05, 0.3)], ids=["production", "fixture-scale"])
+def test_heartbeat_abort_window_fits_lease(monkeypatch, heartbeat, lease):
+    """Drive the real _heartbeat with every scope renewal failing, on the logical
+    clock and without ES: it must abort before the scope lease granted at its
+    start would expire. (15, 90) are the production constants; the second pair
+    keeps the retry spacing observable, since at production scale the retry delay
+    is capped at 2s whatever HEARTBEAT_SECONDS / 4 evaluates to.
+    Assumes ES calls return promptly: per-call ES latency (store.es timeout) is
+    not modelled and is a separate production concern."""
+    clock = _LogicalClock(facts._now())
+    monkeypatch.setattr(_SteppedEvent, "clock", clock)
+    monkeypatch.setattr(facts, "_now", clock.now)
+    monkeypatch.setattr(facts, "HEARTBEAT_SECONDS", heartbeat)
+    monkeypatch.setattr(facts, "BACKFILL_LEASE_SECONDS", lease)
+    renewals = []
+
+    def down(*a, **kw):
+        renewals.append(1)
+        raise RuntimeError("scope store down")
+
+    monkeypatch.setattr(facts, "_update_backfill", down)
+    start, abort = clock.now(), _SteppedEvent()
+    facts._heartbeat("bf", "tok", _SteppedEvent(), abort)
+    assert abort.is_set() and len(renewals) == 3
+    assert (clock.now() - start).total_seconds() < lease
 
 
 def test_job_renew_failure_does_not_abort_scope(monkeypatch, setup):

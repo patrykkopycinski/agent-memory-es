@@ -9,7 +9,13 @@ Thin HTTP wrapper over the AMES REST API; adds no ranking/dedup logic and does n
 | `memory_recall(query, k=8, visibility?, kinds?, as_of?)` | read-only. k clamped 1-50. Results are confidence-descending (the first hit is the best one) and carry `confidence`; when a cross-encoder rerank ran (hits carry `rerank_rank`) the backend's rerank order is kept. |
 | `memory_reflect(question)` | read-only; backend may call an LLM, slower. |
 | `memory_stats()` | read-only; counts/models/pages visible to the key. |
+| `memory_find_related(doc_id, kind="semantic", threshold=0.3, k=5)` | read-only. Hidden connections: similar-but-unlinked memories for one id; hypotheses, never auto-linked. |
+| `memory_links_list(status?, edge_source?, size=50)` | read-only. Stored edges visible to this key (`status`: active/proposed/rejected, `edge_source`: human/near_dup/co_occurrence). |
+| `memory_links_structure(kind="semantic")` | read-only. Orphan rate, components, largest component, degree hubs, articulation-point bridges of the key's bank. |
 | `memory_retain(text, kind="semantic", visibility="private", occurred_at?)` | WRITE. Only registered when `ALLOW_WRITE=1`; otherwise it does not exist in `tools/list`. |
+| `memory_links_link(src, dst, kind="semantic", reason?)` | WRITE (ALLOW_WRITE). Human edge between two visible memories. |
+| `memory_links_approve(edge_id)` | WRITE (ALLOW_WRITE). Activate a pass-proposed edge (owner only). |
+| `memory_links_reject(edge_id)` | WRITE (ALLOW_WRITE). Reject a proposed edge; the pair is never re-proposed. |
 
 ## Config (env)
 - `AMES_API_KEY` (required): the server refuses to start without it. Only sent as `X-API-Key`; never logged or put in errors.

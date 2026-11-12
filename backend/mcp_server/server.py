@@ -101,6 +101,54 @@ def build_server(client: AmesClient, allow_write: bool = False,
         with _tool_span("memory_stats") as record:
             return record(client.stats())
 
+    @mcp.tool()
+    def memory_find_related(doc_id: str, kind: str = "semantic",
+                            threshold: float = 0.3, k: int = 5) -> dict:
+        """Find similar-but-unlinked memories for one memory id (hidden
+        connections): hypotheses from the embedding space, never auto-linked.
+
+        doc_id: a memory id from memory_recall/memory_reflect results.
+        kind: the memory's kind (episodic/semantic/procedural).
+        threshold: cosine floor (0..1). Lower finds more, noisier candidates.
+          Default 0.3, lower than the REST default (0.7): this bank's local
+          embedding model scores sibling topics 0.30-0.50, so 0.7 surfaces
+          nothing for agent exploration.
+        k: max candidates (1-20).
+        Use memory_links_list(status='proposed') to see filed link proposals
+        from the scheduled pass instead.
+        """
+        with _tool_span("memory_find_related") as record:
+            try:
+                return record(client.links_find_related(doc_id, kind, threshold, k))
+            except AmesError as e:
+                if "404" in str(e):
+                    raise AmesError(f"no visible memory with id {doc_id!r} "
+                                    f"of kind {kind!r}") from None
+                raise
+
+    @mcp.tool()
+    def memory_links_list(status: Optional[str] = None,
+                          edge_source: Optional[str] = None,
+                          size: int = 50) -> dict:
+        """List stored memory-to-memory edges (links) visible to this key.
+
+        status: active | proposed | rejected (omit for all).
+        edge_source: human | near_dup | co_occurrence | proposal (omit for all).
+        size: 1-100.
+        Proposed edges await an owner decision (memory_links_approve/reject).
+        """
+        with _tool_span("memory_links_list") as record:
+            return record(client.links_list(status, edge_source,
+                                            max(1, min(int(size), 100))))
+
+    @mcp.tool()
+    def memory_links_structure(kind: str = "semantic") -> dict:
+        """Structure snapshot of this key's memory bank: active docs, docs with
+        at least one active edge, orphans and orphan rate. High orphan rate =
+        many disconnected memories (candidates for linking or consolidation)."""
+        with _tool_span("memory_links_structure") as record:
+            return record(client.links_structure(kind))
+
     if allow_write:
         @mcp.tool()
         def memory_retain(text: str, kind: Kind = "semantic",
@@ -111,6 +159,29 @@ def build_server(client: AmesClient, allow_write: bool = False,
             visibility defaults to private; team/common are shared with others."""
             with _tool_span("memory_retain") as record:
                 return record(client.retain(kind, text, visibility, occurred_at))
+
+        @mcp.tool()
+        def memory_links_link(src: str, dst: str, kind: str = "semantic",
+                              reason: Optional[str] = None) -> dict:
+            """Link two memories with a human edge (WRITE). Both must be visible
+            to this key. Use when a relationship the automatic pass cannot see
+            (cause/effect, same incident, same decision) matters for recall."""
+            with _tool_span("memory_links_link") as record:
+                return record(client.links_link(kind, src, dst, reason))
+
+        @mcp.tool()
+        def memory_links_approve(edge_id: str) -> dict:
+            """Activate a proposed edge from the hidden-connections pass (WRITE).
+            Only the owner of the bank may approve."""
+            with _tool_span("memory_links_approve") as record:
+                return record(client.links_approve(edge_id))
+
+        @mcp.tool()
+        def memory_links_reject(edge_id: str) -> dict:
+            """Reject a proposed edge (WRITE): the pair stays unlinked and the
+            pass will not re-propose it. Only the owner of the bank may reject."""
+            with _tool_span("memory_links_reject") as record:
+                return record(client.links_reject(edge_id))
 
     return mcp
 

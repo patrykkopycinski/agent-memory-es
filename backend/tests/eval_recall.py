@@ -80,9 +80,54 @@ def evaluate(ids, k=5):
     return sum(recalls) / n, sum(mrrs) / n, n
 
 
+# ---- pre-registered graph on/off axis (Cell A) ------------------------------------
+# Claim policy (docs/BENCHMARKS.md): "the graph arm helps" may only be claimed
+# from a paired benchmark. This axis is the in-repo regression gate: recall is
+# computed twice — graph arm disabled (AMES_GRAPH_RRF_WEIGHT=0) and enabled
+# (default) — and the ON run may never lose a gold doc the OFF run found.
+# Single-user synthetic corpora (LongMemEval/PersonaMem analogs) cannot see the
+# hop-2 arm (entities match within one owner's tiny corpus); the axis therefore
+# asserts NO-REGRESSION, never improvement. Improvement claims stay gated on the
+# paired-benchmark policy.
+
+def evaluate_axis(ids, k=5):
+    """Per-doc recall graph-off vs graph-on; returns (off, on, n, regressions)."""
+    # AMES_GRAPH_RRF_WEIGHT is read per recall call, so env flips take effect
+    # without any module reload.
+    regressions = []
+    runs = {}
+    for label, weight in (("off", "0"), ("on", "0.01")):
+        os.environ["AMES_GRAPH_RRF_WEIGHT"] = weight
+        recalls, mrrs = [], []
+        for i, text, query in CORPUS:
+            owner = OWNERS[i]
+            gold = ids[text]
+            hits = memory.recall(owner, query, size=k)["fused"]
+            rank = next((j + 1 for j, h in enumerate(hits) if h["id"] == gold), None)
+            recalls.append(1 if rank else 0)
+            mrrs.append(1.0 / rank if rank else 0.0)
+            for h in hits:
+                if h["visibility"] == "private" and h["owner_id"] != owner:
+                    raise SystemExit(f"CROSS-OWNER LEAK: {owner} saw {h['owner_id']}: {h['text'][:60]}")
+        runs[label] = (sum(recalls) / len(CORPUS), sum(mrrs) / len(CORPUS), recalls)
+    off_r, on_r = runs["off"][2], runs["on"][2]
+    for i, text, _ in CORPUS:
+        if off_r[i] and not on_r[i]:
+            regressions.append(text)
+    return runs["off"], runs["on"], len(CORPUS), regressions
+
+
 if __name__ == "__main__":
     wipe()
     ids = build()
     r, m, n = evaluate(ids)
     backend = os.environ.get("AMES_EMBED_BACKEND", "auto")
     print(f"backend={backend} n={n} Recall@5={r:.3f} MRR={m:.3f}")
+    off, on, n, regressions = evaluate_axis(ids)
+    print(f"graph-off  Recall@5={off[0]:.3f} MRR={off[1]:.3f}")
+    print(f"graph-on   Recall@5={on[0]:.3f} MRR={on[1]:.3f}")
+    if regressions:
+        for t in regressions:
+            print(f"GRAPH REGRESSION: gold doc lost when graph arm on: {t[:70]}")
+        raise SystemExit(1)
+    print("graph axis: no per-doc regression (gate passed)")
