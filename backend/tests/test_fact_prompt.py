@@ -1,4 +1,4 @@
-"""Prompt-contract tests for the v2 extraction prompt (commit: single-sentence, <=300 chars, <=12 facts)."""
+"""Prompt-contract tests for the extraction prompt (single-sentence, <=300 chars, <=MAX_FACTS facts)."""
 from unittest.mock import patch
 import pytest
 from app import facts
@@ -10,10 +10,9 @@ def test_extract_prompt_states_caps():
     with patch.object(facts.llm, "chat_json", return_value={"facts": []}) as cj:
         facts._extract("doc", "2020-01-02")
         system = cj.call_args[0][0]
-    assert "at most 12" in system
+    assert f"at most {facts.MAX_FACTS}" in system
     assert "at most 300" in system
     assert "one single complete sentence" in system
-    assert facts.PROMPT_VERSION == "document-v2"
 
 
 def test_prompt_version_bumped_with_prompt_change():
