@@ -182,7 +182,7 @@ untouched sample.
 
 | # | Follow-up | Targets | Status |
 |---|---|---|---|
-| 1 | **Latest-value-only recall:** extraction assigns a stable slot key (`subject|attribute`); recall collapses on it (ES `collapse`, newest first), so outdated values never reach the answer model | Knowledge-update (8 of 16 holdout misses) | Proposed — needs slot-key design |
+| 1 | **Latest-value-only recall:** extraction assigns a stable slot key (`subject\|attribute`); recall collapses on it (ES `collapse`, newest first), so outdated values never reach the answer model | Knowledge-update (8 of 16 holdout misses) | Proposed — needs slot-key design |
 | 2 | **Date arithmetic in code:** store ISO dates on facts and precompute the gaps between the dates a question mentions | Temporal reasoning (4–5 misses) | Proposed |
 | 3 | **Counting via aggregation:** ES\|QL aggregation over facts tagged with a stable item and category | Multi-session counting (3 misses) | Deferred — depends on 1 |
 | 4 | **Queue robustness ("fix-2"):** the heartbeat renews the job lease with the token its own claim minted, and can no longer renew another worker's claim | Crash/reboot recovery; no effect on answers | In progress (4th review requested changes) |
@@ -191,6 +191,7 @@ untouched sample.
 | 7 | ES-native rerank on by default | Retrieval ordering | **Rejected for now** — cold latency (median 27.7 s); recall is already saturated |
 | 8 | `semantic_text` migration | Maintenance | Paused — accuracy-neutral; align with the Elastic Context Engine schema instead |
 | 9 | PrecisionMemBench precision gap (0.75 vs 0.86) | Over-inclusive recall sets | Open |
+| 10 | Graph edges (hidden connections): stored `am_edges` with provenance; proposal-only pass; `AMES_GRAPH_RRF_WEIGHT` on/off axis | Cross-session association | In review — graph neutral at w=0.01 (Recall@5 1.000 / MRR 0.961 both arms); no improvement claim |
 
 ### Rejected / closed
 

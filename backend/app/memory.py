@@ -596,6 +596,19 @@ def _retain(owner_id: str, kind: str, text: str, visibility: str = "private",
         out["dedup_reason"] = "near_duplicate_linked"
         out["supersedes"] = [old_id]
         out["cosine"] = near[1]
+        # Mirror the link into the edge store (near_dup provenance) so hidden
+        # connections and structure queries see dedup links too. Fail-open: an
+        # edge-store hiccup must never fail the memory write itself.
+        try:
+            from . import links as _links
+            _links.link(owner_id, kind, ids[0], old_id, "near_dup",
+                        status="active", score=near[1],
+                        reason="retain near-duplicate link", proposer="system")
+        except Exception:
+            import logging
+            logging.getLogger(__name__).exception(
+                "near_dup edge write failed for %s -> %s (memory write unaffected)",
+                ids[0], old_id)
     if kind == "episodic" and extract_facts:
         from . import facts
         out["fact_jobs"] = []
@@ -1409,20 +1422,24 @@ def _recall_inner(owner_id: str, query: str, kinds=None, size: int = 8,
         for rank, h in enumerate(hits):
             fused.setdefault(h["id"], {**h, "rrf": 0.0})
             fused[h["id"]]["rrf"] += 1.0 / (RANK_CONSTANT + rank + 1)
-    GRAPH_RRF_WEIGHT = 0.01  # hop-2 evidence must not outvote lexical+kNN agreement
-    # graph arm: entity two-hop expansion, fused by rank (never dominates other arms)
-    try:
-        from . import graph as _graph
-        for rank, h in enumerate([] if parsed is not None else
-                                 _graph.graph_expand(owner_id, query, size,
-                                                     _visibility_filter(owner_id),
-                                                     **({"include_inactive_decisions": True}
-                                                        if include_inactive_decisions else {}))):
-            fused.setdefault(h["id"], {**h, "rrf": 0.0, "arm": "graph"})
-            fused[h["id"]]["rrf"] += GRAPH_RRF_WEIGHT / (RANK_CONSTANT + rank + 1)
-            fused[h["id"]]["graph_hit"] = True
-    except Exception:
-        pass
+    # graph arm: entity two-hop expansion, fused by rank (never dominates other arms).
+    # Env-tunable (AMES_GRAPH_RRF_WEIGHT) so evals can run the pre-registered graph
+    # on/off self-regression axis; 0 disables the arm. Default 0.01: hop-2 evidence
+    # must not outvote lexical+kNN agreement.
+    GRAPH_RRF_WEIGHT = float(os.environ.get("AMES_GRAPH_RRF_WEIGHT", "0.01"))
+    if GRAPH_RRF_WEIGHT > 0:
+        try:
+            from . import graph as _graph
+            for rank, h in enumerate([] if parsed is not None else
+                                     _graph.graph_expand(owner_id, query, size,
+                                                         _visibility_filter(owner_id),
+                                                         **({"include_inactive_decisions": True}
+                                                            if include_inactive_decisions else {}))):
+                fused.setdefault(h["id"], {**h, "rrf": 0.0, "arm": "graph"})
+                fused[h["id"]]["rrf"] += GRAPH_RRF_WEIGHT / (RANK_CONSTANT + rank + 1)
+                fused[h["id"]]["graph_hit"] = True
+        except Exception:
+            pass
     # temporal arm: window fill spread across the range
     temporal_meta = None
     try:

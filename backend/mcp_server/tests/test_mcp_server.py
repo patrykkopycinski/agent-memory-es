@@ -32,6 +32,20 @@ def _backend(calls, results=None, status=200):
             return httpx.Response(200, json={"owner_id": "me", "counts": {}})
         if req.url.path == "/memory/retain":
             return httpx.Response(200, json={"_id": "x1"})
+        if req.url.path == "/memory/links/find_related":
+            return httpx.Response(200, json={"results": [
+                {"id": "sib", "cosine": 0.55, "text": "sibling"}]})
+        if req.url.path == "/memory/links":
+            if req.method == "GET":
+                return httpx.Response(200, json={"edges": [
+                    {"id": "e1", "src": "a", "dst": "b", "status": "proposed"}]})
+            return httpx.Response(200, json={"id": "e1", "status": "active"})
+        if req.url.path in ("/memory/links/approve", "/memory/links/reject"):
+            return httpx.Response(200, json={"id": body["edge_id"],
+                                             "status": "active"})
+        if req.url.path == "/memory/links/structure":
+            return httpx.Response(200, json={"active_docs": 4, "linked_docs": 2,
+                                             "orphans": 2, "orphan_rate": 0.5})
         return httpx.Response(404)
     return handler
 
@@ -65,7 +79,9 @@ ITEMS = [
 
 def test_readonly_by_default_hides_retain():
     mcp = build_server(_client([]))
-    assert set(_tools(mcp)) == {"memory_recall", "memory_reflect", "memory_stats"}
+    assert set(_tools(mcp)) == {"memory_recall", "memory_reflect", "memory_stats",
+                                "memory_find_related", "memory_links_list",
+                                "memory_links_structure"}
 
 
 def test_retain_registered_only_with_allow_write():
@@ -200,6 +216,76 @@ def test_disabled_retain_cannot_be_called():
     mcp = build_server(_client([]))
     with pytest.raises(Exception):
         _call(mcp, "memory_retain", {"text": "x"})
+
+
+# --- links surface (hidden connections / stored edges) ---
+
+def test_links_write_tools_gated_by_allow_write():
+    mcp = build_server(_client([]), allow_write=True)
+    names = set(_tools(mcp))
+    assert {"memory_links_link", "memory_links_approve",
+            "memory_links_reject"} <= names
+    readonly = build_server(_client([]))
+    assert not {"memory_links_link", "memory_links_approve",
+                "memory_links_reject"} & set(_tools(readonly))
+
+
+def test_find_related_passthrough():
+    calls = []
+    mcp = build_server(_client(calls))
+    out = _call(mcp, "memory_find_related", {"doc_id": "d1", "k": 5})
+    assert out["results"][0]["id"] == "sib"
+    assert calls[0][1:] == ("/memory/links/find_related", KEY,
+                            {"doc_id": "d1", "kind": "semantic",
+                             "threshold": 0.3, "k": 5, "exclude_linked": True})
+
+
+def test_find_related_404_becomes_helpful_error():
+    def miss(req):
+        return httpx.Response(404, json={"detail": "doc not found in this bank"})
+    c = AmesClient("http://ames.test", KEY, transport=httpx.MockTransport(miss))
+    mcp = build_server(c)
+    with pytest.raises(Exception) as ei:
+        _call(mcp, "memory_find_related", {"doc_id": "gone"})
+    assert "no visible memory" in str(ei.value)
+
+
+def test_links_list_and_structure_passthrough():
+    calls = []
+    mcp = build_server(_client(calls))
+    out = _call(mcp, "memory_links_list", {"status": "proposed", "size": 10})
+    assert out["edges"][0]["status"] == "proposed"
+    assert calls[0][:2] == ("GET", "/memory/links")
+    out = _call(mcp, "memory_links_structure", {"kind": "semantic"})
+    assert out["orphan_rate"] == 0.5
+    assert calls[1][:2] == ("GET", "/memory/links/structure")
+
+
+def test_links_list_builds_query_string():
+    seen = {}
+
+    def grab(req):
+        seen["url"] = str(req.url)
+        return httpx.Response(200, json={"edges": []})
+    c = AmesClient("http://ames.test", KEY, transport=httpx.MockTransport(grab))
+    c.links_list(status="proposed", edge_source="co_occurrence", size=7)
+    assert seen["url"] == ("http://ames.test/memory/links?size=7"
+                           "&status=proposed&edge_source=co_occurrence")
+
+
+def test_links_link_approve_reject_passthrough():
+    calls = []
+    mcp = build_server(_client(calls), allow_write=True)
+    _call(mcp, "memory_links_link", {"src": "a", "dst": "b",
+                                     "reason": "same incident"})
+    assert calls[0][1] == "/memory/links"
+    assert calls[0][3] == {"kind": "semantic", "src": "a", "dst": "b",
+                           "reason": "same incident"}
+    out = _call(mcp, "memory_links_approve", {"edge_id": "e1"})
+    assert out["status"] == "active"
+    assert calls[1][1] == "/memory/links/approve"
+    _call(mcp, "memory_links_reject", {"edge_id": "e1"})
+    assert calls[2][1] == "/memory/links/reject"
 
 
 def test_401_error_is_clear_and_does_not_leak_key():
