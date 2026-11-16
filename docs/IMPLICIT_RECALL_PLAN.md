@@ -109,7 +109,8 @@ that bet with **readable text plus provenance**, which keeps names exact and eve
 - On recall (opt-in `trait_query: true`, and by default inside reflect): one small LLM call
   "List up to 3 kinds of personal facts that would change a good answer to this question"
   → query restricted to `tags: fact:trait` → merged into RRF at its own weight.
-- Skip on trivial prompts (`is_trivial_prompt`) and when the profile block already holds every
+- Skip on trivial prompts (the Hermes plugin already filters them with Hermes' `is_trivial_prompt`
+  before calling recall; the server has no such check, so MCP/HTTP callers opt in explicitly) and when the profile block already holds every
   trait (owner has ≤ budget traits): then Phase 3 adds latency for nothing.
 
 ## 5. Phases and gates
