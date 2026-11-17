@@ -1,5 +1,11 @@
 # Plan: implicit (associative) recall in AMES
 
+> **Sequencing (2026-11-17):** this is Phase 3 of the EngProd Brain + team-memory plan
+> (`ao-workspace/projects/engprod-brain/plans/implicit-recall-brain-team-memory-plan.md`). The Brain and
+> team memory (Context Engine) go first. AMES feature work here starts only after a Brain-side mechanism
+> passes its gate there. The PersonaMem rerun (Phase 0 here, follow-up #6) may still run as a plain
+> measurement.
+>
 > Status: **draft plan, nothing built.** Every claim about current behaviour names its source file
 > (as of `c89baaa`). Every claim about future effect is an **unverified hypothesis** until the
 > pre-registered eval in §6 says otherwise.
