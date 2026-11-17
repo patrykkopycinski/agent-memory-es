@@ -1,10 +1,14 @@
 # Plan: implicit (associative) recall in AMES
 
-> **Sequencing (2026-11-17):** this is Phase 3 of the EngProd Brain + team-memory plan
-> (`ao-workspace/projects/engprod-brain/plans/implicit-recall-brain-team-memory-plan.md`). The Brain and
-> team memory (Context Engine) go first. AMES feature work here starts only after a Brain-side mechanism
-> passes its gate there. The PersonaMem rerun (Phase 0 here, follow-up #6) may still run as a plain
-> measurement.
+> **Sequencing (2026-11-17):** this is Phase 3 of a separate team-memory plan (an internal agent with a
+> Context Engine team-memory bank). That agent and its team memory go first. AMES feature work here
+> starts only after a mechanism there passes its gate. The PersonaMem rerun (Phase 0 here, follow-up #6)
+> may still run as a plain measurement.
+>
+> **Outcome there (2026-11-17):** a recall tool plus one instruction paragraph was enough. On a frozen
+> test split whose answers exist only in team memory, it went from 0/22 to 18/22 with no control drift.
+> No extra mechanism (routing trigger, intent rewrite, `applies_when`) was built, so there is nothing
+> to port. Only the plain PersonaMem rerun is in scope for AMES now.
 >
 > Status: **draft plan, nothing built.** Every claim about current behaviour names its source file
 > (as of `c89baaa`). Every claim about future effect is an **unverified hypothesis** until the
