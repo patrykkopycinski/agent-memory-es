@@ -91,7 +91,15 @@ PROMPT_VERSION = "document-v5-short-chat"
 WINDOW_CHARS = 12000
 SUPERSESSION_MIN_SCORE = 0.85  # cosine 0.70: ES cosine score = (1 + cosine) / 2
 CACHE = f"{PREFIX}am_fact_cache"
-CACHE_MAPPING = {"mappings": {"dynamic": "strict", "properties": {"facts": {"type": "keyword", "ignore_above": 512}}}}
+CACHE_MAPPING = {"mappings": {"dynamic": "strict", "properties": {
+    "facts": {"type": "keyword", "ignore_above": 512},
+    "usage": {"properties": {
+        "model": {"type": "keyword", "ignore_above": 256},
+        "purpose": {"type": "keyword", "ignore_above": 64},
+        "prompt_tokens": {"type": "integer"},
+        "completion_tokens": {"type": "integer"},
+        "cache_tokens": {"type": "integer"}}},
+    "created_at": {"type": "date"}}}}
 
 JOB_MAPPING = {"settings": {"number_of_shards": 1, "number_of_replicas": 0},
                "mappings": {"dynamic": "strict", "properties": {
@@ -131,6 +139,13 @@ def ensure_queue():
         if "-> 404:" not in str(exc):
             raise
         es("PUT", f"/{CACHE}", CACHE_MAPPING)
+        return
+    # Additive mapping migration: a cache index created before usage recording
+    # must accept the usage fields (dynamic: strict would reject the write).
+    try:
+        es("PUT", f"/{CACHE}/_mapping", CACHE_MAPPING["mappings"])
+    except RuntimeError:
+        pass  # older cluster / no permission: usage recording degrades to absent
 
 
 def enqueue(owner_id, source_id):
