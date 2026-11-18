@@ -14,6 +14,28 @@ from . import http_retry
 from . import telemetry as _otel
 from .store import es, idx, is_doc_miss, PREFIX, knn_num_candidates
 
+
+class _Purpose:
+    """llm.CURRENT_PURPOSE context so recorded token usage is attributed to a stage."""
+
+    def __init__(self, label):
+        self._label = label
+        self._prev = None
+
+    def __enter__(self):
+        self._prev = llm.CURRENT_PURPOSE[0]
+        llm.CURRENT_PURPOSE[0] = self._label
+        return self
+
+    def __exit__(self, *exc):
+        llm.CURRENT_PURPOSE[0] = self._prev
+        return False
+
+
+def _snapshot_usage():
+    """Deep copy of cumulative per-(model, purpose) usage; safe to persist."""
+    return {f"{m}::{p}": dict(v) for (m, p), v in llm.USAGE.items()}
+
 log = logging.getLogger(__name__)
 QUEUE = f"{PREFIX}am_fact_jobs"
 BACKFILLS = f"{PREFIX}am_fact_backfills"
@@ -294,12 +316,13 @@ def _replacement_ids(owner, visibility, vector, text, date):
     candidates = [h for h in candidates if h.get("_score", 0) >= SUPERSESSION_MIN_SCORE]
     if not candidates:
         return []
-    result = llm.chat_json(
-        "Determine which prior facts are actually replaced or contradicted by the new fact. Related or repeated facts are not replacements. "
-        "Return JSON object {\"replace_ids\": [ids]}. Choose only given IDs; return [] if uncertain.",
-        json.dumps({"new": text, "effective_date": date,
-                    "candidates": [{"id": h["_id"], "text": h["_source"]["text"],
-                                    "valid_from": h["_source"].get("valid_from")} for h in candidates]}))
+    with _Purpose("supersession"):
+        result = llm.chat_json(
+            "Determine which prior facts are actually replaced or contradicted by the new fact. Related or repeated facts are not replacements. "
+            "Return JSON object {\"replace_ids\": [ids]}. Choose only given IDs; return [] if uncertain.",
+            json.dumps({"new": text, "effective_date": date,
+                        "candidates": [{"id": h["_id"], "text": h["_source"]["text"],
+                                        "valid_from": h["_source"].get("valid_from")} for h in candidates]}))
     ids = result.get("replace_ids")
     if not isinstance(ids, list):
         raise ValueError("invalid replacement ids")
@@ -336,17 +359,23 @@ def _document_facts(passages, date):
     facts = []
     for window in windows:
         key = hashlib.sha256(json.dumps([window, date, PROMPT_VERSION, llm.MODEL]).encode()).hexdigest()
+        before = dict(llm.LAST_CALL)
         try:
             cached = es("GET", f"/{CACHE}/_doc/{key}")["_source"]["facts"]
         except RuntimeError as exc:
             if not _is_doc_miss(exc):
                 raise
-            cached = _extract(window, date)
+            with _Purpose("fact_extraction"):
+                facts_new = _extract(window, date)
+            call = llm.LAST_CALL if llm.LAST_CALL.get("purpose") == "fact_extraction" else {}
             try:
-                es("PUT", f"/{CACHE}/_create/{key}", {"facts": cached})
+                es("PUT", f"/{CACHE}/_create/{key}",
+                   {"facts": facts_new, "usage": call, "created_at": _iso(_now())})
             except RuntimeError as conflict:
                 if "-> 409:" not in str(conflict):
                     raise
+            llm.LAST_CALL = before        # restore: a cache hit must not attribute the prior call
+            cached = facts_new
         facts.extend(cached)
     return list(dict.fromkeys(facts))
 
@@ -428,7 +457,8 @@ def process(source_id, owner_id, abort=None):
     _otel.set_attrs({"worker.job.passages": len(passages),
                      "worker.job.facts": n_facts,
                      "worker.job.facts_written": n_written,
-                     "worker.job.es_write_ms": round(write_ms, 3)})
+                     "worker.job.es_write_ms": round(write_ms, 3),
+                     "worker.job.llm_usage": json.dumps(_snapshot_usage())})
 
 
 def run_once(owner_id=None, job_id=None, on_claim=None, on_finish=None, abort=None):
