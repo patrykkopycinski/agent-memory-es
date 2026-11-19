@@ -284,7 +284,8 @@ def test_ensure_queue_puts_additive_mapping():
     with patch.object(facts, 'es', fake_es):
         facts.ensure_queue()
     assert puts == [(f"/{facts.QUEUE}/_mapping",
-                     {"properties": {"transient_retries": {"type": "integer"}}})]
+                     {"properties": {"transient_retries": {"type": "integer"}}}),
+                    (f"/{facts.CACHE}/_mapping", facts.CACHE_MAPPING["mappings"])]
 
 
 # --- ADDENDUM: AMES_LLM_TEMPERATURE --------------------------------------
