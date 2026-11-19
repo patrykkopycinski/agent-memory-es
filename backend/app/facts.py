@@ -36,6 +36,17 @@ def _snapshot_usage():
     """Deep copy of cumulative per-(model, purpose) usage; safe to persist."""
     return {f"{m}::{p}": dict(v) for (m, p), v in llm.USAGE.items()}
 
+
+def _usage_since(start):
+    """Per-(model, purpose) usage accrued since a `_snapshot_usage()` taken earlier."""
+    delta = {}
+    for key, totals in _snapshot_usage().items():
+        prev = start.get(key, {})
+        diff = {k: v - prev.get(k, 0) for k, v in totals.items()}
+        if diff.get("calls"):
+            delta[key] = diff
+    return delta
+
 log = logging.getLogger(__name__)
 QUEUE = f"{PREFIX}am_fact_jobs"
 BACKFILLS = f"{PREFIX}am_fact_backfills"
@@ -141,11 +152,9 @@ def ensure_queue():
         es("PUT", f"/{CACHE}", CACHE_MAPPING)
         return
     # Additive mapping migration: a cache index created before usage recording
-    # must accept the usage fields (dynamic: strict would reject the write).
-    try:
-        es("PUT", f"/{CACHE}/_mapping", CACHE_MAPPING["mappings"])
-    except RuntimeError:
-        pass  # older cluster / no permission: usage recording degrades to absent
+    # must accept the usage fields, or dynamic: strict rejects every cache write.
+    # Fail boot loudly (like the QUEUE PUT above) rather than fail every job later.
+    es("PUT", f"/{CACHE}/_mapping", CACHE_MAPPING["mappings"])
 
 
 def enqueue(owner_id, source_id):
@@ -394,12 +403,14 @@ def _document_facts(passages, date):
     facts = []
     for window in windows:
         key = hashlib.sha256(json.dumps([window, date, PROMPT_VERSION, llm.MODEL]).encode()).hexdigest()
-        before = dict(llm.LAST_CALL)
         try:
             cached = es("GET", f"/{CACHE}/_doc/{key}")["_source"]["facts"]
         except RuntimeError as exc:
             if not _is_doc_miss(exc):
                 raise
+            # Clear first: a response without usage must not inherit an earlier
+            # (possibly failed) call's numbers.
+            llm.LAST_CALL = {}
             with _Purpose("fact_extraction"):
                 facts_new = _extract(window, date)
             call = llm.LAST_CALL if llm.LAST_CALL.get("purpose") == "fact_extraction" else {}
@@ -409,7 +420,6 @@ def _document_facts(passages, date):
             except RuntimeError as conflict:
                 if "-> 409:" not in str(conflict):
                     raise
-            llm.LAST_CALL = before        # restore: a cache hit must not attribute the prior call
             cached = facts_new
         facts.extend(cached)
     return list(dict.fromkeys(facts))
@@ -433,6 +443,7 @@ def process(source_id, owner_id, abort=None):
             raise BackfillHeartbeatAbort("backfill heartbeat abort (lease renewal failed)")
 
     check_abort()
+    usage_start = _snapshot_usage()
     try:
         source = es("GET", f"/{idx('episodic')}/_doc/{source_id}")["_source"]
     except RuntimeError as exc:
@@ -493,7 +504,7 @@ def process(source_id, owner_id, abort=None):
                      "worker.job.facts": n_facts,
                      "worker.job.facts_written": n_written,
                      "worker.job.es_write_ms": round(write_ms, 3),
-                     "worker.job.llm_usage": json.dumps(_snapshot_usage())})
+                     "worker.job.llm_usage": json.dumps(_usage_since(usage_start))})
 
 
 def run_once(owner_id=None, job_id=None, on_claim=None, on_finish=None, abort=None):

@@ -1,6 +1,7 @@
 """Reflect LLM wiring: OmniRoute chat completion synthesizes an answer from recalled
 evidence. Cites only retrieved ids. Abstains (atlas finding) when evidence is thin."""
 import json
+import logging
 import os
 import urllib.parse
 import urllib.request
@@ -43,6 +44,14 @@ def record_usage(model: str, purpose: str, usage: dict) -> dict:
     if "cache_tokens" in delta:
         totals["cache_tokens"] = totals.get("cache_tokens", 0) + delta["cache_tokens"]
     return delta
+
+def _safe_record(model: str, usage) -> None:
+    """Usage is telemetry: a malformed provider usage block must not fail a successful call.
+    es_inference records the configured model name; the OpenAI path records the served one."""
+    try:
+        record_usage(model, CURRENT_PURPOSE[0], usage)
+    except (TypeError, ValueError, AttributeError) as exc:
+        logging.getLogger(__name__).warning("ignoring malformed LLM usage block: %s", type(exc).__name__)
 
 BASE = os.environ.get("AMES_LLM_BASE", "http://localhost:20128/v1")
 MODEL = os.environ.get("AMES_LLM_MODEL", "auto/best-chat")
@@ -121,8 +130,9 @@ def _parse_sse(response) -> tuple:
         if isinstance(chunk_usage, dict) and chunk_usage:
             if chunk_usage.get("prompt_tokens"):
                 usage = chunk_usage        # final-chunk totals (non-zero prompt) replace deltas
-            else:
-                usage = {k: usage.get(k, 0) + (v or 0) for k, v in chunk_usage.items()}
+            else:   # sum only flat integer counters; nested *_details objects are ignored
+                usage = {**usage, **{k: usage.get(k, 0) + v for k, v in chunk_usage.items()
+                                     if isinstance(v, int) and not isinstance(v, bool)}}
         for choice in wrapper.get("choices") or []:
             parts.append((choice.get("delta") or {}).get("content") or "")
             finish = choice.get("finish_reason") or finish
@@ -150,8 +160,7 @@ def _complete(messages: list, sampling: dict, json_mode: bool, timeout: float) -
                                      headers={**store._es_headers(), "Accept": "text/event-stream"})
         content, finish, usage = http_retry.request_with(req, _parse_sse, timeout=timeout)
         if usage:
-            record_usage(os.environ.get("AMES_LLM_MODEL") or "es_inference",
-                         CURRENT_PURPOSE[0], usage)
+            _safe_record(os.environ.get("AMES_LLM_MODEL") or "es_inference", usage)
         return content, finish
     body = {"model": MODEL, **sampling, "messages": messages}
     if json_mode:
@@ -164,7 +173,7 @@ def _complete(messages: list, sampling: dict, json_mode: bool, timeout: float) -
     response = http_retry.request_json(req, timeout=timeout)
     choice = response["choices"][0]
     if response.get("usage"):
-        record_usage(response.get("model") or MODEL, CURRENT_PURPOSE[0], response["usage"])
+        _safe_record(response.get("model") or MODEL, response["usage"])
     return choice["message"].get("content") or "", choice.get("finish_reason")
 
 

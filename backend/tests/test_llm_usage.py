@@ -123,6 +123,108 @@ def test_missing_usage_is_not_recorded(monkeypatch):
     assert llm.LAST_CALL == {}
 
 
+def test_malformed_usage_does_not_fail_the_call(monkeypatch):
+    class Resp:
+        def read(self):
+            return json.dumps({"choices": [{"message": {"content": "{\"ok\": true}"},
+                                            "finish_reason": "stop"}], "model": "m",
+                               "usage": {"prompt_tokens": "n/a"}}).encode()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    monkeypatch.setattr(llm.urllib.request, "urlopen", lambda req, timeout=None: Resp())
+    assert llm.chat_json("s", "u") == {"ok": True}
+    assert llm.USAGE == {}
+
+
+def test_sse_nested_usage_details_are_ignored(monkeypatch):
+    monkeypatch.setenv("AMES_LLM_PROVIDER", "es_inference")
+    monkeypatch.setenv("AMES_LLM_INFERENCE_ID", "ep-1")
+    monkeypatch.setenv("AMES_LLM_MODEL", "m3")
+    c1 = json.dumps({"chat_completion": {"choices": [{"index": 0, "delta": {"content": "a"},
+                                                      "finish_reason": "stop"}],
+                                         "usage": {"prompt_tokens": 0, "completion_tokens": 4,
+                                                   "prompt_tokens_details": {"cached_tokens": 0}}}})
+    fake = Fake([(200, sse(c1))])
+    monkeypatch.setattr(llm.store, "_es_url", lambda: fake.url)
+    monkeypatch.setattr(llm.store, "_es_headers", lambda: {})
+    assert llm.chat("q", []) == "a"
+    assert llm.LAST_CALL["completion_tokens"] == 4
+
+
+def _cache_fake_es(writes):
+    def fake_es(method, path, body=None):
+        if method == "GET" and "/_doc/" in path:
+            raise RuntimeError(f'GET {path} -> 404: {{"found": false}}')
+        if method == "PUT" and "/_create/" in path:
+            writes.append(body)
+            return {"result": "created"}
+        raise AssertionError(f"unexpected {method} {path}")
+    return fake_es
+
+
+def test_cache_write_carries_this_calls_usage(monkeypatch):
+    from app import facts
+
+    def fake_extract(window, date):
+        llm.record_usage("m", llm.CURRENT_PURPOSE[0], {"prompt_tokens": 9, "completion_tokens": 2})
+        return ["fact one"]
+
+    writes = []
+    monkeypatch.setattr(facts, "es", _cache_fake_es(writes))
+    monkeypatch.setattr(facts, "_extract", fake_extract)
+    assert facts._document_facts([("p1", "text")], "2026-01-01") == ["fact one"]
+    assert writes[0]["usage"] == {"model": "m", "purpose": "fact_extraction",
+                                  "prompt_tokens": 9, "completion_tokens": 2}
+
+
+def test_failed_extraction_usage_is_not_written_to_the_next_doc(monkeypatch):
+    """Job A's call records usage then raises (bad JSON); job B's response has no
+    usage. B's cache doc must not carry A's numbers."""
+    from app import facts
+
+    def failing_extract(window, date):
+        llm.record_usage("m", llm.CURRENT_PURPOSE[0], {"prompt_tokens": 50, "completion_tokens": 5})
+        raise ValueError("invalid JSON reply")
+
+    writes = []
+    monkeypatch.setattr(facts, "es", _cache_fake_es(writes))
+    monkeypatch.setattr(facts, "_extract", failing_extract)
+    with pytest.raises(ValueError):
+        facts._document_facts([("a1", "doc A")], "2026-01-01")
+    monkeypatch.setattr(facts, "_extract", lambda window, date: ["fact b"])
+    assert facts._document_facts([("b1", "doc B")], "2026-01-01") == ["fact b"]
+    assert writes == [{"facts": ["fact b"], "usage": {}, "created_at": writes[0]["created_at"]}]
+
+
+def test_ensure_queue_cache_mapping_failure_is_loud(monkeypatch):
+    from app import facts
+
+    def fake_es(method, path, body=None):
+        if method == "GET":
+            return {"ok": True}
+        if path == f"/{facts.CACHE}/_mapping":
+            raise RuntimeError(f"PUT {path} -> 403: forbidden")
+        return {"acknowledged": True}
+
+    monkeypatch.setattr(facts, "es", fake_es)
+    with pytest.raises(RuntimeError, match="403"):
+        facts.ensure_queue()
+
+
+def test_job_span_usage_is_a_per_job_delta():
+    from app import facts
+    llm.record_usage("m", "fact_extraction", {"prompt_tokens": 100, "completion_tokens": 10})
+    start = facts._snapshot_usage()
+    llm.record_usage("m", "fact_extraction", {"prompt_tokens": 7, "completion_tokens": 1})
+    assert facts._usage_since(start) == {"m::fact_extraction": {
+        "calls": 1, "prompt_tokens": 7, "completion_tokens": 1}}
+
+
 def _chunked_with_usage(text, finish, usage):
     return json.dumps({"chat_completion": {"choices": [{"index": 0,
                                                         "delta": {"content": text},
