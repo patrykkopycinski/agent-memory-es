@@ -218,19 +218,39 @@ def retry_failed_backfill(owner_id, visibility):
     return backfill_status(owner_id, visibility)
 
 
+MAX_BACKFILL_OWNERS = 1000
+
+
+def _backfill_owners():
+    """Owners whose scope has a pending/running backfill (bounded)."""
+    result = es("POST", f"/{BACKFILLS}/_search", {"size": 0,
+        "query": {"terms": {"state": ["pending", "running"]}},
+        "aggs": {"owners": {"terms": {"field": "owner_id", "size": MAX_BACKFILL_OWNERS}}}})
+    owners = result["aggregations"]["owners"]
+    if owners.get("sum_other_doc_count", 0) > 0:
+        log.warning("backfill owner list truncated at %d: %d more backfill docs not excluded",
+                    MAX_BACKFILL_OWNERS, owners["sum_other_doc_count"])
+    return [b["key"] for b in owners["buckets"]]
+
+
 def claim(owner_id=None, job_id=None, lease_seconds=LEASE_SECONDS):
     now = _now()
+    # Backfill-owned scopes are claimed by id by the backfill runner, not by generic
+    # workers. Exclude them in the query: filtering one fetched page afterwards starves
+    # every generic claim once that page is all one backfill owner's jobs.
+    excluded = [] if job_id or owner_id else _backfill_owners()
     response = es("POST", f"/{QUEUE}/_search", {"size": 20, "seq_no_primary_term": True,
         "sort": [{"next_at": {"order": "asc", "missing": "_last"}}], "query": {"bool": {"should": [
             {"bool": {"filter": [{"term": {"state": "pending"}}, {"range": {"next_at": {"lte": _iso(now)}}}]}},
             {"bool": {"filter": [{"term": {"state": "running"}}, {"range": {"lease_until": {"lte": _iso(now)}}}]}}
         ], "minimum_should_match": 1,
         **({"filter": {"term": {"_id": job_id}}} if job_id else
-           {"filter": {"term": {"owner_id": owner_id}}} if owner_id else {})}}})
+           {"filter": {"term": {"owner_id": owner_id}}} if owner_id else {}),
+        **({"must_not": {"terms": {"owner_id": excluded}}} if excluded else {})}}})
     for hit in response["hits"]["hits"]:
         if not job_id:
-            # Generic workers must not process jobs from a scope whose backfill
-            # owns chronological extraction. The backfill runner claims its exact id.
+            # Not redundant: covers a backfill created after the owner lookup above
+            # and owners beyond MAX_BACKFILL_OWNERS that the query did not exclude.
             active = es("POST", f"/{BACKFILLS}/_count", {"query": {"bool": {"filter": [
                 {"term": {"owner_id": hit["_source"]["owner_id"]}},
                 {"terms": {"state": ["pending", "running"]}}]}}})["count"]
