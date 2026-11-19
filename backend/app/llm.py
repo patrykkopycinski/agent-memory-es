@@ -1,11 +1,57 @@
 """Reflect LLM wiring: OmniRoute chat completion synthesizes an answer from recalled
 evidence. Cites only retrieved ids. Abstains (atlas finding) when evidence is thin."""
 import json
+import logging
 import os
 import urllib.parse
 import urllib.request
 
 from . import http_retry, store
+
+# Most recent call's (model, purpose, usage-delta): extraction code copies it into
+# per-job records before the next call overwrites it.
+LAST_CALL = {}
+
+# Process-wide cumulative token usage per (model, purpose). The response's
+# "model" field names the model that actually served the call; usage numbers
+# come from the provider's top-level "usage" (or per-chunk usage deltas for
+# streaming providers that only send them incrementally).
+USAGE = {}
+
+# Purpose label for the next calls (default "chat"); extraction code sets this
+# around its calls so usage can be attributed per stage.
+CURRENT_PURPOSE = ["chat"]
+
+def _usage_key(model: str, purpose: str) -> tuple:
+    return (model, purpose)
+
+def record_usage(model: str, purpose: str, usage: dict) -> dict:
+    """Accumulate one call's token usage; return the normalized delta."""
+    global LAST_CALL
+    delta = {
+        "prompt_tokens": int(usage.get("prompt_tokens") or 0),
+        "completion_tokens": int(usage.get("completion_tokens") or 0),
+    }
+    cache = usage.get("cache_read_input_tokens") or usage.get("cache_creation_input_tokens") or 0
+    if cache:
+        delta["cache_tokens"] = int(cache)
+    LAST_CALL = {"model": model, "purpose": purpose, **delta}
+    totals = USAGE.setdefault(_usage_key(model, purpose),
+                              {"calls": 0, "prompt_tokens": 0, "completion_tokens": 0})
+    totals["calls"] += 1
+    totals["prompt_tokens"] += delta["prompt_tokens"]
+    totals["completion_tokens"] += delta["completion_tokens"]
+    if "cache_tokens" in delta:
+        totals["cache_tokens"] = totals.get("cache_tokens", 0) + delta["cache_tokens"]
+    return delta
+
+def _safe_record(model: str, usage) -> None:
+    """Usage is telemetry: a malformed provider usage block must not fail a successful call.
+    es_inference records the configured model name; the OpenAI path records the served one."""
+    try:
+        record_usage(model, CURRENT_PURPOSE[0], usage)
+    except (TypeError, ValueError, AttributeError) as exc:
+        logging.getLogger(__name__).warning("ignoring malformed LLM usage block: %s", type(exc).__name__)
 
 BASE = os.environ.get("AMES_LLM_BASE", "http://localhost:20128/v1")
 MODEL = os.environ.get("AMES_LLM_MODEL", "auto/best-chat")
@@ -61,10 +107,13 @@ def validate_config() -> None:
 
 
 def _parse_sse(response) -> tuple:
-    """Assemble (content, finish_reason) from a chat_completion SSE stream. Accepts the bare chunk
-    (`choices[].delta.content`) and the `{"chat_completion": {...}}` wrapper; skips `event:` lines.
+    """Assemble (content, finish_reason, usage) from a chat_completion SSE stream. Accepts the bare
+    chunk (`choices[].delta.content`) and the `{"chat_completion": {...}}` wrapper; skips `event:`
+    lines. Usage is taken from the chunk carrying a non-null top-level "usage" (most providers send
+    it once on the final chunk; some only send incremental deltas, which are summed).
     A stream that ends without `[DONE]` was cut off: ConnectionResetError, which http_retry retries."""
     parts, finish, done = [], None, False
+    usage = {}
     for raw in response:
         line = raw.decode("utf-8", "replace").strip()
         if not line.startswith("data:"):
@@ -76,12 +125,20 @@ def _parse_sse(response) -> tuple:
         chunk = json.loads(data)
         if "error" in chunk:
             raise ValueError("inference stream returned an error event")   # body may echo the prompt
-        for choice in chunk.get("chat_completion", chunk).get("choices") or []:
+        wrapper = chunk.get("chat_completion", chunk)
+        chunk_usage = wrapper.get("usage")
+        if isinstance(chunk_usage, dict) and chunk_usage:
+            if chunk_usage.get("prompt_tokens"):
+                usage = chunk_usage        # final-chunk totals (non-zero prompt) replace deltas
+            else:   # sum only flat integer counters; nested *_details objects are ignored
+                usage = {**usage, **{k: usage.get(k, 0) + v for k, v in chunk_usage.items()
+                                     if isinstance(v, int) and not isinstance(v, bool)}}
+        for choice in wrapper.get("choices") or []:
             parts.append((choice.get("delta") or {}).get("content") or "")
             finish = choice.get("finish_reason") or finish
     if not done:
         raise ConnectionResetError("inference stream ended before [DONE]")
-    return "".join(parts), finish
+    return "".join(parts), finish, usage
 
 
 def _complete(messages: list, sampling: dict, json_mode: bool, timeout: float) -> tuple:
@@ -101,7 +158,10 @@ def _complete(messages: list, sampling: dict, json_mode: bool, timeout: float) -
                + urllib.parse.quote(inference_id, safe="") + "/_stream")
         req = urllib.request.Request(url, data=json.dumps(body).encode(), method="POST",
                                      headers={**store._es_headers(), "Accept": "text/event-stream"})
-        return http_retry.request_with(req, _parse_sse, timeout=timeout)
+        content, finish, usage = http_retry.request_with(req, _parse_sse, timeout=timeout)
+        if usage:
+            _safe_record(os.environ.get("AMES_LLM_MODEL") or "es_inference", usage)
+        return content, finish
     body = {"model": MODEL, **sampling, "messages": messages}
     if json_mode:
         body.update(_template_kwargs())
@@ -110,7 +170,10 @@ def _complete(messages: list, sampling: dict, json_mode: bool, timeout: float) -
                                  method="POST",
                                  headers={"Content-Type": "application/json",
                                           "Authorization": f"Bearer {KEY}"})
-    choice = http_retry.request_json(req, timeout=timeout)["choices"][0]
+    response = http_retry.request_json(req, timeout=timeout)
+    choice = response["choices"][0]
+    if response.get("usage"):
+        _safe_record(response.get("model") or MODEL, response["usage"])
     return choice["message"].get("content") or "", choice.get("finish_reason")
 
 
